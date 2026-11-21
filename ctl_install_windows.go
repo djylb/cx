@@ -2,14 +2,37 @@ package main
 
 import (
 	"errors"
-	"golang.org/x/sys/windows"
+	"fmt"
+	"os"
 	"path/filepath"
+	"time"
 	"unsafe"
+
+	"golang.org/x/sys/windows"
 )
 
 // Request POSIX replacement semantics so existing handles may continue
 // referring to the old executable after its directory entry is replaced.
 func publishBinary(from, to string) error {
+	// Old images left aside by earlier upgrades are removable once their processes exit.
+	if olds, _ := filepath.Glob(to + ".old.*"); len(olds) > 0 {
+		for _, old := range olds {
+			_ = os.Remove(old)
+		}
+	}
+	e := replaceBinary(from, to)
+	if errors.Is(e, windows.ERROR_ACCESS_DENIED) || errors.Is(e, windows.ERROR_SHARING_VIOLATION) {
+		// A running image cannot be replaced, but it can be renamed: move it aside, then publish.
+		aside := fmt.Sprintf("%s.old.%d", to, time.Now().UnixNano())
+		if re := os.Rename(to, aside); re != nil {
+			return fmt.Errorf("replace running %s: %w (rename aside: %v)", to, e, re)
+		}
+		return replaceBinary(from, to)
+	}
+	return e
+}
+
+func replaceBinary(from, to string) error {
 	src, e := windows.UTF16PtrFromString(from)
 	if e != nil {
 		return e

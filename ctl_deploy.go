@@ -494,7 +494,7 @@ func moduleDir() (string, error) {
 			continue
 		}
 		lines := strings.Split(string(b), "\n")
-		if strings.TrimSpace(lines[0]) != "module cx" {
+		if m := strings.TrimSpace(lines[0]); m != "module "+modulePath && m != "module cx" {
 			continue
 		}
 		if _, e = os.Stat(filepath.Join(d, "ctl_deploy.go")); e == nil {
@@ -503,6 +503,9 @@ func moduleDir() (string, error) {
 	}
 	return "", errors.New("cx Go module unavailable for cross compilation; set CX_MODULE to the cxrun source directory")
 }
+
+// modulePath is the public import path of this module (go.mod).
+const modulePath = "github.com/djylb/cx"
 
 // A matching cached platform artifact permits hash checking and submission in
 // one node invocation. Setup handles empty caches, bootstrap and upgrades.

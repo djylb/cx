@@ -75,7 +75,7 @@ func hostSettings(ctx context.Context, root string, sets []string, init bool) er
 			return errors.New("expected K=V")
 		}
 		switch {
-		case k == "load_cmd":
+		case k == "load_cmd" || k == "psmux" || k == "mux_socket" || k == "env_file" || k == "default_profile":
 			obj[k] = v
 		case k == "cache_max_bytes" || k == "min_free_bytes":
 			n, e := strconv.ParseUint(v, 10, 64)
@@ -122,8 +122,8 @@ func doctorNode(ctx context.Context, root string) error {
 	f := hostFacts(ctx, root)
 	mux := "tmux"
 	if runtime.GOOS == "windows" {
-		mux = "psmux"
-		f["psmux_session"] = probe(ctx, "psmux", "-L", muxSocket(), "list-sessions") != ""
+		mux = psmuxProgram()
+		f["psmux_session"] = probe(ctx, psmuxProgram(), "-L", muxSocket(), "list-sessions") != ""
 	}
 	for _, tool := range []string{"git", "ssh", mux, "codex", "claude"} {
 		p, _ := exec.LookPath(tool)
@@ -343,7 +343,7 @@ func launchMuxCommand(ctx context.Context, root, p, j, runID string) error {
 	}
 	ctx, cancel := context.WithTimeout(ctx, 8*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "psmux", "-L", muxSocket(), "new-session", "-d", "-s", "cx-"+runID, "--", exe, "_command", "--state", root, "--project", p, "--job", j)
+	cmd := exec.CommandContext(ctx, psmuxProgram(), "-L", muxSocket(), "new-session", "-d", "-s", "cx-"+runID, "--", exe, "_command", "--state", root, "--project", p, "--job", j)
 	cmd.Stderr = os.Stderr
 	err := cmd.Run()
 	return errors.Join(err, ctx.Err())

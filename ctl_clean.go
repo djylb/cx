@@ -328,7 +328,7 @@ func cleanLegacyJob(ctx context.Context, id, work, token string) error {
 		args := []string{}
 		session := "=" + old.Mux
 		if runtime.GOOS == "windows" {
-			exe = "psmux"
+			exe = psmuxProgram()
 			args = []string{"-L", muxSocket()}
 			session = old.Mux
 		} else if old.Socket != "" {

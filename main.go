@@ -840,6 +840,7 @@ func main() {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	applyHostMux(os.Args[1:])
 	if err := dispatch(ctx, os.Args[1:]); err != nil {
 		var code ctlExit
 		if errors.As(err, &code) {

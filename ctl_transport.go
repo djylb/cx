@@ -211,6 +211,7 @@ func nodeCLI(ctx context.Context, args []string) error {
 			if err = os.Setenv("CXRUN_STATE", req.State); err != nil {
 				return err
 			}
+			applyHostMux(nil) // the state root arrives in the request, not on the command line
 		}
 		args = req.Args
 		if len(args) > 0 && !strings.HasPrefix(args[0], "forward") && args[0] != "platform-probe" {

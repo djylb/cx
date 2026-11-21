@@ -18,6 +18,8 @@ type hostConfig struct {
 	LoadCmd        string                 `json:"load_cmd"`
 	CacheMaxBytes  uint64                 `json:"cache_max_bytes"`
 	MinFreeBytes   *uint64                `json:"min_free_bytes,omitempty"`
+	Psmux          string                 `json:"psmux,omitempty"`      // Windows: path of psmux.exe when it is not on PATH
+	MuxSocket      string                 `json:"mux_socket,omitempty"` // tmux/psmux -L socket (e.g. a logged-in psmux server)
 }
 
 func defaultSlots() int {
@@ -70,4 +72,38 @@ func (h *hostConfig) slotCount(class string) int {
 		return count
 	}
 	return defaultSlots()
+}
+
+// applyHostMux exports the executor's terminal-multiplexer settings from host.json (state root taken from
+// --state, CXRUN_STATE or the default) so every launch path uses them; explicit environment wins.
+func applyHostMux(args []string) {
+	root := os.Getenv("CXRUN_STATE")
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == "--state" {
+			root = args[i+1]
+		}
+	}
+	if root == "" {
+		if r, e := stateRoot(); e == nil {
+			root = r
+		}
+	}
+	cfg, e := readHostConfig(root)
+	if e != nil || cfg == nil {
+		return
+	}
+	if cfg.MuxSocket != "" && os.Getenv("CXRUN_TMUX_SOCKET") == "" {
+		_ = os.Setenv("CXRUN_TMUX_SOCKET", cfg.MuxSocket)
+	}
+	if cfg.Psmux != "" && os.Getenv("CX_PSMUX") == "" {
+		_ = os.Setenv("CX_PSMUX", cfg.Psmux)
+	}
+}
+
+// psmuxProgram is the psmux executable: CX_PSMUX (set from host.json) or psmux on PATH.
+func psmuxProgram() string {
+	if v := os.Getenv("CX_PSMUX"); v != "" {
+		return v
+	}
+	return "psmux"
 }
