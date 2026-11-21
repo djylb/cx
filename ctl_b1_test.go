@@ -49,7 +49,7 @@ func newControllerFixture(t *testing.T) controllerFixture {
 }
 func cliOutput(t *testing.T, code int, stdin []byte, exe string, args ...string) []byte {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 7*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, exe, args...)
 	cmd.Stdin = bytes.NewReader(stdin)

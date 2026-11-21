@@ -92,6 +92,11 @@ func waitAny(ctx context.Context, root, project, session, sinceFile string, out 
 			}
 			terminal := now.Terminal != "" && now.Terminal != before.Terminal
 			blocked := target.busy && s.Finished <= target.floor
+			// An explicit close of a job whose turns were already reported (or predate this wait) ends it
+			// without new information: not an event. Failure-like terminal states still wake the waiter.
+			if terminal && now.Terminal == "done" && s.Finished > 0 && s.Finished <= max(before.Finished, target.floor) {
+				terminal = false
+			}
 			question := s.State == "waiting_input" && (!blocked || s.InputKind != "next_turn")
 			mail := now.OutboxSeq > before.OutboxSeq
 			if mail && sinceFile == "" {

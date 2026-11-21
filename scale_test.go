@@ -90,7 +90,10 @@ func TestWaitAnyConsumers(t *testing.T) {
 	if err := writeJSON(filepath.Join(dir, "status.json"), first); err != nil {
 		t.Fatal(err)
 	}
-	check(call(a, "p", "s"), waitReport{Project: "p", Job: "work", State: "done", Outcome: "failed", Finished: 1, Code: 1})
+	// Closing after the (already reported) failed turn carries no new information: no event.
+	if line := fixtureCLI(t, 124, "wait", "--any", "--project", "p", "--session", "s", "--since-file", a, "--timeout", "60ms"); line != "" {
+		t.Fatal(line)
+	}
 
 	first.RunID, first.State, first.CompletedStatus = "replacement", "waiting", "completed"
 	if err := writeJSON(filepath.Join(dir, "status.json"), first); err != nil {
