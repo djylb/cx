@@ -1,0 +1,581 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/BurntSushi/toml"
+)
+
+type ctlOptions struct {
+	env                                                     map[string]string
+	cleanBase, all, explicitSession                         bool
+	project, session, tag, cwd, dir, host                   string
+	hosts, channels, sets, argv, pos                        []string
+	engine, model, effort, sandbox, role, parent            string
+	batch, snapshot, history, previous, input, image        string
+	quiet, timeout, idle, turnLimit, approval, stall, queue string
+	turn, cursor, since, kind, mention, repo, script, shell string
+	full, json, watch, any, wait, raw, refresh              bool
+	inplace, interactive, web, hard, network, noNetwork     bool
+	command, reuse, sync, force, noTools                    bool
+	max                                                     int
+}
+
+func ctlFlags(op string, o *ctlOptions) *flag.FlagSet {
+	f := cliFlags(op)
+	cmd := ctlCommands[op]
+	bools := map[string]*bool{
+		"all": &o.all, "clean-base": &o.cleanBase,
+		"refresh": &o.refresh, "cmd": &o.command, "reuse": &o.reuse,
+		"inplace": &o.inplace, "interactive": &o.interactive, "web-search": &o.web,
+		"hard": &o.hard, "network": &o.network, "no-network": &o.noNetwork,
+		"force": &o.force, "sync": &o.sync, "no-tools": &o.noTools,
+		"full": &o.full, "json": &o.json, "watch": &o.watch,
+		"any": &o.any, "wait": &o.wait, "raw": &o.raw,
+	}
+	stringsByName := map[string]*string{
+		"type": &o.kind, "mention": &o.mention, "repo": &o.repo,
+		"engine": &o.engine, "model": &o.model, "effort": &o.effort,
+		"sandbox": &o.sandbox, "role": &o.role, "parent": &o.parent,
+		"batch": &o.batch, "snapshot": &o.snapshot, "with-history": &o.history,
+		"dir": &o.dir, "continue": &o.previous, "input-json": &o.input,
+		"image": &o.image, "idle-exit": &o.idle, "turn-timeout": &o.turnLimit,
+		"approval-timeout": &o.approval, "stall": &o.stall, "queue-timeout": &o.queue,
+		"script": &o.script, "shell": &o.shell, "project": &o.project,
+		"session": &o.session, "tag": &o.tag, "cwd": &o.cwd,
+		"timeout": &o.timeout, "quiet-timeout": &o.quiet, "turn": &o.turn,
+		"cursor": &o.cursor, "since": &o.since,
+	}
+	const defaultPreviewBytes = 8192
+	o.max = defaultPreviewBytes
+	for _, k := range strings.Fields(cmd.flags) {
+		if p := bools[k]; p != nil {
+			f.BoolVar(p, k, false, ctlFlagHelp(op, k))
+			continue
+		}
+		if p := stringsByName[k]; p != nil {
+			f.StringVar(p, k, "", ctlFlagHelp(op, k))
+			continue
+		}
+		switch k {
+		case "max-bytes":
+			f.IntVar(&o.max, k, defaultPreviewBytes, "preview budget in bytes")
+		case "host":
+			if op == "agent" {
+				f.StringVar(&o.host, k, "auto", "execution host (auto uses CX_DEFAULT_HOST, project configuration, or local)")
+				continue
+			}
+			f.Func(k, ctlFlagHelp(op, k), func(v string) error { o.hosts = append(o.hosts, v); return nil })
+		case "chat":
+			f.Func(k, ctlFlagHelp(op, k), func(v string) error { o.channels = append(o.channels, v); return nil })
+		case "env":
+			f.Func(k, ctlFlagHelp(op, k), func(v string) error { return addCommandEnv(&o.env, v) })
+		case "set":
+			f.Func(k, ctlFlagHelp(op, k), func(v string) error { o.sets = append(o.sets, v); return nil })
+		default:
+			panic("unregistered flag " + k)
+		}
+	}
+	return f
+}
+
+func parseCtl(op string, args []string) (ctlOptions, error) {
+	var o ctlOptions
+	f := ctlFlags(op, &o)
+	hasSeparator := false
+	if i := slices.Index(args, "--"); i >= 0 {
+		hasSeparator = true
+		o.argv = args[i+1:]
+		args = args[:i]
+	}
+	var flags []string
+	for i := 0; i < len(args); i++ {
+		v := args[i]
+		if isHelp(v) {
+			return o, flag.ErrHelp
+		}
+		if v == "-" || !strings.HasPrefix(v, "-") {
+			o.pos = append(o.pos, v)
+			continue
+		}
+		key, _, assigned := strings.Cut(strings.TrimLeft(v, "-"), "=")
+		opt := f.Lookup(key)
+		if opt == nil {
+			return o, fmt.Errorf("unknown flag %s", v)
+		}
+		if key == "with-history" && !assigned && (i+1 == len(args) || strings.HasPrefix(args[i+1], "-")) {
+			flags = append(flags, "--with-history=HEAD")
+			continue
+		}
+		flags = append(flags, v)
+		if _, ok := opt.Value.(interface{ IsBoolFlag() bool }); !ok && !assigned {
+			i++
+			if i == len(args) {
+				return o, fmt.Errorf("%s needs a value", v)
+			}
+			flags = append(flags, args[i])
+			if key == "chat" || key == "env" {
+				for i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+					i++
+					flags = append(flags, "--"+key, args[i])
+				}
+			}
+		}
+	}
+	if hasSeparator && op != "exec" && op != "run" {
+		return o, errors.New("unexpected --")
+	}
+	e := f.Parse(flags)
+	f.Visit(func(fl *flag.Flag) {
+		if fl.Name == "session" {
+			o.explicitSession = true
+		}
+	})
+	if o.all && o.explicitSession {
+		return o, errors.New("--all and --session are mutually exclusive")
+	}
+	if o.max < 0 {
+		return o, errors.New("negative output budget")
+	}
+	return o, e
+}
+func currentSession() string {
+	for _, key := range []string{"CX_SESSION", "CLAUDE_CODE_HOST_SESSION_ID", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"} {
+		if v := os.Getenv(key); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+func defaultProject(ctx context.Context) (string, error) {
+	return projectAt(ctx, ".")
+}
+func projectAt(ctx context.Context, dir string) (string, error) {
+	if p := os.Getenv("CX_PROJECT"); p != "" {
+		return p, nil
+	}
+	identity := probe(ctx, "git", "-C", dir, "rev-parse", "--path-format=absolute", "--git-common-dir")
+	if identity != "" {
+		directory, e := projectDirectory()
+		if e != nil {
+			return "", e
+		}
+		files, e := filepath.Glob(filepath.Join(directory, "*.toml"))
+		if e != nil {
+			return "", e
+		}
+		match := ""
+		for _, path := range files {
+			var def struct{ Repositories []struct{ Path string } }
+			if _, e = toml.DecodeFile(path, &def); e != nil {
+				return "", e
+			}
+			for _, repo := range def.Repositories {
+				if probe(ctx, "git", "-C", repo.Path, "rev-parse", "--path-format=absolute", "--git-common-dir") == identity {
+					if match != "" {
+						return "", errors.New("repository belongs to multiple projects; set CX_PROJECT")
+					}
+					match = strings.TrimSuffix(filepath.Base(path), ".toml")
+					break
+				}
+			}
+		}
+		if match != "" {
+			return match, nil
+		}
+	}
+	p := probe(ctx, "git", "-C", dir, "rev-parse", "--show-toplevel")
+	if p == "" {
+		p, _ = filepath.Abs(dir)
+	}
+	p = regexp.MustCompile("[^A-Za-z0-9_.-]").ReplaceAllString(filepath.Base(p), "-")
+	p = strings.TrimLeft(p, "._-")
+	if p == "" {
+		return "project", nil
+	}
+	return p[:min(48, len(p))], nil
+}
+func controller(ctx context.Context, a []string) error {
+	if len(a) == 1 && isHelp(a[0]) {
+		printCtlHelp(os.Stdout, "")
+		return nil
+	}
+	if len(a) == 0 {
+		return ctlUsage("", errors.New("command required"))
+	}
+	if a[0] == "--max-bytes" && len(a) >= 3 {
+		a = append(append([]string{}, a[2:]...), "--max-bytes", a[1])
+	} else if strings.HasPrefix(a[0], "--max-bytes=") && len(a) > 1 {
+		a = append(append([]string{}, a[1:]...), a[0])
+	}
+	op := a[0]
+	if _, ok := ctlCommands[op]; !ok || strings.HasPrefix(op, "chat-") || strings.HasPrefix(op, "project-") {
+		return ctlUsage("", fmt.Errorf("unknown cx command %q", op))
+	}
+	if len(a) > 1 && isHelp(a[1]) {
+		return ctlUsage(op, flag.ErrHelp)
+	}
+	if op == "chat" {
+		if len(a) < 2 {
+			return ctlUsage(op, errors.New("chat requires an action"))
+		}
+		action := "chat-" + a[1]
+		if _, ok := ctlCommands[action]; !ok {
+			return ctlUsage(op, fmt.Errorf("unknown chat action %q", a[1]))
+		}
+		o, e := parseCtl(action, a[2:])
+		if e != nil {
+			return ctlUsage(action, e)
+		}
+		hs, e := loadEndpoints()
+		if e != nil {
+			return e
+		}
+		return ctlChat(ctx, hs, a[1], o)
+	}
+	if op == "test" || op == "gate" {
+		if op == "gate" && (len(a) < 2 || strings.HasPrefix(a[1], "-")) {
+			return ctlUsage(op, errors.New("gate requires DIR"))
+		}
+		if op == "gate" && len(a) > 2 && isHelp(a[2]) {
+			return ctlUsage(op, flag.ErrHelp)
+		}
+		return legacyGate(ctx, a)
+	}
+	if op == "fork" || op == "resume" {
+		return ctlRestart(ctx, op, a[1:])
+	}
+	if op == "project" {
+		return ctlProject(ctx, a[1:])
+	}
+	if op == "version" {
+		if len(a) != 1 {
+			return ctlUsage(op, errors.New("version takes no arguments"))
+		}
+		return printVersion()
+	}
+	if isThinControl(op) || op == "hosts" || op == "outbox" {
+		return ctlForward(ctx, op, a[1:])
+	}
+	o, e := parseCtl(op, a[1:])
+	if e != nil {
+		return ctlUsage(op, e)
+	}
+	if op == "wait" && !o.any && (o.all || o.explicitSession || len(o.hosts) > 0 || o.project != "" || o.session != "" || o.cursor != "" || len(o.channels) > 0) {
+		return ctlUsage(op, errors.New("wait filters require --any"))
+	}
+	if (op == "ls" || op == "overview" || op == "wait" && o.any) && !o.all && !o.explicitSession {
+		o.session = currentSession()
+		if o.session == "" {
+			fmt.Fprintf(os.Stderr, "cx %s: current session unknown, showing jobs from all sessions\n", op)
+		}
+	}
+	hs, e := loadEndpoints()
+	if e != nil {
+		return e
+	}
+	switch {
+	case op == "mirror":
+		return mirror(ctx, hs, o)
+	case op == "run" || op == "agent" || op == "snapshot":
+		return ctlSubmit(ctx, hs, op, o)
+	case op == "doctor" || op == "ls" || op == "overview":
+		return displayHosts(ctx, hs, op, o)
+	case op == "wait" && o.any:
+		return ctlWaitAny(ctx, hs, o)
+	}
+	if op == "rebase" {
+		if len(o.pos) != 2 {
+			return ctlUsage(op, errors.New("rebase requires JOB and TEXT"))
+		}
+		o.dir = o.pos[1]
+		o.pos = o.pos[:1]
+	}
+	if op == "apply" && len(o.pos) == 2 {
+		o.dir = o.pos[1]
+		o.pos = o.pos[:1]
+	}
+	if len(o.pos) != 1 {
+		return ctlUsage(op, fmt.Errorf("%s requires one host or job", op))
+	}
+	name, id := o.pos[0], ""
+	if op != "exec" && op != "setup" && op != "host" {
+		name, id, e = resolveJob(ctx, name)
+		if e != nil {
+			return e
+		}
+	}
+	h, e := hs.get(name)
+	if e != nil {
+		return e
+	}
+	if id != "" && op != "clean" {
+		var d time.Duration
+		if op == "tail" || op == "wait" {
+			d, e = observation(o.timeout)
+			if e != nil {
+				return e
+			}
+		}
+		started := time.Now()
+		if handled, e := observeSubmission(ctx, name, id, op, d); handled || e != nil {
+			return e
+		}
+		if op == "wait" || op == "tail" {
+			remaining := d - time.Since(started)
+			if remaining <= 0 {
+				return ctlExit(124)
+			}
+			o.timeout = remaining.String()
+		}
+	}
+	switch op {
+	case "clean":
+		return cleanControllerJob(ctx, h, name, id)
+	case "result", "patch", "apply", "rebase":
+		return ctlResult(ctx, name, id, op, o)
+	case "setup":
+		return retryTransfer(ctx, func() error { return deployOnce(ctx, hs, name, true) })
+	case "host":
+		r, e := h.call(ctx, 30*time.Second, append([]string{"host-config"}, o.sets...)...)
+		if e != nil {
+			return e
+		}
+		return r.output()
+	case "exec":
+		if o.script != "" && len(o.argv) > 0 || o.script == "" && o.shell != "" {
+			return ctlUsage(op, errors.New("exec uses --script FILE [--shell SHELL] or -- ARGV"))
+		}
+		if o.script == "" && (len(o.argv) == 0 || o.argv[0] == "") {
+			return ctlUsage(op, errors.New("exec requires -- ARGV"))
+		}
+		if o.project == "" {
+			o.project, e = defaultProject(ctx)
+			if e != nil {
+				return e
+			}
+		}
+		if o.tag == "" {
+			var nonce [4]byte
+			if _, e = rand.Read(nonce[:]); e != nil {
+				return e
+			}
+			o.tag = fmt.Sprintf("%s-%x", time.Now().Format("20060102-150405"), nonce)
+		}
+		id = o.project + "/" + o.tag
+		if _, e = jobDir("", id); e != nil {
+			return e
+		}
+		if o.reuse {
+			q := reuseQuery{Host: name, ID: id, Dir: o.cwd, Argv: o.argv, Shell: o.shell, Env: o.env}
+			if o.script != "" {
+				q.ScriptHash, e = fileHash(o.script)
+				if e != nil {
+					return e
+				}
+			}
+			found, e := lookupReuse(ctx, h, q)
+			if e != nil || found {
+				return e
+			}
+		}
+		args := []string{"submit-command", id, o.cwd}
+		for k, v := range o.env {
+			args = append(args, "--env", k+"="+v)
+		}
+		if o.session == "" {
+			o.session = currentSession()
+		}
+		for _, kv := range [][2]string{{"--session", o.session}, {"--queue-timeout", o.queue}, {"--quiet-timeout", o.quiet}, {"--timeout", o.timeout}} {
+			if kv[1] != "" {
+				args = append(args, kv[0], kv[1])
+			}
+		}
+		var r reply
+		if o.script != "" {
+			if h.SSH != "" && h.Platform == "" {
+				if e = deploy(ctx, hs, name); e != nil {
+					return e
+				}
+				h = hs[name]
+			}
+			r, e = submitScript(ctx, h, args, o.script, o.shell)
+		} else {
+			r, e = submitCommand(ctx, hs, name, append(append(args, "--"), o.argv...))
+		}
+		h = hs[name]
+		if e != nil {
+			return e
+		}
+		if r.code != 0 {
+			return r.output()
+		}
+		dst := os.Stdout
+		if o.wait {
+			dst = os.Stderr
+		}
+		if e = forgetResult(name, id); e != nil {
+			return e
+		}
+		if e = rememberRoute(id, name); e != nil {
+			return e
+		}
+		fmt.Fprintln(dst, id)
+		if !o.wait {
+			return nil
+		}
+		var ack status
+		if e = json.Unmarshal(r.data, &ack); e != nil {
+			return e
+		}
+		return follow(ctx, h, name, id, ctlOptions{raw: true, wait: true, cursor: "exec-" + ack.RunID})
+	case "tail":
+		return follow(ctx, h, name, id, o)
+	case "status":
+		r, e := h.call(ctx, 30*time.Second, "status", "--job", id)
+		if e != nil {
+			return e
+		}
+		return r.output()
+	case "show":
+		r, e := h.call(ctx, 30*time.Second, "show", id, o.turn, fmt.Sprint(o.json || o.full))
+		if e != nil {
+			return e
+		}
+		if r.code != 0 {
+			return r.output()
+		}
+		return r.output()
+	case "wait":
+		limit, e := observation(o.timeout)
+		if e != nil {
+			return e
+		}
+		return waitOne(ctx, h, id, limit)
+	}
+	return errors.New("invalid command")
+}
+func waitOne(ctx context.Context, h endpoint, id string, limit time.Duration) error {
+	r, e := h.call(ctx, limit+2*time.Second, "observe-one", id, limit.String())
+	if e != nil {
+		return e
+	}
+	// The node appends its terminal snapshot to the ordinary wait diagnostic.
+	first, last, ok := bytes.Cut(r.data, []byte("\n{"))
+	if ok {
+		var s status
+		if e = json.Unmarshal(append([]byte("{"), last...), &s); e != nil {
+			return e
+		}
+		if isTerminal(s.State) {
+			fmt.Printf("job=%s status=%s completed_turn=%s outcome=%s", s.Job, s.State, s.LastCompleted, s.CompletedStatus)
+			if s.ExitCode != nil {
+				fmt.Printf(" exit_code=%d", *s.ExitCode)
+			}
+			fmt.Println()
+			return resultCode(s, r.code)
+		}
+		r.data = append(first, '\n')
+	}
+	return r.output()
+}
+func observation(s string) (time.Duration, error) {
+	if s == "" {
+		s = os.Getenv("CXRUN_MONITOR_TIMEOUT")
+	}
+	if s == "" {
+		return defaultMonitorTimeout, nil
+	}
+	d, e := time.ParseDuration(s)
+	if e != nil || d <= 0 {
+		return 0, errors.New("invalid observation timeout")
+	}
+	return d, nil
+}
+func resultCode(s status, fallback int) error {
+	if s.Engine == "cmd" {
+		if (s.State == "done" || s.State == "failed") && s.ExitCode != nil && *s.ExitCode >= 0 {
+			fallback = int(*s.ExitCode)
+		} else if code, ok := terminalCodes[s.State]; ok {
+			fallback = code
+		}
+	}
+	if fallback != 0 {
+		return ctlExit(fallback)
+	}
+	return nil
+}
+func preview(b []byte, o ctlOptions) error {
+	if o.json || o.watch || o.full || len(b) <= o.max {
+		_, e := os.Stdout.Write(b)
+		return e
+	}
+	f, e := os.CreateTemp("", "cx-output-*")
+	if e != nil {
+		return e
+	}
+	_, e = f.Write(b)
+	if e = errors.Join(e, f.Close()); e != nil {
+		return e
+	}
+	fmt.Fprintln(os.Stderr, f.Name())
+	n := o.max
+	for n > 0 && n < len(b) && b[n]&0xc0 == 0x80 {
+		n--
+	}
+	_, e = os.Stdout.Write(b[:n])
+	return e
+}
+func cursorFile(parts ...string) (string, error) {
+	home, e := os.UserHomeDir()
+	if e != nil {
+		return "", e
+	}
+	p := filepath.Join(home, ".cache", "cx", "cursors")
+	for _, part := range parts {
+		p, e = jobPath(p, part)
+		if e != nil {
+			return "", e
+		}
+	}
+	return p, os.MkdirAll(filepath.Dir(p), 0700)
+}
+
+var keyEvent = regexp.MustCompile("^(item/(started|completed) commandExecution|command/(start|exit|stop)|turn/(plan/updated|steer|start|completed|interrupt)|item/completed plan|error|stall|agent/(ask|send)|server/request|failed|restart)$")
+
+func resolveJob(ctx context.Context, address string) (name, id string, e error) {
+	name = address
+	var ok bool
+	name, id, ok = strings.Cut(name, ":")
+	if !ok {
+		id = name
+		name = "local"
+	}
+	if !strings.Contains(id, "/") {
+		p, err := defaultProject(ctx)
+		if err != nil {
+			return "", "", err
+		}
+		id = p + "/" + id
+	}
+	id = strings.TrimPrefix(id, "/")
+	if _, e = jobDir("", id); e != nil {
+		return "", "", e
+	}
+	if !strings.Contains(address, ":") {
+		name, e = lookupRoute(id)
+	}
+	return name, id, e
+}
