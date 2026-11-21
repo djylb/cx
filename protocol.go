@@ -39,6 +39,7 @@ type frame struct {
 }
 type server struct {
 	cmd             *exec.Cmd
+	finishLog       func() error
 	in              io.WriteCloser
 	frames          chan frame
 	stop            chan struct{}
@@ -77,8 +78,14 @@ func openServer(c config, dir string) (*server, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer log.Close()
-	cmd.Stderr = log
+	keepLog := false
+	defer func() {
+		if !keepLog {
+			log.Close()
+		}
+	}()
+	stderr, flush := c.secret.output(cmd, log)
+	cmd.Stderr = stderr
 	in, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, err
@@ -96,6 +103,10 @@ func openServer(c config, dir string) (*server, error) {
 		return nil, err
 	}
 	s := &server{tree: tree, writes: make(chan writeRequest, 16), expired: make(map[string]bool), writeTimeout: 10 * time.Second, cmd: cmd, in: in, frames: make(chan frame, 32), stop: make(chan struct{})}
+	if c.secret != nil {
+		keepLog = true
+		s.finishLog = func() error { return errors.Join(flush(), log.Close()) }
+	}
 	go s.writer()
 	go func() {
 		defer close(s.frames)
@@ -122,6 +133,17 @@ func openServer(c config, dir string) (*server, error) {
 }
 
 // Read the final notifications through EOF before Wait closes the stdout pipe.
+func (s *server) wait() error {
+	err := s.cmd.Wait()
+	if errors.Is(err, exec.ErrWaitDelay) {
+		err = nil
+	}
+	if s.finishLog != nil {
+		err = errors.Join(err, s.finishLog())
+	}
+	return err
+}
+
 func (r *runner) shutdown() (result error) {
 	s := r.srv
 	defer s.tree.cleanup()
@@ -158,7 +180,7 @@ drain:
 	drainErr = errors.Join(drainErr, r.flushTurnFailure())
 	close(s.stop)
 	done := make(chan error, 1)
-	go func() { done <- s.cmd.Wait() }()
+	go func() { done <- s.wait() }()
 	select {
 	case err := <-done:
 		return errors.Join(drainErr, err)
@@ -235,12 +257,16 @@ func (r *runner) read(f frame) (message, error) {
 		}
 		return m, fmt.Errorf("%w: %v", errServerClosed, f.err)
 	}
-	if err := json.Unmarshal(f.raw, &m); err != nil {
+	raw, err := r.c.secret.jsonStrings(f.raw)
+	if err != nil {
+		return m, err
+	}
+	if err := json.Unmarshal(raw, &m); err != nil {
 		return m, fmt.Errorf("invalid app-server JSON: %w", err)
 	}
 	if m.Method != "" {
 		var record map[string]json.RawMessage
-		if err := json.Unmarshal(f.raw, &record); err != nil {
+		if err := json.Unmarshal(raw, &record); err != nil {
 			return m, err
 		}
 		if err := r.appendEvent(r.events, record); err != nil {

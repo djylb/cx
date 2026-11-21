@@ -163,11 +163,12 @@ func briefStatus(s status) any {
 		Project   string    `json:"project"`
 		Job       string    `json:"job"`
 		Session   string    `json:"session"`
+		Profile   string    `json:"profile,omitempty"`
 		State     string    `json:"status"`
 		Turn      string    `json:"turn_id"`
 		Finished  int64     `json:"completed_turns"`
 		LastEvent time.Time `json:"last_event_time"`
 		turnSummary
 		RateLimit rateLimitStatus `json:"rate_limit"`
-	}{s.Project, s.Job, s.Session, s.State, s.Turn, s.Finished, s.LastEvent, s.turnSummary, s.rateLimitStatus}
+	}{s.Project, s.Job, s.Session, s.Profile, s.State, s.Turn, s.Finished, s.LastEvent, s.turnSummary, s.rateLimitStatus}
 }

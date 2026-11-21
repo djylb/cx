@@ -106,9 +106,13 @@ func (r *runner) restartServer() error {
 	close(old.stop)
 	old.in.Close()
 	old.tree.cleanup()
-	if err := waitProcess(old.cmd, 5*time.Second); errors.Is(err, errReapDeadline) {
+	done := make(chan error, 1)
+	go func() { done <- old.wait() }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
 		r.srv = nil
-		return err
+		return errReapDeadline
 	}
 	r.srv = nil
 	r.s.Approvals = nil

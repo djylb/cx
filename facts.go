@@ -71,7 +71,7 @@ func hostFacts(ctx context.Context, root string) fields {
 	probes := []func() fields{
 		func() fields { return fields{"os_version": stringOrNil(osVersion(ctx))} },
 		func() fields { return fields{"codex_version": stringOrNil(probe(ctx, "codex", "--version"))} },
-		func() fields { return fields{"codex_login_status": loginStatus(ctx)} },
+		func() fields { return fields{"codex_login_status": loginStatus(ctx, nil)} },
 		func() fields { return fields{"version_managers": managerDirs()} },
 		func() fields { return platformFacts(ctx, root) },
 	}
@@ -92,17 +92,23 @@ func hostFacts(ctx context.Context, root string) fields {
 	}
 	return f
 }
-func loginStatus(ctx context.Context) any {
+func loginStatus(ctx context.Context, env []string) any {
 	// Keep login output private. Codex can include account information in its diagnostic.
 	loginCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(loginCtx, "codex", "login", "status")
+	if len(env) > 0 {
+		cmd.Env = append(cmd.Environ(), env...)
+	}
 	cmd.WaitDelay = 200 * time.Millisecond
 	b, err := cmd.CombinedOutput()
+	if loginCtx.Err() != nil {
+		return nil
+	}
 	login := strings.ToLower(strings.TrimSpace(string(b)))
 	if strings.Contains(login, "not logged in") {
 		return "logged_out"
-	} else if err == nil && strings.Contains(login, "logged in") {
+	} else if err == nil {
 		return "logged_in"
 	}
 	return nil

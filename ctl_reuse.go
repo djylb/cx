@@ -15,6 +15,7 @@ import (
 
 type reuseQuery struct {
 	Env                                   map[string]string
+	Profile                               string `json:",omitempty"`
 	Host, ID, Key, Dir, ScriptHash, Shell string
 	Argv                                  []string
 }
@@ -79,10 +80,14 @@ func findReuse(ctx context.Context, raw string) error {
 	if !exists && q.Dir == "" && q.Key == "" {
 		return nil
 	}
+	profile, _, e := selectedProfile(root, q.Profile, true)
+	if e != nil {
+		return e
+	}
 	var hit *reuseHit
 	var newest time.Time
 	e = scanJobs(ctx, root, p, "", func(s status) (bool, error) {
-		if s.Engine != "cmd" || s.ExitCode == nil || s.State != "done" && s.State != "failed" || s.LastEvent.Before(newest) {
+		if s.Profile != profile || s.Engine != "cmd" || s.ExitCode == nil || s.State != "done" && s.State != "failed" || s.LastEvent.Before(newest) {
 			return false, nil
 		}
 		id := s.Project + "/" + s.Job

@@ -46,6 +46,8 @@ const (
 const dangerFullAccess = "danger-full-access"
 
 type config struct {
+	localEnv                            []string
+	secret                              *secretFilter
 	Env                                 map[string]string `json:"env,omitempty"`
 	JobTools                            bool              `json:"job_tools,omitempty"`
 	Engine                              string            `json:"engine,omitempty"`
@@ -78,6 +80,7 @@ func (c config) privileged() bool {
 }
 
 type status struct {
+	Profile         string          `json:"profile,omitempty"`
 	OutboxSeq       uint64          `json:"outbox_seq,omitempty"`
 	Generation      uint64          `json:"generation,omitempty"`
 	InputKind       string          `json:"input_kind,omitempty"`
@@ -291,6 +294,12 @@ func runNode(ctx context.Context, args []string, directSubmit bool) error {
 		fs.StringVar(&listFields, "fields", "", "brief for compact status")
 	}
 	var force, command bool
+	var requestedProfile string
+	if op == "start" || op == "resume" || op == "fork" {
+		fs.StringVar(&requestedProfile, "profile", "", "execution host profile")
+	}
+	newProfile := op == "start"
+
 	var prompt, preamblePath, stallNudgePath string
 	if op == "start" {
 		fs.BoolVar(&command, "cmd", false, "start a command")
@@ -408,6 +417,7 @@ func runNode(ctx context.Context, args []string, directSubmit bool) error {
 		enc := json.NewEncoder(os.Stdout)
 		return readMail(dir, outSince, func(m agentMail) error { return enc.Encode(m) })
 	}
+	profile := requestedProfile
 	if op == "fork" {
 		if len(pos) != 1 {
 			return errors.New("fork SOURCE --job NEW")
@@ -437,6 +447,9 @@ func runNode(ctx context.Context, args []string, directSubmit bool) error {
 		}
 		if !c.driver().capabilities().Fork {
 			return errors.New("driver does not support fork")
+		}
+		if profile == "" {
+			profile = from.Profile
 		}
 		c.ForkThread = from.Thread
 		c.Through = opts.through
@@ -506,9 +519,13 @@ func runNode(ctx context.Context, args []string, directSubmit bool) error {
 	c.Project, c.Session = *project, *session
 	s := status{Job: *job, Project: *project, Session: *session, State: "queued", LastEvent: time.Now().UTC()}
 	if op == "start" {
+		s.Profile, _, err = selectedProfile(root, profile, newProfile)
+		if err != nil {
+			return err
+		}
 		if _, err = os.Stat(dir); err == nil {
 			if directSubmit {
-				if err = checkSubmission(dir, c, fs.Args()); err != nil {
+				if err = checkSubmission(dir, c, s.Profile, fs.Args()); err != nil {
 					return err
 				}
 			}
@@ -656,6 +673,14 @@ func runNode(ctx context.Context, args []string, directSubmit bool) error {
 			}
 		}
 	}
+	if op == "resume" {
+		if err = readJSON(filepath.Join(dir, "status.json"), &s); err != nil {
+			return err
+		}
+		if err = checkResumeProfile(root, s.Profile, requestedProfile); err != nil {
+			return err
+		}
+	}
 	f, err := os.OpenFile(filepath.Join(dir, "owner.lock"), os.O_RDWR, 0600)
 	if err != nil {
 		return err
@@ -801,6 +826,12 @@ func runNode(ctx context.Context, args []string, directSubmit bool) error {
 		return errors.Join(err, r.save())
 	}
 	defer r.releaseBuildCache()
+	if err = r.loadCredentials(); err != nil {
+		r.s.State = "failed"
+		r.s.PID = 0
+		r.s.Error = err.Error()
+		return errors.Join(err, r.save())
+	}
 	return r.c.driver().run(&r)
 }
 func main() {

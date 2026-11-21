@@ -304,6 +304,9 @@ func fixtureServer() error {
 					return nil
 				}
 				fallthrough
+			case "credential":
+				itemEvent(fields{"type": "agentMessage", "text": os.Getenv("AUTH_VALUE")})
+				notify("turn/completed", fields{"turn": fields{"id": turnID, "status": "completed"}})
 			case "complete":
 				notify("turn/completed", fields{"turn": fields{"id": turnID, "status": "completed"}})
 			default:

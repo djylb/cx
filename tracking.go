@@ -33,6 +33,7 @@ func (c config) mark(cmd *exec.Cmd, dir string) {
 	for k, v := range c.Env {
 		env = append(env, k+"="+v)
 	}
+	env = append(env, c.localEnv...)
 	cmd.Env = append(env, "CXRUN_JOB="+c.Project+"/"+filepath.Base(dir), "CXRUN_RUN="+c.RunID)
 }
 func sameProcess(start, current uint64) bool { return start != 0 && start == current }

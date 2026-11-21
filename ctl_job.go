@@ -172,8 +172,9 @@ func launchRunner(ctx context.Context, dir, work string, argv []string, env map[
 	}
 }
 
-func restartFlags(op string, child, through *string) *flag.FlagSet {
+func restartFlags(op string, child, through, profile *string) *flag.FlagSet {
 	fs := cliFlags(op)
+	fs.StringVar(profile, "profile", "", "execution host profile")
 	if op == "fork" {
 		fs.StringVar(child, "job", "", "required child job tag")
 		fs.StringVar(through, "through", "", "last turn to include (defaults to all turns)")
@@ -185,8 +186,8 @@ func ctlRestart(ctx context.Context, op string, a []string) error {
 	if len(a) == 0 || strings.HasPrefix(a[0], "-") {
 		return ctlUsage(op, fmt.Errorf("%s needs a job", op))
 	}
-	child, through := "", ""
-	fs := restartFlags(op, &child, &through)
+	child, through, profile := "", "", ""
+	fs := restartFlags(op, &child, &through, &profile)
 	if e := fs.Parse(a[1:]); e != nil {
 		return ctlUsage(op, e)
 	}
@@ -215,7 +216,11 @@ func ctlRestart(ctx context.Context, op string, a []string) error {
 			return e
 		}
 	}
-	r, e := h.invoke(ctx, 20*time.Second, false, "restart-job", op, host, id, child, through)
+	argv := []string{"restart-job", op, host, id, child, through}
+	if profile != "" {
+		argv = append(argv, profile)
+	}
+	r, e := h.invoke(ctx, 20*time.Second, false, argv...)
 	if e != nil {
 		return e
 	}
@@ -233,10 +238,14 @@ func ctlRestart(ctx context.Context, op string, a []string) error {
 	return nil
 }
 func restartNode(ctx context.Context, a []string) error {
-	if len(a) != 5 {
+	if len(a) != 5 && len(a) != 6 {
 		return errors.New("invalid restart arguments")
 	}
 	op, host, id := a[0], a[1], a[2]
+	var profile string
+	if len(a) == 6 {
+		profile = a[5]
+	}
 	root, e := stateRoot()
 	if e != nil {
 		return e
@@ -279,6 +288,19 @@ func restartNode(ctx context.Context, a []string) error {
 	defer lock.Close()
 	if e = readJSON(filepath.Join(dir, "status.json"), &s); e != nil {
 		return e
+	}
+	if op == "resume" {
+		if e = checkResumeProfile(root, s.Profile, profile); e != nil {
+			return e
+		}
+	} else if op == "fork" {
+		selected := profile
+		if selected == "" {
+			selected = s.Profile
+		}
+		if _, _, e = selectedProfile(root, selected, false); e != nil {
+			return e
+		}
 	}
 	argv := []string{"resume", "--job", id}
 	env := map[string]string{"CX_PARENT": host + ":" + id}
@@ -329,10 +351,13 @@ func restartNode(ctx context.Context, a []string) error {
 	} else if op != "resume" {
 		return errors.New("invalid operation")
 	}
+	if profile != "" {
+		argv = append(argv, "--profile", profile)
+	}
 	return launchRunner(ctx, dir, work, argv, env, resume)
 }
 
-func continueNode(ctx context.Context, host, id, text string) error {
+func continueNode(ctx context.Context, host, id, text, profile string) error {
 	root, e := stateRoot()
 	if e != nil {
 		return e
@@ -343,6 +368,9 @@ func continueNode(ctx context.Context, host, id, text string) error {
 	}
 	var s status
 	if e = projected(ctx, dir, &s); e != nil {
+		return e
+	}
+	if e = checkResumeProfile(root, s.Profile, profile); e != nil {
 		return e
 	}
 	if isTerminal(s.State) && s.Thread != "" {

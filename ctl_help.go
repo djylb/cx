@@ -14,7 +14,7 @@ type ctlCommand struct {
 	usage, summary, flags string
 }
 
-const submitFlags = "engine model effort sandbox role parent snapshot with-history input-json image idle-exit turn-timeout approval-timeout stall queue-timeout inplace interactive web-search hard network no-network force sync no-tools clean-base"
+const submitFlags = "profile engine model effort sandbox role parent snapshot with-history input-json image idle-exit turn-timeout approval-timeout stall queue-timeout inplace interactive web-search hard network no-network force sync no-tools clean-base"
 
 var ctlCommands = map[string]ctlCommand{
 	"agent":        {"[--host HOST] [--dir DIR] TEXT|@FILE|-\n  cx agent --continue JOB TEXT|@FILE|-", "Submit or continue an agent and read its report.", submitFlags + " dir host tag continue full"},
@@ -32,8 +32,8 @@ var ctlCommands = map[string]ctlCommand{
 	"diff":         {"JOB", "Read recorded diff events.", ""},
 	"doctor":       {"[HOST ...]", "Check execution hosts.", "json"},
 	"events":       {"JOB", "Read recorded events.", ""},
-	"exec":         {"HOST [options] -- ARGV...\n  cx exec HOST --script FILE [--shell SHELL] [options]", "Submit a command job.", "project tag cwd timeout quiet-timeout queue-timeout wait session script shell reuse env"},
-	"fork":         {"JOB --job CHILD [--through TURN]", "Fork a Codex thread on its current host.", ""},
+	"exec":         {"HOST [options] -- ARGV...\n  cx exec HOST --script FILE [--shell SHELL] [options]", "Submit a command job.", "project tag cwd timeout quiet-timeout queue-timeout wait session script shell reuse env profile"},
+	"fork":         {"JOB --job CHILD [--through TURN] [--profile NAME]", "Fork a Codex thread on its current host.", ""},
 	"gate":         {"DIR [GATE-ARGS ...]", "Run the source directory's scripts/gate.sh.", ""},
 	"history":      {"JOB [read|turns|items]", "Read Codex thread history.", ""},
 	"host":         {"HOST", "Read or update node configuration.", "set"},
@@ -57,7 +57,7 @@ var ctlCommands = map[string]ctlCommand{
 	"reply":        {"JOB [--request ID] (--result JSON|@FILE | --error JSON|@FILE)", "Reply to a Codex request.", ""},
 	"requests":     {"JOB", "List pending Codex requests.", ""},
 	"result":       {"JOB", "Collect and display a sealed turn's report.", "turn full wait refresh max-bytes"},
-	"resume":       {"JOB", "Restart a recoverable Codex job.", ""},
+	"resume":       {"JOB [--profile NAME]", "Restart a recoverable Codex job.", ""},
 	"review":       {"JOB --target JSON|@FILE", "Start a Codex review.", ""},
 	"rpc":          {"JOB METHOD", "Invoke a Codex RPC method.", ""},
 	"run":          {"HOST DIR TAG PROMPTFILE [options]\n  cx run HOST DIR TAG --cmd [options] -- ARGV...\n  cx run HOST DIR --batch FILE [options]", "Submit an agent or command job.", submitFlags + " batch cmd reuse timeout quiet-timeout"},
@@ -117,7 +117,7 @@ func printCtlHelp(w io.Writer, op string) {
 	case isThinControl(op):
 		f = controlFlags(op)
 	case op == "fork" || op == "resume":
-		f = restartFlags(op, new(string), new(string))
+		f = restartFlags(op, new(string), new(string), new(string))
 	}
 	f.SetOutput(w)
 	f.PrintDefaults()
@@ -194,7 +194,7 @@ var ctlFlagDescriptions = map[string]string{
 	"parent":  "parent `JOB` or session (defaults to CX_PARENT, then current session)",
 	"project": "select `PROJECT`", "raw": "show raw job output", "refresh": "refresh the cached result",
 	"repo": "select repository `PATH`", "reuse": "reuse matching successful command output",
-	"role": "agent `ROLE` (defaults to worker)", "sandbox": "sandbox `MODE` (defaults to workspace-write)",
+	"profile": "execution host credential profile `NAME`", "role": "agent `ROLE` (defaults to worker)", "sandbox": "sandbox `MODE` (defaults to workspace-write)",
 	"script": "upload and run `FILE`", "session": "select `SESSION` (defaults to the detected session where applicable)",
 	"set": "update a node setting with `NAME=VALUE` (repeatable)", "snapshot": "reuse snapshot `ID`",
 	"sync": "wait for job registration", "tag": "job `TAG` (generated when omitted)",

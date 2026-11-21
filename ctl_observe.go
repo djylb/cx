@@ -159,7 +159,7 @@ func displayHosts(ctx context.Context, hs endpoints, op string, o ctlOptions) er
 					}
 				} else {
 					if header {
-						fmt.Fprintln(&output, "JOB\tHOST\tROLE\tSTATUS\tTURNS\tPLAN\tFILES\tFAILED COMMAND\tRATE LIMIT\tTOKENS\tCONTEXT %")
+						fmt.Fprintln(&output, "JOB\tHOST\tROLE\tSTATUS\tTURNS\tPLAN\tFILES\tFAILED COMMAND\tRATE LIMIT\tTOKENS\tCONTEXT %\tPROFILE")
 						header = false
 					}
 					state := fmt.Sprint(row["status"])
@@ -174,7 +174,7 @@ func displayHosts(ctx context.Context, hs endpoints, op string, o ctlOptions) er
 						failure = fmt.Sprintf("%v (%v)", v["command"], v["exit_code"])
 					}
 					rate, _ := json.Marshal(row["rate_limit"])
-					values := []any{id, name, role, state, row["completed_turns"], row["plan_step"], row["changed_files"], failure, string(rate), row["tokens"], row["context_percent"]}
+					values := []any{id, name, role, state, row["completed_turns"], row["plan_step"], row["changed_files"], failure, string(rate), row["tokens"], row["context_percent"], row["profile"]}
 					for i, v := range values {
 						if i > 0 {
 							output.WriteByte('\t')
@@ -230,7 +230,11 @@ func displayHosts(ctx context.Context, hs endpoints, op string, o ctlOptions) er
 					fmt.Fprintf(&output, "%s %s\n", name, b)
 					if rows, ok := jobs.([]fields); ok {
 						for _, r := range rows {
-							fmt.Fprintf(&output, "%s%s/%s %s %s %v\n", strings.Repeat("  ", 1+r["depth"].(int)), r["project"], r["job"], r["role"], r["status"], r["plan_step"])
+							fmt.Fprintf(&output, "%s%s/%s %s %s %v", strings.Repeat("  ", 1+r["depth"].(int)), r["project"], r["job"], r["role"], r["status"], r["plan_step"])
+							if profile, ok := r["profile"].(string); ok {
+								fmt.Fprintf(&output, " profile=%s", profile)
+							}
+							output.WriteByte('\n')
 						}
 					}
 				}

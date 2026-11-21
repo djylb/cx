@@ -1,0 +1,335 @@
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"slices"
+	"strings"
+	"sync"
+	"time"
+	"unicode/utf8"
+)
+
+type hostProfile struct {
+	CodexHome       string `json:"codex_home,omitempty"`
+	ClaudeConfigDir string `json:"claude_config_dir,omitempty"`
+	EnvFile         string `json:"env_file,omitempty"`
+}
+
+// Empty is a valid recorded selection. Only a new submission uses the default.
+func (h *hostConfig) profile(name string) (hostProfile, error) {
+	p, ok := h.Profiles[name]
+	if name != "" && !ok {
+		return p, fmt.Errorf("unknown profile %q", name)
+	}
+	if name == "" {
+		p = hostProfile{}
+	}
+	if p.EnvFile == "" {
+		p.EnvFile = h.EnvFile
+	}
+	return p, nil
+}
+
+func selectedProfile(root, name string, useDefault bool) (string, hostProfile, error) {
+	h, err := readHostConfig(root)
+	if err != nil {
+		return "", hostProfile{}, err
+	}
+	if name == "" && useDefault {
+		name = h.DefaultProfile
+	}
+	p, err := h.profile(name)
+	return name, p, err
+}
+
+func stateRelative(root, path string) string {
+	if path == "" || filepath.IsAbs(path) {
+		return path
+	}
+	return filepath.Join(root, path)
+}
+
+func (p hostProfile) accountEnv(root string) []string {
+	var env []string
+	if p.CodexHome != "" {
+		env = append(env, "CODEX_HOME="+stateRelative(root, p.CodexHome))
+	}
+	if p.ClaudeConfigDir != "" {
+		env = append(env, "CLAUDE_CONFIG_DIR="+stateRelative(root, p.ClaudeConfigDir))
+	}
+	return env
+}
+
+func parseEnvFile(data string) (map[string]string, error) {
+	env := map[string]string{}
+	for i, line := range strings.Split(data, "\n") {
+		line = strings.TrimSuffix(line, "\r")
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		key, value, ok := strings.Cut(line, "=")
+		key = strings.TrimSpace(key)
+		if !ok || !envName.MatchString(key) || strings.ContainsRune(value, 0) || !utf8.ValidString(value) {
+			return nil, fmt.Errorf("invalid env_file assignment on line %d", i+1)
+		}
+		env[key] = value
+	}
+	return env, nil
+}
+
+// The runtime environment is deliberately unexported in config. Only the
+// payload gets these values, including when its runner was launched via a mux.
+func (r *runner) loadCredentials() error {
+	root, err := filepath.Abs(r.root)
+	if err != nil {
+		return err
+	}
+	_, p, err := selectedProfile(root, r.s.Profile, false)
+	if err != nil {
+		return err
+	}
+	if p.EnvFile != "" {
+		path := stateRelative(root, p.EnvFile)
+		info, err := os.Stat(path)
+		if err == nil && !info.Mode().IsRegular() {
+			return fmt.Errorf("env_file is not a regular file")
+		}
+		var data []byte
+		if err == nil {
+			data, err = os.ReadFile(path)
+		}
+		if err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("read env_file: %w", err)
+		}
+		if err == nil {
+			env, err := parseEnvFile(string(data))
+			if err != nil {
+				return err
+			}
+			keys := make([]string, 0, len(env))
+			for key, value := range env {
+				keys = append(keys, key)
+				r.c.localEnv = append(r.c.localEnv, key+"="+value)
+			}
+			slices.Sort(keys)
+			r.c.secret, err = newSecretFilter(env)
+			if err != nil {
+				return err
+			}
+			method, _ := json.Marshal("env_file/loaded")
+			params, _ := json.Marshal(fields{"keys": keys})
+			f, err := os.OpenFile(filepath.Join(r.dir, "events.jsonl"), os.O_APPEND|os.O_WRONLY, 0600)
+			if err != nil {
+				return err
+			}
+			err = r.appendEvent(f, map[string]json.RawMessage{"method": method, "params": params})
+			closeErr := f.Close()
+			if err != nil {
+				return err
+			}
+			if closeErr != nil {
+				return closeErr
+			}
+		}
+	}
+	r.c.localEnv = append(r.c.localEnv, p.accountEnv(root)...)
+	return nil
+}
+
+func sensitiveKey(key string) bool {
+	key = strings.ToUpper(key)
+	return strings.HasSuffix(key, "_API_KEY") || strings.Contains(key, "TOKEN") ||
+		strings.Contains(key, "SECRET") || strings.Contains(key, "PASSWORD")
+}
+
+func warnCredentialKey(key string) {
+	fmt.Fprintf(os.Stderr, "cx: %s 看起来是凭据键名，请改用执行端 env_file\n", key)
+}
+
+func warnInputCredentials(data []byte) {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	seen := map[string]bool{}
+	var scan func(json.Token)
+	scan = func(token json.Token) {
+		switch token {
+		case json.Delim('{'):
+			for dec.More() {
+				k, _ := dec.Token()
+				key, _ := k.(string)
+				if sensitiveKey(key) && !seen[key] {
+					warnCredentialKey(key)
+					seen[key] = true
+				}
+				value, _ := dec.Token()
+				scan(value)
+			}
+			_, _ = dec.Token()
+		case json.Delim('['):
+			for dec.More() {
+				value, _ := dec.Token()
+				scan(value)
+			}
+			_, _ = dec.Token()
+		}
+	}
+	first, _ := dec.Token()
+	scan(first)
+}
+
+// The filter handles literal values from env_file in cx-captured output.
+// Ordering longer values first also handles values that share a prefix.
+type secretFilter struct {
+	pattern *regexp.Regexp
+	values  []string
+}
+
+func newSecretFilter(env map[string]string) (*secretFilter, error) {
+	values := make([]string, 0, len(env))
+	for _, v := range env {
+		if v != "" {
+			values = append(values, v)
+		}
+	}
+	if len(values) == 0 {
+		return nil, nil
+	}
+	slices.SortFunc(values, func(a, b string) int { return len(b) - len(a) })
+	patterns := make([]string, len(values))
+	for i, v := range values {
+		patterns[i] = regexp.QuoteMeta(v)
+	}
+	pattern, err := regexp.Compile(strings.Join(patterns, "|"))
+	if err != nil {
+		// Regexp diagnostics can quote the pattern, which contains credentials.
+		return nil, fmt.Errorf("env_file values exceed filtering capacity")
+	}
+	return &secretFilter{pattern, values}, nil
+}
+
+const hiddenValue = "[REDACTED]"
+
+func (f *secretFilter) text(s string) string {
+	if f == nil {
+		return s
+	}
+	return f.pattern.ReplaceAllLiteralString(s, hiddenValue)
+}
+
+func (f *secretFilter) jsonStrings(raw json.RawMessage) (json.RawMessage, error) {
+	if f == nil {
+		return raw, nil
+	}
+	var data any
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	if err := dec.Decode(&data); err != nil {
+		return nil, fmt.Errorf("invalid agent JSON")
+	}
+	var redact func(any) any
+	redact = func(v any) any {
+		switch x := v.(type) {
+		case string:
+			return f.text(x)
+		case map[string]any:
+			for k, child := range x {
+				x[k] = redact(child)
+			}
+		case []any:
+			for i, child := range x {
+				x[i] = redact(child)
+			}
+		}
+		return v
+	}
+	return json.Marshal(redact(data))
+}
+
+type filteredOutput struct {
+	mu      sync.Mutex
+	closed  bool
+	dst     io.Writer
+	filter  *secretFilter
+	pending []byte
+}
+
+func (w *filteredOutput) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return len(p), nil
+	}
+	w.pending = append(w.pending, p...)
+	// Hold only a trailing partial match so ordinary output remains live.
+	limit := len(w.pending)
+	for _, value := range w.filter.values {
+		for i := max(0, len(w.pending)-len(value)+1); i < limit; {
+			start := bytes.IndexByte(w.pending[i:limit], value[0])
+			if start < 0 {
+				break
+			}
+			i += start
+			if strings.HasPrefix(value, string(w.pending[i:])) {
+				limit = i
+				break
+			}
+			i++
+		}
+	}
+	return len(p), w.flush(limit)
+}
+
+func (w *filteredOutput) flush(limit int) error {
+	if limit == 0 {
+		return nil
+	}
+	end := 0
+	var out bytes.Buffer
+	for _, match := range w.filter.pattern.FindAllIndex(w.pending, -1) {
+		if match[0] >= limit {
+			break
+		}
+		out.Write(w.pending[end:match[0]])
+		out.WriteString(hiddenValue)
+		end = match[1]
+	}
+	limit = max(limit, end)
+	out.Write(w.pending[end:limit])
+	_, err := w.dst.Write(out.Bytes())
+	w.pending = append(w.pending[:0], w.pending[limit:]...)
+	return err
+}
+
+func (f *secretFilter) output(cmd *exec.Cmd, dst *os.File) (io.Writer, func() error) {
+	if f == nil {
+		return dst, func() error { return nil }
+	}
+	w := &filteredOutput{dst: dst, filter: f}
+	// Descendants can outlive their foreground payload and inherit its pipes.
+	cmd.WaitDelay = 200 * time.Millisecond
+	return w, func() error {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		w.closed = true
+		return w.flush(len(w.pending))
+	}
+}
+
+func checkResumeProfile(root, recorded, requested string) error {
+	if requested != "" && requested != recorded {
+		if _, _, err := selectedProfile(root, requested, false); err != nil {
+			return err
+		}
+		return fmt.Errorf("resume uses the original profile %q", recorded)
+	}
+	_, _, err := selectedProfile(root, recorded, false)
+	return err
+}

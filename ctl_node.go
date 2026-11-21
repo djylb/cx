@@ -161,6 +161,7 @@ func doctorNode(ctx context.Context, root string) error {
 	f["host_json"] = e == nil && cfgErr == nil
 	if cfgErr == nil {
 		addDiskStatus(f, diskPath(root), host)
+		credentialDoctor(ctx, root, host, f)
 	}
 	cache := os.Getenv("GOCACHE")
 	if cache == "" {
@@ -246,6 +247,11 @@ func nodeControl(ctx context.Context, a []string) error {
 		}
 	case "host-config":
 		return hostSettings(ctx, root, a[1:], false)
+	case "check-profile":
+		if len(a) == 2 {
+			_, _, e := selectedProfile(root, a[1], true)
+			return e
+		}
 	case "doctor":
 		return doctorNode(ctx, root)
 	case "overview":
@@ -309,12 +315,16 @@ func nodeControl(ctx context.Context, a []string) error {
 	return errors.New("invalid node arguments")
 }
 
-func checkSubmission(dir string, want config, args []string) error {
+func checkSubmission(dir string, want config, profile string, args []string) error {
+	var s status
+	if err := readJSON(filepath.Join(dir, "status.json"), &s); err != nil {
+		return err
+	}
 	var old config
 	if e := readJSON(filepath.Join(dir, "config.json"), &old); e != nil {
 		return e
 	}
-	if !maps.Equal(old.Env, want.Env) || !slices.Equal(old.Argv, args) || old.Dir != want.Dir || old.Session != want.Session || old.Timeout != want.Timeout || old.Quiet != want.Quiet || old.Shell {
+	if s.Profile != profile || !maps.Equal(old.Env, want.Env) || !slices.Equal(old.Argv, args) || old.Dir != want.Dir || old.Session != want.Session || old.Timeout != want.Timeout || old.Quiet != want.Quiet || old.Shell {
 		return errors.New("job already registered with different input")
 	}
 	return nil

@@ -55,6 +55,14 @@ cxrun clean --job tools/review
 - 作业进程继承原环境变量（包括 `GOCACHE`），执行端设置 `CARGO_TARGET_DIR=<state>/cache/cargo-target/<project>`，并加入 Codex `workspace-write` 的可写目录。同项目复用 Cargo 增量构建产物，无项目名的作业使用自己的缓存目录。准入前按目录最近使用时间从旧到新淘汰，直到管理的 Cargo 缓存总量达到 `cache_max_bytes` 以下，默认 50 GB。持有作业租约的目录会跳过，缓存总量可能暂时超过上限。
 - 从旧版升级时，把 `--slots` 和 `--load-cmd` 的设置迁到主机文件，并从调用方删除这两个参数。旧作业快照中的 `slots` 和 `load_cmd` 不再参与准入。
 
+### 执行账户与凭据
+
+- 在执行端 `host.json` 配置可选的 `env_file`、`default_profile` 和 `profiles`。每个 profile 支持 `codex_home`、`claude_config_dir`、`env_file`，相对路径以执行端状态根为基准。配置示例见 [安装指南](../docs/agent-install.md#configure-credentials-on-the-execution-host)。
+- 新作业使用 `--profile NAME` 或主机默认账户。未知 profile 报错。作业状态只保存已选账户名。续跑和续轮沿用该账户，显式指定的名称必须一致。fork 默认继承，也可为新作业显式选择账户。
+- profile 提供的 `env_file` 替换主机文件，省略时使用主机文件。文件缺失时跳过；格式错误或其他读取错误会使作业启动失败。文件应在工作区和快照外，Unix 建议权限 `0600`。doctor 报告文件存在状态和 Unix 权限，并按 profile 检查 Codex 登录状态和 Claude CLI 可用性。
+- runner 在准入后读取 UTF-8 环境文件。支持空行和整行 `#` 注释，首个等号后的值按字面使用，重复键取最后一项。合并顺序为继承环境、显式环境、所选环境文件、账户目录及 runner 的作业标记。每次新启动 runner 时读取当前文件。子进程只收到本机注入的值，加载事件只记录键名。cx 会过滤自己捕获的输出中的字面凭据值。作业及其工具生成的文件由作业控制，保持凭据远离这些文件。
+- 控制端 `--env` 和 `--input-json` 遇到疑似凭据键名只告警，调用仍继续。密钥统一交给执行端本地环境文件或 CLI 登录。
+
 ### 作业默认值
 
 | 设置 | 默认值 | 覆盖方式 |
@@ -75,7 +83,7 @@ cxrun clean --job tools/review
 
 每个消费者在执行端为同一状态根维护独立的 `--since-file`，并串行调用该文件。文件所在目录由调用方创建。省略文件或使用缺失、空白或 `{}` 文件时，从空基线开始，现有已完成轮次或终态可以立即返回。每次成功输出后，原子更新已报告作业的游标，键为 `P/JOB`（旧扁平作业为 `JOB`），值记录 `completed_turns`、已报告的 `terminal` 及可用的 `run_id`。未匹配及未报告的作业游标保持原样。单独交付问题或 outbox 消息时，被本次等待跳过的旧完成也不会推进完成游标。超时不写文件。进程若在输出和游标提交之间中断，下次可能重复交付。省略文件时每次调用都从空基线开始。
 
-`list --fields brief` 只含 `project`、`job`、`session`、`status`、`turn_id`、`completed_turns`、`plan_step`、`changed_files`、`failed_command`、`last_event_time` 和 `rate_limit`。其中 `plan_step` 是最新计划中首个 `inProgress` 步骤，无进行项时为空。 `changed_files` 来自本轮最新的整轮 diff，重命名算一个文件，无 diff 时为 0。 `failed_command` 为最近一次非零退出的命令，含 `command`（单行摘要）和 `exit_code`，无记录时为 null。 `rate_limit` 含 `rate_limited`，已知时附 Unix 秒 `reset_at`、`primary`、`secondary` 和 `limit_id`。每个已知窗口含 `used_percent` 及可用的 `reset_at`。完整 list 保留这些信息及原有的状态字段。
+`list --fields brief` 只含 `project`、`job`、`session`、可选的 `profile`、`status`、`turn_id`、`completed_turns`、`plan_step`、`changed_files`、`failed_command`、`last_event_time` 和 `rate_limit`。其中 `plan_step` 是最新计划中首个 `inProgress` 步骤，无进行项时为空。 `changed_files` 来自本轮最新的整轮 diff，重命名算一个文件，无 diff 时为 0。 `failed_command` 为最近一次非零退出的命令，含 `command`（单行摘要）和 `exit_code`，无记录时为 null。 `rate_limit` 含 `rate_limited`，已知时附 Unix 秒 `reset_at`、`primary`、`secondary` 和 `limit_id`。每个已知窗口含 `used_percent` 及可用的 `reset_at`。完整 list 保留这些信息及原有的状态字段。
 
 ## Codex 0.171 控制协议
 

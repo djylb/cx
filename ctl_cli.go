@@ -19,18 +19,18 @@ import (
 )
 
 type ctlOptions struct {
-	env                                                     map[string]string
-	cleanBase, all, explicitSession                         bool
-	project, session, tag, cwd, dir, host                   string
-	hosts, channels, sets, argv, pos                        []string
-	engine, model, effort, sandbox, role, parent            string
-	batch, snapshot, history, previous, input, image        string
-	quiet, timeout, idle, turnLimit, approval, stall, queue string
-	turn, cursor, since, kind, mention, repo, script, shell string
-	full, json, watch, any, wait, raw, refresh              bool
-	inplace, interactive, web, hard, network, noNetwork     bool
-	command, reuse, sync, force, noTools                    bool
-	max                                                     int
+	env                                                       map[string]string
+	cleanBase, all, explicitSession                           bool
+	project, session, tag, cwd, dir, host                     string
+	hosts, channels, sets, argv, pos                          []string
+	engine, model, effort, sandbox, role, parent              string
+	batch, snapshot, history, previous, input, image, profile string
+	quiet, timeout, idle, turnLimit, approval, stall, queue   string
+	turn, cursor, since, kind, mention, repo, script, shell   string
+	full, json, watch, any, wait, raw, refresh                bool
+	inplace, interactive, web, hard, network, noNetwork       bool
+	command, reuse, sync, force, noTools                      bool
+	max                                                       int
 }
 
 func ctlFlags(op string, o *ctlOptions) *flag.FlagSet {
@@ -50,7 +50,7 @@ func ctlFlags(op string, o *ctlOptions) *flag.FlagSet {
 		"engine": &o.engine, "model": &o.model, "effort": &o.effort,
 		"sandbox": &o.sandbox, "role": &o.role, "parent": &o.parent,
 		"batch": &o.batch, "snapshot": &o.snapshot, "with-history": &o.history,
-		"dir": &o.dir, "continue": &o.previous, "input-json": &o.input,
+		"profile": &o.profile, "dir": &o.dir, "continue": &o.previous, "input-json": &o.input,
 		"image": &o.image, "idle-exit": &o.idle, "turn-timeout": &o.turnLimit,
 		"approval-timeout": &o.approval, "stall": &o.stall, "queue-timeout": &o.queue,
 		"script": &o.script, "shell": &o.shell, "project": &o.project,
@@ -81,7 +81,16 @@ func ctlFlags(op string, o *ctlOptions) *flag.FlagSet {
 		case "chat":
 			f.Func(k, ctlFlagHelp(op, k), func(v string) error { o.channels = append(o.channels, v); return nil })
 		case "env":
-			f.Func(k, ctlFlagHelp(op, k), func(v string) error { return addCommandEnv(&o.env, v) })
+			f.Func(k, ctlFlagHelp(op, k), func(v string) error {
+				if err := addCommandEnv(&o.env, v); err != nil {
+					return err
+				}
+				key, _, _ := strings.Cut(v, "=")
+				if sensitiveKey(key) {
+					warnCredentialKey(key)
+				}
+				return nil
+			})
 		case "set":
 			f.Func(k, ctlFlagHelp(op, k), func(v string) error { o.sets = append(o.sets, v); return nil })
 		default:
@@ -379,7 +388,7 @@ func controller(ctx context.Context, a []string) error {
 			return e
 		}
 		if o.reuse {
-			q := reuseQuery{Host: name, ID: id, Dir: o.cwd, Argv: o.argv, Shell: o.shell, Env: o.env}
+			q := reuseQuery{Host: name, ID: id, Dir: o.cwd, Argv: o.argv, Shell: o.shell, Env: o.env, Profile: o.profile}
 			if o.script != "" {
 				q.ScriptHash, e = fileHash(o.script)
 				if e != nil {
@@ -398,7 +407,7 @@ func controller(ctx context.Context, a []string) error {
 		if o.session == "" {
 			o.session = currentSession()
 		}
-		for _, kv := range [][2]string{{"--session", o.session}, {"--queue-timeout", o.queue}, {"--quiet-timeout", o.quiet}, {"--timeout", o.timeout}} {
+		for _, kv := range [][2]string{{"--profile", o.profile}, {"--session", o.session}, {"--queue-timeout", o.queue}, {"--quiet-timeout", o.quiet}, {"--timeout", o.timeout}} {
 			if kv[1] != "" {
 				args = append(args, kv[0], kv[1])
 			}

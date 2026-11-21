@@ -263,7 +263,10 @@ func nodeCLI(ctx context.Context, args []string) error {
 			return errors.New("invalid submission worker arguments")
 		case "continue-job":
 			if len(args) == 4 {
-				return continueNode(ctx, args[1], args[2], args[3])
+				return continueNode(ctx, args[1], args[2], args[3], "")
+			}
+			if len(args) == 5 {
+				return continueNode(ctx, args[1], args[2], args[3], args[4])
 			}
 			return errors.New("invalid continue arguments")
 		case "mirror-refs":
@@ -315,7 +318,7 @@ func nodeCLI(ctx context.Context, args []string) error {
 			return cacheNode(ctx, args)
 		case "recv":
 			return receive(ctx, args[1:])
-		case "follow", "observe-one", "submit-if-version", "install", "host-config", "doctor", "show", "overview", "rows", "wait-poll", "submit-command":
+		case "follow", "observe-one", "submit-if-version", "install", "host-config", "check-profile", "doctor", "show", "overview", "rows", "wait-poll", "submit-command":
 			return nodeControl(ctx, args)
 		}
 	}

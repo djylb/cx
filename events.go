@@ -108,7 +108,7 @@ func (r *runner) note(kind, s string) error {
 	if err != nil {
 		return err
 	}
-	_, err = fmt.Fprintf(r.log, "%d\t%s\t%s\t%s\n", fi.Size()+1, time.Now().UTC().Format(time.RFC3339Nano), kind, brief(s))
+	_, err = fmt.Fprintf(r.log, "%d\t%s\t%s\t%s\n", fi.Size()+1, time.Now().UTC().Format(time.RFC3339Nano), kind, brief(r.c.secret.text(s)))
 	return err
 }
 func (r *runner) begin(id string) error {
@@ -186,7 +186,7 @@ func (r *runner) finish(t turn) error {
 			report += "\n" + r.lastText
 		}
 	}
-	if err := atomicWrite(filepath.Join(r.dir, "last.md"), []byte(report)); err != nil {
+	if err := atomicWrite(filepath.Join(r.dir, "last.md"), []byte(r.c.secret.text(report))); err != nil {
 		return err
 	}
 	r.s.Turn = t.ID

@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/sha1"
 	"crypto/sha256"
-	_ "embed"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -21,8 +20,42 @@ import (
 	"syscall"
 )
 
-//go:embed snap_denylist
-var snapDeny string
+const snapDeny = `# Case-insensitive shell patterns, matched against every path component.
+*.pem
+*.key
+*.p12
+*.pfx
+*.ppk
+id_*
+.env*
+.ssh
+.aws
+.kube
+.docker
+.gnupg
+.netrc
+_git-credentials
+.git-credentials
+.pypirc
+credentials
+credentials.*
+credentials-*.json
+*service-account*.json
+*service_account*.json
+client_secret*.json
+kubeconfig
+.credentials
+.credentials.*
+auth.json
+token.json
+tokens.json
+access_token*
+secrets.json
+secrets.yml
+secrets.yaml
+application_default_credentials.json
+.gitcookies
+`
 
 func snapName(name string) error {
 	for _, c := range strings.Split(strings.ToLower(name), "/") {

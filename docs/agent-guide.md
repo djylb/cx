@@ -16,6 +16,12 @@ Run `cx --help` to list commands and `cx COMMAND --help` for usage, options, def
 
 Separate the command's exit status, the job state, and the agent's report status when deciding whether a task is complete. The [README](../README.md#exit-codes) lists observation and collection codes.
 
+### Choose an execution account
+
+Use `--profile NAME` on `run`, `agent`, and `exec` to select an account configured on the execution host. New jobs without a selection use the host's `default_profile` when set. `ls`, `overview`, and `show` display the selected name. `resume` and `agent --continue` keep the original profile. On those commands, an explicit name must match the original. `fork` inherits the source profile by default. A different profile can fork only if its Codex account can open the source thread.
+
+Keep credentials on the execution host. Never put API keys, tokens, passwords, or other secrets in cx arguments, prompts, snapshots, scripts, or attachments. Use `--env` for ordinary variables and `--input-json` for structured agent input. cx warns on credential-like keys and continues processing the request. Provision credentials through the executor's `env_file` or agent CLI login. [Installation and account setup](agent-install.md#configure-credentials-on-the-execution-host)
+
 ### Choose source and target explicitly
 
 `run` and `agent` default to an isolated snapshot. A Git snapshot can include current uncommitted changes. Use `--clean-base` to reject a dirty Git baseline. History is omitted by default. Use `--with-history` or `--with-history=A..HEAD` when the task needs history. `cx snapshot DIR` prints an ID you can pass with `--snapshot ID` to reuse frozen inputs. Non-Git directories also work. `--inplace` uses the original directory, requires `local`, and does not produce a snapshot patch.

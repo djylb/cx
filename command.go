@@ -85,8 +85,9 @@ func (r *runner) serveCommand() (err error) {
 		cmd = exec.Command(r.c.Argv[0], r.c.Argv[1:]...)
 	}
 	cmd.Dir = r.c.Dir
-	cmd.Stdout = out
-	cmd.Stderr = out
+	output, flush := r.c.secret.output(cmd, out)
+	cmd.Stdout, cmd.Stderr = output, output
+	defer func() { err = errors.Join(err, flush()) }()
 	r.c.mark(cmd, r.dir)
 	tree, err := startCommand(cmd, r.c.RunID)
 	if err != nil {
@@ -130,6 +131,9 @@ func (r *runner) serveCommand() (err error) {
 			exited = true
 			if cmd.ProcessState == nil {
 				return err
+			}
+			if errors.Is(err, exec.ErrWaitDelay) {
+				err = nil
 			}
 			code := commandExitCode(cmd.ProcessState)
 			r.s.ExitCode = &code

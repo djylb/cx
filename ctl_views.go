@@ -353,6 +353,9 @@ func showNode(dir, raw string, full bool) error {
 		report = clip(report)
 	}
 	out := fields{"turn": n, "report": report, "decisions": decisions, "plan": plan, "commands": commands, "changed_files": changed, "token_usage": s.Usage}
+	if s.Profile != "" {
+		out["profile"] = s.Profile
+	}
 	usage(out, s.Usage)
 	return json.NewEncoder(os.Stdout).Encode(out)
 }

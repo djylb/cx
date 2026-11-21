@@ -11,10 +11,13 @@ const hostConfigName = "host.json"
 const defaultCacheMaxBytes = 50_000_000_000
 
 type hostConfig struct {
-	Slots         map[string]int `json:"slots"`
-	LoadCmd       string         `json:"load_cmd"`
-	CacheMaxBytes uint64         `json:"cache_max_bytes"`
-	MinFreeBytes  *uint64        `json:"min_free_bytes,omitempty"`
+	EnvFile        string                 `json:"env_file,omitempty"`
+	DefaultProfile string                 `json:"default_profile,omitempty"`
+	Profiles       map[string]hostProfile `json:"profiles,omitempty"`
+	Slots          map[string]int         `json:"slots"`
+	LoadCmd        string                 `json:"load_cmd"`
+	CacheMaxBytes  uint64                 `json:"cache_max_bytes"`
+	MinFreeBytes   *uint64                `json:"min_free_bytes,omitempty"`
 }
 
 func defaultSlots() int {

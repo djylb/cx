@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"crypto/rand"
-	"embed"
 	"errors"
 	"fmt"
 	"io"
@@ -17,9 +16,6 @@ import (
 	"github.com/BurntSushi/toml"
 )
 
-//go:embed ctl_defaults/*.md
-var builtInPolicies embed.FS
-
 func controllerPolicy(name string) (string, error) {
 	if d := os.Getenv("CX_POLICY_DIR"); d != "" {
 		b, e := os.ReadFile(filepath.Join(d, name))
@@ -27,8 +23,11 @@ func controllerPolicy(name string) (string, error) {
 			return string(b), e
 		}
 	}
-	b, e := builtInPolicies.ReadFile("ctl_defaults/" + name)
-	return string(b), e
+	text, ok := builtInPolicies[name]
+	if !ok {
+		return "", fmt.Errorf("unknown policy %q", name)
+	}
+	return text, nil
 }
 
 type jobSubmission struct {
@@ -129,7 +128,11 @@ func ctlSubmit(ctx context.Context, hs endpoints, op string, o ctlOptions) error
 			if e = forgetResult(name, id); e != nil {
 				return e
 			}
-			r, e := h.invoke(ctx, 185*time.Second, false, "continue-job", name, id, prompt)
+			argv := []string{"continue-job", name, id, prompt}
+			if o.profile != "" {
+				argv = append(argv, o.profile)
+			}
+			r, e := h.invoke(ctx, 185*time.Second, false, argv...)
 			if e != nil {
 				return e
 			}
@@ -261,7 +264,7 @@ func ctlSubmit(ctx context.Context, hs endpoints, op string, o ctlOptions) error
 	if o.hard && o.effort == "" {
 		o.effort = "high"
 	}
-	for _, kv := range [][2]string{{"sandbox", o.sandbox}, {"model", o.model}, {"effort", o.effort}, {"engine", o.engine}, {"idle-exit", o.idle}, {"turn-timeout", o.turnLimit}, {"stall", o.stall}, {"approval-timeout", o.approval}, {"queue-timeout", o.queue}, {"timeout", o.timeout}, {"quiet-timeout", o.quiet}} {
+	for _, kv := range [][2]string{{"profile", o.profile}, {"sandbox", o.sandbox}, {"model", o.model}, {"effort", o.effort}, {"engine", o.engine}, {"idle-exit", o.idle}, {"turn-timeout", o.turnLimit}, {"stall", o.stall}, {"approval-timeout", o.approval}, {"queue-timeout", o.queue}, {"timeout", o.timeout}, {"quiet-timeout", o.quiet}} {
 		if kv[1] != "" {
 			req.Options = append(req.Options, "--"+kv[0], kv[1])
 		}
@@ -280,12 +283,29 @@ func ctlSubmit(ctx context.Context, hs endpoints, op string, o ctlOptions) error
 		if e != nil {
 			return e
 		}
+		warnInputCredentials(b)
 		req.Options = append(req.Options, "--input-json", string(b))
 	}
 	if o.image != "" {
 		req.Image, e = os.ReadFile(o.image)
 		if e != nil {
 			return e
+		}
+	}
+	if o.profile != "" {
+		// Check before snapshot preparation; the runner validates again at registration.
+		if h.SSH != "" {
+			if e = deploy(ctx, hs, host); e != nil {
+				return e
+			}
+			h = hs[host]
+		}
+		r, e := h.call(ctx, 20*time.Second, "check-profile", o.profile)
+		if e != nil {
+			return e
+		}
+		if r.code != 0 {
+			return r.output()
 		}
 	}
 	if e = attachContext(&req, p, o.interactive); e != nil {
@@ -305,7 +325,7 @@ func ctlSubmit(ctx context.Context, hs endpoints, op string, o ctlOptions) error
 	if o.command {
 		req.ReuseKey = runReuseKey(req.Snapshot, src, req.Command)
 		if o.reuse {
-			found, e := lookupReuse(ctx, h, reuseQuery{ID: id, Host: host, Key: req.ReuseKey})
+			found, e := lookupReuse(ctx, h, reuseQuery{ID: id, Host: host, Key: req.ReuseKey, Profile: o.profile})
 			if e != nil || found {
 				return e
 			}

@@ -170,6 +170,9 @@ func controlOperands(op string, args []string) ([]string, error) {
 			if e != nil {
 				return nil, e
 			}
+			if key == "input-json" {
+				warnInputCredentials(b)
+			}
 			value = string(b)
 		case "image":
 			b, e := os.ReadFile(value)

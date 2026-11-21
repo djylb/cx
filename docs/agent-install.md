@@ -56,6 +56,38 @@ Use `cx setup local` for local execution. `doctor` reports probes such as tool a
 
 For deployments with published artifacts, setup can use `[release]` in the user host file, with a `url` template containing `{version}` and `{platform}` and a `[release.sha256]` entry keyed by `goos-goarch` for each platform. SSH and gzip streams carry job and result data. Some Linux upgrade paths use rsync for binary deltas. If rsync is unavailable, use `CX_SETUP_BINARY` for the target to select the explicit artifact path.
 
+### Configure credentials on the execution host
+
+Use the same OS account that runs the node. Keep credentials and account settings outside the checkout and its snapshots.
+
+**Codex.** Load `OPENAI_API_KEY` into the execution account's local shell from its secret store, then run `printenv OPENAI_API_KEY | codex login --with-api-key`. For ChatGPT sign-in on a headless host, use `codex login --device-auth`. Run the login and `codex login status` with `CODEX_HOME` set to the account directory you intend to use. [Codex CLI authentication](https://developers.openai.com/codex/cli/reference#codex-login)
+
+**Claude Code.** Put `ANTHROPIC_API_KEY` in a private executor `env_file`, or configure a local `apiKeyHelper` in the account's Claude settings. For an account that supports `claude setup-token`, store its returned token locally as `CLAUDE_CODE_OAUTH_TOKEN` in the executor's `env_file`. Set `CLAUDE_CONFIG_DIR` to the desired account directory when preparing its settings or authentication. [Claude Code authentication](https://code.claude.com/docs/en/authentication)
+
+On the execution host, merge credential paths and named profiles into `host.json` under its state root. The example uses paths relative to that root. Absolute executor paths also work.
+
+```json
+{
+  "env_file": "credentials/host.env",
+  "default_profile": "account-a",
+  "profiles": {
+    "account-a": {
+      "codex_home": "accounts/a/codex",
+      "claude_config_dir": "accounts/a/claude"
+    },
+    "account-b": {
+      "codex_home": "accounts/b/codex",
+      "claude_config_dir": "accounts/b/claude",
+      "env_file": "credentials/account-b.env"
+    }
+  }
+}
+```
+
+Create the credential files privately on the executor. Use mode `0600` on Unix and restrict access to the executor account on Windows. The UTF-8 format is one `KEY=VALUE` per line. Blank lines and lines beginning with `#` after optional whitespace are ignored. Characters after the first `=`, including quotes, spaces, inline `#` and dollar signs, are literal. A profile's `env_file` replaces the host file selection. A profile with no file uses the host file. Only the child process environment receives the file's values.
+
+Use `cx doctor HOST --json` after setup to check each profile's Codex login, Claude CLI availability and selected file. A missing file is skipped. Unix permission warnings are advisory. The Codex probe checks the account's `CODEX_HOME`; it does not verify API credentials supplied by an environment file.
+
 ### Windows execution
 
 - Enable OpenSSH Server and verify SSH and SFTP as the intended Windows account. Keep PowerShell available to the SSH login.

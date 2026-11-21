@@ -100,15 +100,17 @@ func (r *runner) startClaude(input any, id string) error {
 	if err != nil {
 		return err
 	}
-	defer log.Close()
-	cmd.Stderr = log
+	stderr, flush := r.c.secret.output(cmd, log)
+	cmd.Stderr = stderr
 	out, err := cmd.StdoutPipe()
 	if err != nil {
+		log.Close()
 		return err
 	}
 	tree, err := startCommand(cmd, r.c.RunID)
 	if err != nil {
 		out.Close()
+		log.Close()
 		return err
 	}
 	s := r.claude
@@ -132,8 +134,15 @@ func (r *runner) startClaude(input any, id string) error {
 		dec := json.NewDecoder(out)
 		var streamErr error
 		for {
+			var raw json.RawMessage
+			streamErr = dec.Decode(&raw)
+			if streamErr == nil {
+				raw, streamErr = r.c.secret.jsonStrings(raw)
+			}
 			var ev claudeEvent
-			streamErr = dec.Decode(&ev)
+			if streamErr == nil {
+				streamErr = json.Unmarshal(raw, &ev)
+			}
 			if streamErr != nil {
 				break
 			}
@@ -145,6 +154,10 @@ func (r *runner) startClaude(input any, id string) error {
 			killTree(cmd)
 		}
 		waitErr := cmd.Wait()
+		if errors.Is(waitErr, exec.ErrWaitDelay) {
+			waitErr = nil
+		}
+		waitErr = errors.Join(waitErr, flush(), log.Close())
 		if errors.Is(streamErr, io.EOF) {
 			streamErr = nil
 		}
