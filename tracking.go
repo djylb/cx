@@ -28,7 +28,7 @@ type inventory struct {
 	Unreadable int       `json:"unreadable"`
 }
 
-func (c config) mark(cmd *exec.Cmd, dir string) {
+func (c *config) mark(cmd *exec.Cmd, dir string) {
 	env := cmd.Environ()
 	for k, v := range c.Env {
 		env = append(env, k+"="+v)

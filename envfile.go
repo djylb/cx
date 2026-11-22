@@ -159,7 +159,7 @@ func sensitiveKey(key string) bool {
 }
 
 func warnCredentialKey(key string) {
-	fmt.Fprintf(os.Stderr, "cx: %s looks like a credential; put it in the executor env_file instead\n", key)
+	diagnosticf("cx: %s looks like a credential; put it in the executor env_file instead\n", key)
 }
 
 func warnInputCredentials(data []byte) {

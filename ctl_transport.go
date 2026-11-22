@@ -76,11 +76,12 @@ func loadEndpoints() (endpoints, error) {
 	}
 	return cfg.Hosts, nil
 }
-func (h *endpoint) setPlatform(plat string) {
+func (h endpoint) withPlatform(plat string) endpoint {
 	h.Platform = plat
 	if h.defaultCX {
-		h.CX = defaultBinary(*h)
+		h.CX = defaultBinary(h)
 	}
+	return h
 }
 
 func defaultBinary(h endpoint) string {
@@ -156,7 +157,7 @@ func dispatch(ctx context.Context, args []string) error {
 		}
 		return err
 	}
-	fmt.Fprintln(os.Stderr, "cx:", err)
+	diagnosticf("cx: %v\n", err)
 	if errors.Is(err, context.DeadlineExceeded) {
 		return ctlExit(124)
 	}
@@ -214,7 +215,9 @@ func nodeCLI(ctx context.Context, args []string) error {
 		}
 		args = req.Args
 		if len(args) > 0 && !strings.HasPrefix(args[0], "forward") && args[0] != "platform-probe" {
-			fmt.Fprint(os.Stderr, wireReady)
+			if _, err := io.WriteString(os.Stderr, wireReady); err != nil {
+				return err
+			}
 		}
 	}
 	if len(args) > 0 {
@@ -226,7 +229,7 @@ func nodeCLI(ctx context.Context, args []string) error {
 			return errors.New("invalid channel request")
 		case "forward-message":
 			if len(args) == 3 {
-				return forwardMessage(ctx, args[1], args[2])
+				return forwardMessage(args[1], args[2])
 			}
 			return errors.New("invalid message request")
 		case "runner-worker":
@@ -462,7 +465,7 @@ func (h endpoint) invoke(parent context.Context, per time.Duration, replay bool,
 		}
 		if !expired && errors.As(err, &exit) && (exit.ExitCode() != 255 || h.SSH == "") {
 			if diag.Len() > 0 {
-				fmt.Fprint(os.Stderr, cleanDiag(diag.Bytes()))
+				diagnosticf("%s", cleanDiag(diag.Bytes()))
 			}
 			return reply{b, exit.ExitCode()}, nil
 		}
@@ -470,7 +473,7 @@ func (h endpoint) invoke(parent context.Context, per time.Duration, replay bool,
 			return reply{}, errors.Join(ctlExit(9), cause)
 		}
 		if !replay || i == 3 || ctx.Err() != nil || h.SSH == "" {
-			fmt.Fprintf(os.Stderr, "node invocation: %v %s\n", err, cleanDiag(diag.Bytes()))
+			diagnosticf("node invocation: %v %s\n", err, cleanDiag(diag.Bytes()))
 			return reply{}, ctlExit(9)
 		}
 		if err = pause(ctx, time.Second<<i); err != nil {

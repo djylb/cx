@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-func (c config) nudgeText(fallback string) string {
+func (c *config) nudgeText(fallback string) string {
 	if c.StallNudge != "" {
 		return c.StallNudge
 	}

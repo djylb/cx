@@ -60,7 +60,7 @@ func workDir(dir string, s status) (string, error) {
 }
 func nodeRows(ctx context.Context, root, p, session string, chatProject string) error {
 	overview := chatProject != ""
-	rows := []fields{}
+	rows := make([]fields, 0) // Encode an empty list as [].
 	var rate any
 	var latest string
 	e := scanJobs(ctx, root, p, session, func(s status) (bool, error) {
@@ -123,7 +123,7 @@ func nodeRows(ctx context.Context, root, p, session string, chatProject string) 
 	}
 	addDiskStatus(f, diskPath(root), h)
 	slots := fields{}
-	for k, cap := range h.Slots {
+	for k, capacity := range h.Slots {
 		r := runner{root: root}
 		r.c.SlotClass = k
 		matches, e := filepath.Glob(filepath.Join(r.pool(), "slot-*.lock"))
@@ -142,7 +142,7 @@ func nodeRows(ctx context.Context, root, p, session string, chatProject string) 
 				_ = lock.Close()
 			}
 		}
-		slots[k] = fields{"used": used, "capacity": cap}
+		slots[k] = fields{"used": used, "capacity": capacity}
 	}
 	f["slots"] = slots
 	f["rate_limit"] = rate
@@ -207,12 +207,13 @@ func showNode(dir, raw string, full bool) error {
 	if id == "" && n == current {
 		id = s.Turn
 	}
-	plan := []fields{}
-	commands := []fields{}
+	// Preserve empty JSON arrays when the turn has no recorded plan or commands.
+	plan := make([]fields, 0)
+	commands := make([]fields, 0)
 	index := map[string]int{}
 	paths := map[string]bool{}
 	changed := 0
-	f, e := os.Open(filepath.Join(dir, "events.jsonl"))
+	f, e := openShared(filepath.Join(dir, "events.jsonl"))
 	if e == nil {
 		defer closeBestEffort(f)
 		rd := bufio.NewReader(f)
@@ -285,7 +286,7 @@ func showNode(dir, raw string, full bool) error {
 		if sealed {
 			folder = archive
 		}
-		b, readErr := os.ReadFile(filepath.Join(folder, "last.md"))
+		b, readErr := readStateFile(filepath.Join(folder, "last.md"))
 		if readErr != nil && !os.IsNotExist(readErr) {
 			return readErr
 		}
@@ -327,7 +328,7 @@ func showNode(dir, raw string, full bool) error {
 		}
 		argv := "[" + strings.Join(parts, ", ") + "]"
 		cmd := fields{"command": clip(argv), "exit_code": s.ExitCode}
-		if b, e := os.ReadFile(filepath.Join(dir, "output.log")); e == nil {
+		if b, e := readStateFile(filepath.Join(dir, "output.log")); e == nil {
 			cmd["output"] = clip(string(b))
 		} else if !os.IsNotExist(e) {
 			return e

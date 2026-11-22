@@ -13,10 +13,16 @@ Run `cx --help` to list commands and `cx COMMAND --help` for usage, options, def
 5. Collect with `cx result JOB --wait`. Without `--wait`, cx can start or rejoin a background download and return 12 while collection proceeds. Use `--turn N` to select a sealed turn, or `--refresh` after activity from another controller. The default summary prints the absolute path to `last.md` on stderr. Use `--full` to print the entire report. If the job makes deliverable files, write them into `artifacts/` in the job's working directory.
 
 Use `cx result JOB --json --wait` for metadata about the sealed turn, including its engine, status, exit code and local report, log, patch manifest and artifact paths. Use `cx result JOB --log --wait` for the entire command log or the selected agent turn's progress log as raw bytes. In both modes collection progress goes to stderr and `--max-bytes` does not limit stdout. On exit 12, `--json` emits a single object with `job`, `status: "collecting"`, `turn`, `bytes`, and `total` (null until known). On the same exit code, `--log` leaves stdout empty.
-6. Inspect `cx patch JOB` for change statistics and `cx patch JOB --full --repo PATH` for one repository's patch. Run `cx apply JOB` only after review. It checks the selected patches before writing them to the original working trees. Use `--repo PATH` to select one repository. If a patch conflicts, `cx rebase JOB 'Explain the conflict here'` creates a related job on a fresh snapshot. Accept and commit through your normal Git workflow.
+6. Inspect `cx patch JOB` for change statistics and `cx patch JOB --full --repo PATH` for one repository's patch. Run `cx apply JOB` only after review. Use `--repo PATH` to select one repository. Accept and commit through your normal Git workflow.
 7. `cx interrupt JOB` stops the active turn. `cx close JOB` ends the agent session and releases its private workspace when the last user of that checkout closes. Collect the desired results, then `cx clean JOB` when the terminal job's private state can be removed. Use `cx resume JOB` to reconnect a recoverable Codex thread whose runner died and whose checkout still exists.
 
 Separate the command's exit status, the job state, and the agent's report status when deciding whether a task is complete. The [README](../README.md#exit-codes) lists observation and collection codes.
+
+### Apply changes across turns
+
+By default, `cx patch JOB` and `cx apply JOB` use the cumulative changes from the dispatch snapshot to the latest selected turn. Once you have applied and committed turn 1, inspect turn 2 with `cx patch JOB --turn 2 --incremental`. Then use `cx apply JOB --since-turn 2` to apply turn 2 through the latest completed turn, using the sealed turn 1 tree as the merge base. The incremental patch for turn 1 is the cumulative patch for turn 1. Incremental operations use the dispatch snapshot stored by the submitting controller. If an older job lacks the required sealed turn, the command names the missing turn and exits 44.
+
+If any selected repository has a conflict, `cx apply` lists the files and exits 1 before changing any repository. Use `--allow-conflicts` to write the merge result, including text conflict markers and unmerged index entries, and still exit 1. Use `cx rebase JOB 'Explain the conflict here'` to create a related job from a fresh snapshot. Three-way merges require Git 2.38 or later on the controller.
 
 ### Choose an execution account
 

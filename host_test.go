@@ -15,7 +15,19 @@ func setTestHost(t *testing.T, root string, slots map[string]int, load string) {
 	if err := os.MkdirAll(root, 0700); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeJSON(filepath.Join(root, "host.json"), hostConfig{Slots: slots, LoadCmd: load}); err != nil {
+	// Fixture jobs must be admitted independently of the test volume's free space.
+	// Tests exercising disk admission set their own minimum.
+	host, err := readHostConfig(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slots != nil {
+		host.Slots = slots
+	}
+	var minFree uint64
+	host.MinFreeBytes = &minFree
+	host.LoadCmd = load
+	if err := writeJSON(filepath.Join(root, hostConfigName), host); err != nil {
 		t.Fatal(err)
 	}
 }

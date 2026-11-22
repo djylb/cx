@@ -51,7 +51,7 @@ func hostSettings(ctx context.Context, root string, sets []string, init bool) er
 	}
 	// Preserve extension fields and explicit slot overrides in existing files.
 	var obj fields
-	b, e := os.ReadFile(dst)
+	b, e := readStateFile(dst)
 	if os.IsNotExist(e) {
 		obj = fields{"load_cmd": h.LoadCmd, "slots": h.Slots}
 	} else if e != nil {

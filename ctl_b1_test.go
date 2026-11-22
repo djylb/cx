@@ -42,7 +42,9 @@ func newControllerFixture(t *testing.T) controllerFixture {
 		}
 	}
 	py, _ := pythonReference(t, "cx-control.py")
-	for k, v := range map[string]string{"HOME": dir, "CXRUN_STATE": filepath.Join(dir, "state"), "CX_HOME": dir, "CX_PROJECT": "p", "CX_HOSTS": "local", "CXRUN_BIN": filepath.Join(dir, "cxrun"), "PYTHONDONTWRITEBYTECODE": "1", "GORACE": "atexit_sleep_ms=1", "CX_CHAT_LOCAL_ROOT": ""} {
+	state := filepath.Join(dir, "state")
+	setTestHost(t, state, nil, "")
+	for k, v := range map[string]string{"HOME": dir, "CXRUN_STATE": state, "CX_HOME": dir, "CX_PROJECT": "p", "CX_HOSTS": "local", "CXRUN_BIN": filepath.Join(dir, "cxrun"), "PYTHONDONTWRITEBYTECODE": "1", "GORACE": "atexit_sleep_ms=1", "CX_CHAT_LOCAL_ROOT": ""} {
 		t.Setenv(k, v)
 	}
 	return controllerFixture{dir, filepath.Join(dir, "cx"), py}

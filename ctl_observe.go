@@ -130,7 +130,7 @@ func displayHosts(ctx context.Context, hs endpoints, op string, o ctlOptions) er
 						ch <- hostReply{name: name, e: err}
 						return
 					}
-					h.setPlatform(plat)
+					h = h.withPlatform(plat)
 				}
 				args := []string{"doctor"}
 				if op != "doctor" {
@@ -161,7 +161,7 @@ func displayHosts(ctx context.Context, hs endpoints, op string, o ctlOptions) er
 			results[v.name] = v
 		}
 		reports := map[string]fields{}
-		var output bytes.Buffer
+		var output bytes.Buffer // In-memory formatting cannot return a write error.
 		enc := json.NewEncoder(&output)
 		failed := false
 		current := map[string]string{}
@@ -174,7 +174,7 @@ func displayHosts(ctx context.Context, hs endpoints, op string, o ctlOptions) er
 				if op != "ls" {
 					continue
 				}
-				fmt.Fprintln(os.Stderr, name, reports[name]["error"])
+				diagnosticf("%v %v\n", name, reports[name]["error"])
 			}
 			if op != "ls" {
 				var obj fields
@@ -240,7 +240,7 @@ func displayHosts(ctx context.Context, hs endpoints, op string, o ctlOptions) er
 					}
 				} else {
 					if header {
-						fmt.Fprintln(&output, "JOB\tHOST\tROLE\tSTATUS\tTURNS\tPLAN\tFILES\tFAILED COMMAND\tRATE LIMIT\tTOKENS\tCONTEXT %\tPROFILE")
+						output.WriteString("JOB\tHOST\tROLE\tSTATUS\tTURNS\tPLAN\tFILES\tFAILED COMMAND\tRATE LIMIT\tTOKENS\tCONTEXT %\tPROFILE\n")
 						header = false
 					}
 					state := fmt.Sprint(row["status"])
@@ -290,7 +290,7 @@ func displayHosts(ctx context.Context, hs endpoints, op string, o ctlOptions) er
 						return e
 					}
 				} else {
-					fmt.Fprintf(&output, "%s\t%s\t-\tremoved\n", id, name)
+					_, _ = fmt.Fprintf(&output, "%s\t%s\t-\tremoved\n", id, name)
 				}
 			}
 		}
@@ -308,22 +308,22 @@ func displayHosts(ctx context.Context, hs endpoints, op string, o ctlOptions) er
 					jobs := obj["jobs"]
 					delete(obj, "jobs")
 					b, _ := json.MarshalIndent(obj, "", "  ")
-					fmt.Fprintf(&output, "%s %s\n", name, b)
+					_, _ = fmt.Fprintf(&output, "%s %s\n", name, b)
 					if rows, ok := jobs.([]fields); ok {
 						var previousSession string
 						for i, r := range rows {
 							session, _ := r["session"].(string)
 							if i == 0 || session != previousSession {
 								if session == "" {
-									fmt.Fprintln(&output, "  No session")
+									output.WriteString("  No session\n")
 								} else {
-									fmt.Fprintf(&output, "  %q\n", session)
+									_, _ = fmt.Fprintf(&output, "  %q\n", session)
 								}
 								previousSession = session
 							}
-							fmt.Fprintf(&output, "%s%s/%s %s %s %v", strings.Repeat("  ", 2+r["depth"].(int)), r["project"], r["job"], r["role"], r["status"], r["plan_step"])
+							_, _ = fmt.Fprintf(&output, "%s%s/%s %s %s %v", strings.Repeat("  ", 2+r["depth"].(int)), r["project"], r["job"], r["role"], r["status"], r["plan_step"])
 							if profile, ok := r["profile"].(string); ok {
-								fmt.Fprintf(&output, " profile=%s", profile)
+								_, _ = fmt.Fprintf(&output, " profile=%s", profile)
 							}
 							output.WriteByte('\n')
 						}
@@ -504,7 +504,7 @@ func ctlWaitAny(ctx context.Context, hs endpoints, o ctlOptions) error {
 			return hostErr
 		}
 		file := filepath.Join(filepath.Dir(path), name+".json")
-		b, hostErr := os.ReadFile(file)
+		b, hostErr := readStateFile(file)
 		if os.IsNotExist(hostErr) {
 			b = []byte("{}")
 		} else if hostErr != nil {

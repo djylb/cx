@@ -53,7 +53,9 @@ func submitScript(ctx context.Context, h endpoint, args []string, path, shell st
 	go func() {
 		z := gzip.NewWriter(wr)
 		_, copyErr := io.Copy(z, f)
-		wr.CloseWithError(errors.Join(copyErr, z.Close()))
+		if closeErr := wr.CloseWithError(errors.Join(copyErr, z.Close())); closeErr != nil {
+			diagnosticf("cx: close script input: %v\n", closeErr)
+		}
 	}()
 	cmd.Stdin = rd
 	var out, diag bytes.Buffer
@@ -61,10 +63,10 @@ func submitScript(ctx context.Context, h endpoint, args []string, path, shell st
 	if e != nil {
 		var ex *exec.ExitError
 		if errors.As(e, &ex) && ex.ExitCode() >= 0 && ex.ExitCode() != 255 {
-			fmt.Fprint(os.Stderr, cleanDiag(diag.Bytes()))
+			diagnosticf("%s", cleanDiag(diag.Bytes()))
 			return reply{out.Bytes(), ex.ExitCode()}, nil
 		}
-		fmt.Fprintln(os.Stderr, e, cleanDiag(diag.Bytes()))
+		diagnosticf("%v %v\n", e, cleanDiag(diag.Bytes()))
 		return reply{}, ctlExit(9)
 	}
 	return reply{out.Bytes(), 0}, nil

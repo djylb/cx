@@ -105,7 +105,7 @@ func TestLogOffsetAndDrain(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "progress.log"), []byte("a\nb\npart\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := logFrom(dir, []string{"4"}); err != errDrained {
+	if err := logFrom(dir, []string{"4"}); !errors.Is(err, errDrained) {
 		t.Fatalf("want errDrained, got %v", err)
 	}
 }

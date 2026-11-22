@@ -229,7 +229,15 @@ func (r *runner) finish(t turn) error {
 			return err
 		}
 	}
-	return r.save()
+	if err := r.save(); err != nil {
+		return err
+	}
+	if t.Status == "completed" {
+		if err := r.sealSnapshotTurn(); err != nil {
+			return r.writeProgress("result/seal-failed", r.c.secret.text(err.Error()))
+		}
+	}
+	return nil
 }
 func (r *runner) notify(m message) error {
 	if m.Method == "item/agentMessage/delta" || m.Method == "item/commandExecution/outputDelta" {
@@ -513,6 +521,11 @@ func (r *runner) input(text, id string, steer bool) error {
 	return r.sendInput(input, id, steer)
 }
 func (r *runner) sendInput(input any, id string, steer bool) error {
+	if !steer {
+		if err := r.sealSnapshotTurn(); err != nil {
+			return fmt.Errorf("seal previous turn before starting the next: %w", err)
+		}
+	}
 	if r.claude != nil {
 		return r.startClaude(input, id)
 	}

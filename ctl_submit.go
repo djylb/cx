@@ -124,7 +124,7 @@ func ctlSubmit(ctx context.Context, hs endpoints, op string, o ctlOptions) error
 			if strings.Contains(o.previous, ":") {
 				shown = o.previous
 			}
-			fmt.Fprintln(os.Stderr, "JOB="+shown)
+			diagnosticf("JOB=%s\n", shown)
 			if continueErr = forgetResult(name, id); continueErr != nil {
 				return continueErr
 			}
@@ -343,7 +343,7 @@ func ctlSubmit(ctx context.Context, hs endpoints, op string, o ctlOptions) error
 		return e
 	}
 	if op == "agent" {
-		fmt.Fprintln(os.Stderr, "JOB="+id)
+		diagnosticf("JOB=%s\n", id)
 		return agentReport(ctx, host, h, id, o.full)
 	}
 	fmt.Println(id)
@@ -574,7 +574,7 @@ func verifySourceBase(ctx context.Context, src string, req *jobSubmission, o ctl
 			if o.cleanBase {
 				return fmt.Errorf("dirty source: %s", r.Path)
 			}
-			fmt.Fprintf(os.Stderr, "cx: uncommitted changes in %s; using frozen worktree\n", r.Path)
+			diagnosticf("cx: uncommitted changes in %s; using frozen worktree\n", r.Path)
 		}
 	}
 	return nil

@@ -20,11 +20,11 @@ import (
 
 type tailPosition struct {
 	Mode          string `json:"mode"`
+	LastCompleted string `json:"last_completed,omitempty"`
 	Next          int64  `json:"next"`
-	Raw           bool   `json:"raw"`
 	Since         int64  `json:"since,omitempty"`
 	Finished      int64  `json:"finished,omitempty"`
-	LastCompleted string `json:"last_completed,omitempty"`
+	Raw           bool   `json:"raw"`
 }
 type tailFrame struct {
 	Terminal *status      `json:"terminal,omitempty"`
@@ -36,8 +36,8 @@ type tailFrame struct {
 // never advances the consumer, including for binary output without newlines.
 type frameWriter struct {
 	enc     *json.Encoder
-	pos     tailPosition
 	pending bytes.Buffer
+	pos     tailPosition
 }
 
 func (w *frameWriter) Write(p []byte) (int, error) {
@@ -227,7 +227,7 @@ func follow(ctx context.Context, h endpoint, name, id string, o ctlOptions) erro
 		}
 		var ex *exec.ExitError
 		if errors.As(processErr, &ex) && ex.ExitCode() != 255 {
-			fmt.Fprint(os.Stderr, cleanDiag(diag.Bytes()))
+			diagnosticf("%s", cleanDiag(diag.Bytes()))
 			return ctlExit(ex.ExitCode())
 		}
 		if i < 3 {
@@ -274,7 +274,7 @@ func streamMessages(ctx context.Context, dir string, pos tailPosition) (err erro
 }
 
 func readMessageEvents(ctx context.Context, dir string, pos *tailPosition, emit func(tailFrame) error) (bool, error) {
-	f, err := os.Open(filepath.Join(dir, "events.jsonl"))
+	f, err := openShared(filepath.Join(dir, "events.jsonl"))
 	if os.IsNotExist(err) {
 		return true, nil
 	}
@@ -295,11 +295,11 @@ func readMessageEvents(ctx context.Context, dir string, pos *tailPosition, emit 
 			return false, e
 		}
 		var record struct {
-			Seq        int64
 			Method     string
 			Time       string
-			TurnNumber int64 `json:"turn_number"`
 			Params     json.RawMessage
+			Seq        int64
+			TurnNumber int64 `json:"turn_number"`
 		}
 		if e = json.Unmarshal(line, &record); e != nil {
 			return false, e

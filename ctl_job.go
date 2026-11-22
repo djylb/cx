@@ -41,7 +41,7 @@ func startNodeJob(ctx context.Context, raw string) error {
 	}
 	receipt := filepath.Join(work, "request.json")
 	if _, e = os.Stat(filepath.Join(dir, "status.json")); e == nil {
-		b, receiptErr := os.ReadFile(receipt)
+		b, receiptErr := readStateFile(receipt)
 		if receiptErr != nil || string(b) != raw {
 			return errors.New("job already registered with different input")
 		}

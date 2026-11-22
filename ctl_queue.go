@@ -288,7 +288,7 @@ func observeSubmission(ctx context.Context, host, id, op string, limit time.Dura
 			return true, json.NewEncoder(os.Stdout).Encode(s)
 		}
 		if s.State == "submit_failed" {
-			fmt.Fprintln(os.Stderr, s.Reason)
+			diagnosticf("%v\n", s.Reason)
 			return true, ctlExit(8)
 		}
 		if op != "tail" && op != "wait" {

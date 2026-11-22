@@ -34,7 +34,7 @@ type waitReport struct {
 func waitAny(ctx context.Context, root, project, session, sinceFile string, out io.Writer) error {
 	baseline := make(map[string]waitCursor)
 	if sinceFile != "" {
-		b, err := os.ReadFile(sinceFile)
+		b, err := readStateFile(sinceFile)
 		if err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("read wait baseline: %w", err)
 		}
@@ -165,7 +165,7 @@ func waitAny(ctx context.Context, root, project, session, sinceFile string, out 
 		case <-tick.C:
 		}
 	}
-	if ctx.Err() == context.DeadlineExceeded {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return errObserveTimeout
 	}
 	return ctx.Err()

@@ -73,7 +73,7 @@ func snapJSON(v any) ([]byte, error) {
 			result.WriteRune(r)
 		} else {
 			for _, u := range utf16.Encode([]rune{r}) {
-				fmt.Fprintf(&result, "\\u%04x", u)
+				_, _ = fmt.Fprintf(&result, "\\u%04x", u) // bytes.Buffer.Write never returns an error.
 			}
 		}
 	}
@@ -90,7 +90,7 @@ func snapCommand(ctx context.Context, dir string, env []string, in []byte, prog 
 	c.Stderr = &diag
 	b, e := c.Output()
 	if e != nil {
-		return nil, fmt.Errorf("%s in %s: %w: %s", prog, dir, e, strings.TrimSpace(diag.String()))
+		return b, fmt.Errorf("%s in %s: %w: %s", prog, dir, e, strings.TrimSpace(diag.String()))
 	}
 	return b, nil
 }
@@ -174,7 +174,7 @@ func snapImmutable(path string, data []byte) error {
 	}
 	e = os.Link(f.Name(), path)
 	if errors.Is(e, os.ErrExist) {
-		b, err := os.ReadFile(path)
+		b, err := readStateFile(path)
 		if err != nil {
 			return err
 		}

@@ -41,7 +41,7 @@ func (s *claudeSession) interrupt() {
 		killTree(s.cmd)
 	}
 }
-func (c config) claudeArgs(session string) []string {
+func (c *config) claudeArgs(session string) []string {
 	args := []string{"-p", "--output-format", "stream-json", "--input-format", "stream-json", "--verbose"}
 	if session != "" {
 		args = append(args, "--resume", session)

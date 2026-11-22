@@ -208,7 +208,7 @@ func ctlChat(ctx context.Context, hs endpoints, action string, o ctlOptions) err
 	}
 	return nil
 }
-func forwardMessage(ctx context.Context, id, number string) error {
+func forwardMessage(id, number string) error {
 	n, e := strconv.ParseUint(number, 10, 64)
 	if e != nil || n == 0 {
 		return errors.New("invalid message sequence")

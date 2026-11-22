@@ -79,7 +79,7 @@ func waitOutcome(dir string, before, now status) (id, outcome string, err error)
 	if now.Finished <= before.Finished+1 {
 		return now.LastCompleted, now.CompletedStatus, nil
 	}
-	f, err := os.Open(filepath.Join(dir, "progress.log"))
+	f, err := openShared(filepath.Join(dir, "progress.log"))
 	if err != nil {
 		return "", "", err
 	}
@@ -139,7 +139,7 @@ func observe(ctx context.Context, op, dir string) error {
 	if err := readJSON(filepath.Join(dir, "status.json"), &s); err != nil {
 		return err
 	}
-	log, err := os.Open(filepath.Join(dir, s.logName()))
+	log, err := openShared(filepath.Join(dir, s.logName()))
 	if err != nil {
 		return err
 	}
@@ -380,7 +380,7 @@ func writeLogFrom(out io.Writer, dir string, args []string) error {
 	if err := readJSON(filepath.Join(dir, "status.json"), &s); err != nil {
 		return err
 	}
-	f, err := os.Open(filepath.Join(dir, s.logName()))
+	f, err := openShared(filepath.Join(dir, s.logName()))
 	if err != nil {
 		return err
 	}
@@ -428,7 +428,7 @@ func writeLogSince(out io.Writer, dir, raw string) error {
 	if err = readJSON(filepath.Join(dir, "status.json"), &s); err != nil {
 		return err
 	}
-	f, err := os.Open(filepath.Join(dir, "progress.log"))
+	f, err := openShared(filepath.Join(dir, "progress.log"))
 	if err != nil {
 		return err
 	}

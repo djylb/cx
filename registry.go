@@ -40,7 +40,7 @@ func claimKey(root string, c config, s status) error {
 	} else if !os.IsExist(err) {
 		return err
 	}
-	raw, err := os.ReadFile(path)
+	raw, err := readStateFile(path)
 	if err != nil {
 		return err
 	}

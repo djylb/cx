@@ -177,7 +177,7 @@ func (r *runner) takeMarker(op string) (controlMarker, bool, error) {
 		return m, false, fmt.Errorf("invalid control file: %s", op)
 	}
 	m.published = fi.ModTime()
-	b, err := os.ReadFile(claimed)
+	b, err := readStateFile(claimed)
 	if err != nil {
 		return m, false, err
 	}

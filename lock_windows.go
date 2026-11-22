@@ -1,10 +1,8 @@
 package main
 
 import (
-	"errors"
 	"os"
 	"syscall"
-	"time"
 	"unsafe"
 )
 
@@ -29,16 +27,4 @@ func tryLockMode(f *os.File, mode uintptr) (bool, error) {
 		return false, nil
 	} // ERROR_LOCK_VIOLATION
 	return false, err
-}
-
-// Windows readers can briefly hold handles without FILE_SHARE_DELETE.
-func replaceFile(from, to string) error {
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		err := os.Rename(from, to)
-		if !(errors.Is(err, syscall.Errno(32)) || errors.Is(err, syscall.ERROR_ACCESS_DENIED)) || time.Now().After(deadline) {
-			return err
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
 }

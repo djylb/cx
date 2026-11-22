@@ -2,11 +2,9 @@ package main
 
 import (
 	"context"
-	"errors"
 	"os"
 	"path/filepath"
 	"strings"
-	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
@@ -24,9 +22,7 @@ func publishBinary(ctx context.Context, from, to string) error {
 		return err
 	}
 	defer closeBestEffort(lock)
-	err = publishWithRollback(from, to, replaceBinary, moveBinary, func(replaceErr error) bool {
-		return errors.Is(replaceErr, windows.ERROR_ACCESS_DENIED) || errors.Is(replaceErr, windows.ERROR_SHARING_VIOLATION)
-	})
+	err = publishWithRollback(from, to, replaceBinary, moveBinary, isWindowsFileConflict)
 	if err != nil {
 		return err
 	}
@@ -43,11 +39,11 @@ func publishBinary(ctx context.Context, from, to string) error {
 }
 
 func moveBinary(from, to string) error {
-	src, err := windows.UTF16PtrFromString(extendedBinaryPath(from))
+	src, err := windows.UTF16PtrFromString(extendedWindowsPath(from))
 	if err != nil {
 		return err
 	}
-	dst, err := windows.UTF16PtrFromString(extendedBinaryPath(to))
+	dst, err := windows.UTF16PtrFromString(extendedWindowsPath(to))
 	if err != nil {
 		return err
 	}
@@ -56,52 +52,12 @@ func moveBinary(from, to string) error {
 	return windows.MoveFile(src, dst)
 }
 
-func extendedBinaryPath(path string) string {
-	switch {
-	case strings.HasPrefix(path, `\\?\`), strings.HasPrefix(path, `\\.\`):
-		return path
-	case strings.HasPrefix(path, `\\`):
-		return `\\?\UNC\` + path[2:]
-	default:
-		return `\\?\` + path
-	}
-}
-
 func replaceBinary(from, to string) error {
-	src, e := windows.UTF16PtrFromString(from)
-	if e != nil {
-		return e
+	err := renameFilePOSIX(from, to)
+	if posixRenameUnavailable(err) {
+		return retryWindowsFileIO(stateReplaceBudget, isWindowsFileConflict, func() error {
+			return os.Rename(from, to)
+		})
 	}
-	h, e := windows.CreateFile(src, windows.DELETE, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE, nil, windows.OPEN_EXISTING, windows.FILE_ATTRIBUTE_NORMAL, 0)
-	if e != nil {
-		return e
-	}
-	defer func() { _ = windows.CloseHandle(h) }()
-	dest, e := filepath.Abs(to)
-	if e != nil {
-		return e
-	}
-	name, e := windows.UTF16FromString(dest)
-	if e != nil {
-		return e
-	}
-	name = name[:len(name)-1]
-	// Field order is fixed by the Windows FILE_RENAME_INFO ABI.
-	type renameInfo struct {
-		Flags  uint32
-		Root   windows.Handle
-		Length uint32
-		Name   uint16
-	}
-	offset := int(unsafe.Offsetof(renameInfo{}.Name))
-	buffer := make([]byte, offset+len(name)*2)
-	record := (*renameInfo)(unsafe.Pointer(&buffer[0]))
-	record.Flags = windows.FILE_RENAME_REPLACE_IF_EXISTS | windows.FILE_RENAME_POSIX_SEMANTICS
-	record.Length = uint32(len(name) * 2)
-	copy(unsafe.Slice((*uint16)(unsafe.Pointer(&buffer[offset])), len(name)), name)
-	e = windows.SetFileInformationByHandle(h, windows.FileRenameInfoEx, &buffer[0], uint32(len(buffer)))
-	if errors.Is(e, windows.ERROR_NOT_SUPPORTED) || errors.Is(e, windows.ERROR_INVALID_PARAMETER) {
-		return replaceFile(from, to)
-	}
-	return e
+	return err
 }

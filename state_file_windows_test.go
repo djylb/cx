@@ -1,0 +1,109 @@
+package main
+
+import (
+	"errors"
+	"io"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"golang.org/x/sys/windows"
+)
+
+func TestWindowsStateFileSharedReads(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "status.json")
+	if err := writeJSON(path, "old"); err != nil {
+		t.Fatal(err)
+	}
+	reader, err := openShared(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeBestEffort(reader)
+
+	// Opening with all three access rights requires the reader to share each one.
+	name, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := windows.CreateFile(name, windows.GENERIC_READ|windows.GENERIC_WRITE|windows.DELETE,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
+		nil, windows.OPEN_EXISTING, windows.FILE_ATTRIBUTE_NORMAL, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = windows.CloseHandle(h); err != nil {
+		t.Fatal(err)
+	}
+
+	if err = writeJSON(path, "new"); err != nil {
+		t.Fatal(err)
+	}
+	old, err := io.ReadAll(reader)
+	if err != nil || string(old) != "\"old\"\n" {
+		t.Fatalf("open handle read %q, %v", old, err)
+	}
+	var got string
+	if err = readJSON(path, &got); err != nil || got != "new" {
+		t.Fatalf("new handle read %q, %v", got, err)
+	}
+}
+
+func TestWindowsStateFileRetry(t *testing.T) {
+	t.Run("replace", func(t *testing.T) {
+		outcomes := []error{
+			&os.LinkError{Op: "rename", Err: windows.ERROR_SHARING_VIOLATION},
+			windows.ERROR_ACCESS_DENIED,
+			nil,
+		}
+		attempts := 0
+		err := retryWindowsFileIO(stateReplaceBudget, isWindowsFileConflict, func() error {
+			err := outcomes[attempts]
+			attempts++
+			return err
+		})
+		if err != nil || attempts != len(outcomes) {
+			t.Fatalf("replace attempted %d times, error %v", attempts, err)
+		}
+	})
+
+	t.Run("open", func(t *testing.T) {
+		attempts := 0
+		err := retryWindowsFileIO(stateReadBudget, isWindowsOpenTransient, func() error {
+			attempts++
+			if attempts == 1 {
+				return windows.ERROR_FILE_NOT_FOUND
+			}
+			return nil
+		})
+		if err != nil || attempts != 2 {
+			t.Fatalf("open attempted %d times, error %v", attempts, err)
+		}
+	})
+
+	t.Run("expired", func(t *testing.T) {
+		attempts := 0
+		err := retryWindowsFileIO(0, isWindowsFileConflict, func() error {
+			attempts++
+			return windows.ERROR_ACCESS_DENIED
+		})
+		if !errors.Is(err, windows.ERROR_ACCESS_DENIED) || attempts != 1 {
+			t.Fatalf("expired replace attempted %d times, error %v", attempts, err)
+		}
+	})
+}
+
+func TestWindowsStateFileErrorsNamePath(t *testing.T) {
+	dir := t.TempDir()
+	from, to := filepath.Join(dir, "missing"), filepath.Join(dir, "status.json")
+	err := replaceFile(from, to)
+	var linkErr *os.LinkError
+	if !errors.As(err, &linkErr) || linkErr.Old != from || linkErr.New != to || !os.IsNotExist(err) {
+		t.Fatalf("replaceFile returned %v", err)
+	}
+	_, err = readStateFile(to)
+	var pathErr *os.PathError
+	if !errors.As(err, &pathErr) || pathErr.Path != to || !os.IsNotExist(err) {
+		t.Fatalf("readStateFile returned %v", err)
+	}
+}

@@ -23,5 +23,3 @@ func tryFlock(f *os.File, mode int) (bool, error) {
 	}
 	return err == nil, err
 }
-
-func replaceFile(from, to string) error { return os.Rename(from, to) }

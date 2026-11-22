@@ -106,8 +106,8 @@ func TestExplicitInstallPathsSurviveDetection(t *testing.T) {
 		t.Fatal(err)
 	}
 	fixed, auto := hs["fixed"], hs["automatic"]
-	fixed.setPlatform("windows/amd64")
-	auto.setPlatform("windows/amd64")
+	fixed = fixed.withPlatform("windows/amd64")
+	auto = auto.withPlatform("windows/amd64")
 	if fixed.CX != ".local/bin/cx" || fixed.State != "custom state" || auto.CX != ".local/bin/cx.exe" {
 		t.Fatalf("fixed=%+v automatic=%+v", fixed, auto)
 	}

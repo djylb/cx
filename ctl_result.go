@@ -21,7 +21,8 @@ import (
 
 type turnPatch struct {
 	*ResultBase
-	Source string `json:"source,omitempty"`
+	Source    string `json:"source,omitempty"`
+	mergeBase string // reconstructed for an incremental application
 	SnapshotPatch
 }
 
@@ -49,6 +50,33 @@ func readyResult(s status) bool {
 	}
 	return s.Turn == s.LastCompleted
 }
+func resultCheckout(work string) (string, error) {
+	for _, checkout := range []string{filepath.Join(work, "jobs", "checkout"), work} {
+		if _, err := os.Stat(filepath.Join(checkout, "input", "manifest.json")); err == nil {
+			return checkout, nil
+		} else if !os.IsNotExist(err) {
+			return "", err
+		}
+	}
+	return "", nil
+}
+
+func (r *runner) sealSnapshotTurn() error {
+	if r.s.Finished == 0 || !readyResult(r.s) {
+		return nil
+	}
+	work, err := workDir(r.dir, r.s)
+	if err != nil {
+		return err
+	}
+	checkout, err := resultCheckout(work)
+	if err != nil || checkout == "" {
+		return err
+	}
+	_, err = sealTurn(r.ctx, r.dir, r.s, r.s.Finished)
+	return err
+}
+
 func sealTurn(ctx context.Context, dir string, s status, n int64) (string, error) {
 	work, e := workDir(dir, s)
 	if e != nil {
@@ -73,15 +101,13 @@ func sealTurn(ctx context.Context, dir string, s status, n int64) (string, error
 		return "", ctlExit(44)
 	}
 	var result SnapshotResult
-	checkout := work
-	if _, e = os.Stat(filepath.Join(work, "jobs", "checkout", "input", "manifest.json")); e == nil {
-		checkout = filepath.Join(work, "jobs", "checkout")
-	} else if !os.IsNotExist(e) {
+	checkout, e := resultCheckout(work)
+	if e != nil {
 		return "", e
 	}
-	if _, e = os.Stat(filepath.Join(checkout, "input", "manifest.json")); e == nil {
+	if checkout != "" {
 		result, e = Collect(ctx, checkout)
-	} else if os.IsNotExist(e) {
+	} else {
 		result.Dir, e = os.MkdirTemp(work, ".seal-")
 		if e == nil {
 			defer removeTreeBestEffort(result.Dir)
@@ -109,27 +135,26 @@ func sealTurn(ctx context.Context, dir string, s status, n int64) (string, error
 	if s.Engine != "cmd" {
 		meta.Outcome = s.CompletedStatus
 	}
-	{
+	if checkout != "" {
 		var manifest Manifest
-		if err := readJSON(filepath.Join(checkout, "input", "manifest.json"), &manifest); err == nil {
-			var req jobSubmission
-			if err = readJSON(filepath.Join(work, "request.json"), &req); err != nil && !os.IsNotExist(err) {
-				return "", err
-			}
-			for _, r := range manifest.Repositories {
-				if r.Head != nil {
-					meta.Bases[r.Path] = ResultBase{Base: r.Head, Branch: req.Branches[r.Path]}
-				}
-			}
-			for _, r := range result.Repositories {
-				var provenance *ResultBase
-				if v, ok := meta.Bases[r.Path]; ok {
-					provenance = &v
-				}
-				meta.Repositories = append(meta.Repositories, turnPatch{SnapshotPatch: r, Source: req.Sources[r.Path], ResultBase: provenance})
-			}
-		} else if !os.IsNotExist(err) {
+		if err := readJSON(filepath.Join(checkout, "input", "manifest.json"), &manifest); err != nil {
 			return "", err
+		}
+		var req jobSubmission
+		if err := readJSON(filepath.Join(work, "request.json"), &req); err != nil && !os.IsNotExist(err) {
+			return "", err
+		}
+		for _, r := range manifest.Repositories {
+			if r.Head != nil {
+				meta.Bases[r.Path] = ResultBase{Base: r.Head, Branch: req.Branches[r.Path]}
+			}
+		}
+		for _, r := range result.Repositories {
+			var provenance *ResultBase
+			if v, ok := meta.Bases[r.Path]; ok {
+				provenance = &v
+			}
+			meta.Repositories = append(meta.Repositories, turnPatch{SnapshotPatch: r, Source: req.Sources[r.Path], ResultBase: provenance})
 		}
 	}
 	if result.Artifacts == nil {
@@ -397,7 +422,7 @@ func fetchTurn(ctx context.Context, h endpoint, id, gen, turn, dest string, deta
 	if e = runActive(cmd, stop, h.connectionBudget(idle), idle, &sink, &diag); e != nil {
 		var ex *exec.ExitError
 		if errors.As(e, &ex) && ex.ExitCode() >= 0 && ex.ExitCode() != 255 {
-			fmt.Fprint(os.Stderr, cleanDiag(diag.Bytes()))
+			diagnosticf("%s", cleanDiag(diag.Bytes()))
 			return ctlExit(ex.ExitCode())
 		}
 		if runtime.GOOS == "windows" && unsupportedDiagnostic(runtime.GOOS, diag.String()) {
@@ -450,7 +475,7 @@ func resultDest(host, id, gen, turn string) (string, error) {
 func ctlResult(ctx context.Context, host, id, op string, o ctlOptions) error {
 	details := o.json || o.log
 	if op == "result" || op == "patch" {
-		if !o.refresh {
+		if !o.refresh && !o.incremental {
 			cached, e := cachedResultDir(host, id, o.turn, details)
 			if e != nil {
 				return e
@@ -487,6 +512,18 @@ func ctlResult(ctx context.Context, host, id, op string, o ctlOptions) error {
 	if e != nil || n < 0 {
 		return errors.New("invalid result turn")
 	}
+	var since int64
+	if o.incremental {
+		since = n
+		if since == 0 {
+			return errors.New("--incremental requires a positive completed turn")
+		}
+	} else if o.sinceTurn != "" {
+		since, e = strconv.ParseInt(o.sinceTurn, 10, 64)
+		if e != nil || since < 1 || since > n {
+			return fmt.Errorf("--since-turn must be between 1 and the latest completed turn (%d)", n)
+		}
+	}
 	turn = strconv.FormatInt(n, 10)
 	dest, e := resultDest(host, id, s.RunID, turn)
 	if e != nil {
@@ -510,7 +547,7 @@ func ctlResult(ctx context.Context, host, id, op string, o ctlOptions) error {
 			if !o.refresh {
 				var failure fetchFailure
 				if e = readJSON(dest+".error", &failure); e == nil && failure.Code != 9 && (failure.Code != 44 || !readyResult(s)) {
-					fmt.Fprintln(os.Stderr, failure.Message)
+					diagnosticf("%v\n", failure.Message)
 					return ctlExit(failure.Code)
 				}
 			}
@@ -525,7 +562,7 @@ func ctlResult(ctx context.Context, host, id, op string, o ctlOptions) error {
 	} else if e != nil {
 		return e
 	}
-	if op == "apply" || op == "rebase" {
+	if op == "apply" || op == "rebase" || since > 1 {
 		var m turnResult
 		if e = readJSON(filepath.Join(dest, "result.json"), &m); e != nil {
 			return e
@@ -533,7 +570,33 @@ func ctlResult(ctx context.Context, host, id, op string, o ctlOptions) error {
 		if op == "rebase" {
 			return rebaseTurn(ctx, dest, host, id, o.dir, m)
 		}
-		return applyTurn(ctx, dest, id, host, o, m)
+		patchDir := dest
+		if since > 1 {
+			previous, err := resultDest(host, id, s.RunID, strconv.FormatInt(since-1, 10))
+			if err != nil {
+				return err
+			}
+			if err = fetchTurn(ctx, h, id, s.RunID, strconv.FormatInt(since-1, 10), previous, false); err != nil {
+				if errors.Is(err, ctlExit(44)) {
+					diagnosticf("Sealed turn %d is unavailable for %s. Use the cumulative patch or cx rebase %s TEXT.\n", since-1, id, id)
+					return ctlExit(44)
+				}
+				return err
+			}
+			patchDir, err = os.MkdirTemp("", "cx-incremental-")
+			if err != nil {
+				return err
+			}
+			defer removeTreeBestEffort(patchDir)
+			m, err = incrementalResult(ctx, host, id, previous, dest, patchDir, since-1, m)
+			if err != nil {
+				return err
+			}
+		}
+		if op == "apply" {
+			return applyTurn(ctx, dest, patchDir, id, host, since, o, m)
+		}
+		return displayTurn(ctx, patchDir, id, op, o)
 	}
 	return displayTurn(ctx, dest, id, op, o)
 }
@@ -596,7 +659,7 @@ func displayTurn(ctx context.Context, dir, id, op string, o ctlOptions) error {
 			if pathErr != nil {
 				return errors.Join(pathErr, e)
 			}
-			fmt.Fprintf(os.Stderr, "cx: summary shown; full report: %s (use --full)\n", report)
+			diagnosticf("cx: summary shown; full report: %s (use --full)\n", report)
 		}
 		return e
 	}
@@ -788,7 +851,7 @@ func backgroundFetch(host, id, gen, turn, dest string, o ctlOptions) error {
 		size = strconv.FormatInt(*total, 10)
 	}
 	if details {
-		fmt.Fprintf(os.Stderr, "collecting turn=%s bytes=%d/%s\n", turn, count, size)
+		diagnosticf("collecting turn=%s bytes=%d/%s\n", turn, count, size)
 	} else {
 		fmt.Printf("collecting turn=%s bytes=%d/%s\n", turn, count, size)
 	}

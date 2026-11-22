@@ -23,7 +23,7 @@ func (claudeDriver) capabilities() capabilities {
 func (commandDriver) run(r *runner) error { return r.serveCommand() }
 func (codexDriver) run(r *runner) error   { return r.serveAgent(r.serveCodex) }
 func (claudeDriver) run(r *runner) error  { return r.serveAgent(r.serveClaude) }
-func (c config) driver() driver {
+func (c *config) driver() driver {
 	if len(c.Argv) > 0 {
 		return commandDriver{}
 	}

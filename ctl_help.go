@@ -18,7 +18,7 @@ const submitFlags = "profile engine model effort sandbox role parent snapshot wi
 
 var ctlCommands = map[string]ctlCommand{
 	"agent":        {"[--host HOST] [--dir DIR] TEXT|@FILE|-\n  cx agent --continue JOB TEXT|@FILE|-", "Submit or continue an agent and read its report.", submitFlags + " dir host tag continue full"},
-	"apply":        {"JOB [DIR]", "Check and apply a collected patch.", "turn repo max-bytes"},
+	"apply":        {"JOB [DIR]", "Check and apply a collected patch.", "turn since-turn allow-conflicts repo max-bytes"},
 	"approve":      {"JOB", "Approve a pending request.", ""},
 	"chat":         {"post|read|wait|forward ...", "Post, read, wait for, or forward project messages.", ""},
 	"chat-forward": {"JOB SEQ CHANNEL", "Forward an outbox message to a channel.", "max-bytes"},
@@ -47,7 +47,7 @@ var ctlCommands = map[string]ctlCommand{
 	"node":         {"COMMAND [ARGS ...]", "Run an execution-node command.", ""},
 	"outbox":       {"JOB [--since N]\n  cx outbox --any [--project PROJECT] [--since N]", "Read job messages after a sequence.", "any project since"},
 	"overview":     {"", "Summarize jobs and project channels.", "json project session all max-bytes"},
-	"patch":        {"JOB", "Show collected patch statistics or contents.", "turn full repo max-bytes"},
+	"patch":        {"JOB", "Show collected patch statistics or contents.", "turn incremental full repo max-bytes"},
 	"plan":         {"JOB", "Read recorded plan events.", ""},
 	"project":      {"ls | show NAME | init NAME --repo DIR [DIR ...] [--default-host HOST]", "List, inspect, or initialize projects.", ""},
 	"project-init": {"NAME --repo DIR [DIR ...] [--default-host HOST]", "Initialize a project.", ""},
@@ -158,7 +158,11 @@ func printCtlHelp(w io.Writer, op string) {
 	case "run":
 		_, _ = fmt.Fprintln(w, "  7 duplicate job\n  9 transport failure")
 	case "result", "patch", "apply", "rebase":
-		_, _ = fmt.Fprintln(w, "  1 failed turn or operation\n  9 transport failure\n  44 result unavailable")
+		failure := "failed turn or operation"
+		if op == "apply" {
+			failure = "apply failed or had conflicts (even with --allow-conflicts)"
+		}
+		_, _ = fmt.Fprintf(w, "  1 %s\n  9 transport failure\n  44 result unavailable\n", failure)
 		if op == "result" {
 			_, _ = fmt.Fprintln(w, "  12 background download in progress")
 		}
@@ -178,7 +182,10 @@ func printCtlHelp(w io.Writer, op string) {
 }
 
 var ctlFlagDescriptions = map[string]string{
-	"all": "include every session", "all-hosts": "include all configured hosts (default)", "any": "select multiple jobs",
+	"since-turn":      "apply changes from turn `N` through the latest sealed turn",
+	"incremental":     "show changes since the preceding sealed turn",
+	"allow-conflicts": "write merge results with conflicts and exit nonzero",
+	"all":             "include every session", "all-hosts": "include all configured hosts (default)", "any": "select multiple jobs",
 	"batch": "read tagged prompt paths from `FILE`", "chat": "watch `CHANNEL` (repeatable)",
 	"clean-base": "require a clean Git baseline", "cmd": "run command arguments after --",
 	"continue": "continue an existing `JOB`", "cwd": "remote working `DIR` (node default when unset)",

@@ -50,7 +50,7 @@ func rawArg(v string) (json.RawMessage, error) {
 	b := []byte(v)
 	var err error
 	if strings.HasPrefix(v, "@") {
-		b, err = os.ReadFile(v[1:])
+		b, err = readStateFile(v[1:])
 		if err != nil {
 			return nil, err
 		}
@@ -60,7 +60,7 @@ func rawArg(v string) (json.RawMessage, error) {
 	}
 	return b, nil
 }
-func (o options) inputs(text string) ([]json.RawMessage, error) {
+func (o *options) inputs(text string) ([]json.RawMessage, error) {
 	var a []json.RawMessage
 	if o.input != "" {
 		b, err := rawArg(o.input)
@@ -109,7 +109,7 @@ var aliases = map[string]string{
 	"history read":   "thread/read",
 }
 
-func (o options) dispatch(ctx context.Context, dir, op string, args []string) (bool, error) {
+func (o *options) dispatch(ctx context.Context, dir, op string, args []string) (bool, error) {
 	if op == "events" || op == "diff" || op == "plan" {
 		return true, o.events(dir, op)
 	}
@@ -200,12 +200,11 @@ func (o options) dispatch(ctx context.Context, dir, op string, args []string) (b
 				}
 			}
 			return true, o.publish(ctx, dir, s, e)
-		} else {
-			if len(args) > 0 {
-				key += " " + strings.Join(args, " ")
-			}
-			e.Method = aliases[key]
 		}
+		if len(args) > 0 {
+			key += " " + strings.Join(args, " ")
+		}
+		e.Method = aliases[key]
 		p := map[string]json.RawMessage{}
 		set := func(k, v string) { p[k], _ = json.Marshal(v) }
 		if o.params != "" {
@@ -271,7 +270,7 @@ func (o options) dispatch(ctx context.Context, dir, op string, args []string) (b
 	}
 	return true, o.publish(ctx, dir, s, e)
 }
-func (o options) publish(ctx context.Context, dir string, s status, e envelope) error {
+func (o *options) publish(ctx context.Context, dir string, s status, e envelope) error {
 	id := o.opID
 	if id == "" {
 		var b [16]byte
@@ -335,7 +334,7 @@ func (o options) publish(ctx context.Context, dir string, s status, e envelope) 
 		}
 	}
 }
-func (o options) events(dir, op string) error {
+func (o *options) events(dir, op string) error {
 	var since uint64
 	if o.since != "" {
 		var err error
@@ -354,7 +353,7 @@ func (o options) events(dir, op string) error {
 			o.thread = s.Thread
 		}
 	}
-	f, err := os.Open(filepath.Join(dir, "events.jsonl"))
+	f, err := openShared(filepath.Join(dir, "events.jsonl"))
 	if err != nil {
 		return err
 	}

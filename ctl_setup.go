@@ -170,7 +170,7 @@ func upload(ctx context.Context, h endpoint, source, dest string) error {
 		_ = rd.Close()
 		e = errors.Join(e, <-sent)
 		if e != nil {
-			fmt.Fprint(os.Stderr, cleanDiag(diag.Bytes()))
+			diagnosticf("%s", cleanDiag(diag.Bytes()))
 		}
 		stop()
 		_ = f.Close()

@@ -135,7 +135,7 @@ func agentInbox(dir string) (fields, error) {
 			if !e.Type().IsRegular() || !strings.HasSuffix(e.Name(), ".msg") {
 				continue
 			}
-			b, err := os.ReadFile(filepath.Join(folder, e.Name()))
+			b, err := readStateFile(filepath.Join(folder, e.Name()))
 			if os.IsNotExist(err) {
 				continue
 			}

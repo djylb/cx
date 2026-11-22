@@ -242,7 +242,7 @@ func centerInstall(ctx context.Context, sid, plat, destination string) error {
 	}
 	return e
 }
-func bootstrapCompiler(ctx context.Context, center endpoint, sid SnapshotID, m Manifest) error {
+func bootstrapCompiler(ctx context.Context, center endpoint, m Manifest) error {
 	if len(m.Repositories) != 1 {
 		return errors.New("expected standalone compiler snapshot")
 	}
@@ -308,7 +308,7 @@ func deployFromCenter(ctx context.Context, h endpoint, plat string) (handled boo
 		return true, e
 	}
 	if capability.code != 0 || strings.TrimSpace(string(capability.data)) != "1" {
-		if e = bootstrapCompiler(ctx, center, sid, m); e != nil {
+		if e = bootstrapCompiler(ctx, center, m); e != nil {
 			return true, e
 		}
 	}

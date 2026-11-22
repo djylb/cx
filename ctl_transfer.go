@@ -41,7 +41,7 @@ func retryTransfer(ctx context.Context, attempt func() error) error {
 		if !connection || time.Now().Add(delay).After(end) {
 			return e
 		}
-		fmt.Fprintf(os.Stderr, "cx: transfer interrupted; retry in %s: %v\n", delay, e)
+		diagnosticf("cx: transfer interrupted; retry in %s: %v\n", delay, e)
 		if err := pause(ctx, delay); err != nil {
 			return err
 		}
@@ -126,7 +126,7 @@ func startInstalledTask(ctx context.Context, id, hash string) error {
 	if e != nil {
 		return e
 	}
-	b, e := os.ReadFile(p)
+	b, e := readStateFile(p)
 	if e != nil {
 		return e
 	}

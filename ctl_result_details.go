@@ -182,7 +182,7 @@ func displayResultDetails(out io.Writer, dir, id string, logOnly bool) error {
 	}
 	if logOnly {
 		if logPath == nil {
-			fmt.Fprintln(os.Stderr, "cx: result log unavailable")
+			diagnosticf("cx: result log unavailable\n")
 			return ctlExit(9)
 		}
 		log, err := os.Open(*logPath)

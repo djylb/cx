@@ -325,7 +325,7 @@ func cleanLegacyJob(ctx context.Context, id, work, token string) error {
 			return errors.New("unexpected legacy session")
 		}
 		exe := "tmux"
-		args := []string{}
+		var args []string
 		session := "=" + old.Mux
 		if runtime.GOOS == "windows" {
 			var socket string

@@ -174,7 +174,7 @@ func expectedVersion(version, plat string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	b, err := os.ReadFile(path + ".sha256")
+	b, err := readStateFile(path + ".sha256")
 	if os.IsNotExist(err) {
 		return "", nil
 	}
@@ -356,7 +356,7 @@ func deployOnce(ctx context.Context, hs endpoints, name string, setup bool) erro
 		if e != nil {
 			return e
 		}
-		h.setPlatform(plat)
+		h = h.withPlatform(plat)
 	}
 	platformChanged := hs[name].Platform != plat
 	hs[name] = h

@@ -321,7 +321,7 @@ func ctlOutbox(ctx context.Context, hs endpoints, o ctlOptions) error {
 				}
 			}
 			if e != nil {
-				fmt.Fprintln(os.Stderr, name, e)
+				diagnosticf("%v %v\n", name, e)
 				failed = true
 			}
 		}

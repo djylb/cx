@@ -76,7 +76,7 @@ type config struct {
 	Network                             bool
 }
 
-func (c config) privileged() bool {
+func (c *config) privileged() bool {
 	return len(c.Argv) == 0 && c.Sandbox == dangerFullAccess
 }
 
@@ -124,6 +124,10 @@ type status struct {
 	Privileged   bool   `json:"privileged,omitempty"`
 }
 
+// diagnosticf writes advisory text or reports an existing failure. A broken
+// stderr cannot report its own write error, and must not change the command result.
+func diagnosticf(format string, args ...any) { _, _ = fmt.Fprintf(os.Stderr, format, args...) }
+
 // closeBestEffort releases resources whose operation has already completed.
 // Writers that rely on Close to commit data must check its result separately.
 func closeBestEffort(c io.Closer) { _ = c.Close() }
@@ -168,7 +172,7 @@ func writeJSON(path string, v any) error {
 	return atomicWrite(path, append(b, '\n'))
 }
 func readJSON(path string, v any) error {
-	b, err := os.ReadFile(path)
+	b, err := readStateFile(path)
 	if err != nil {
 		return err
 	}
@@ -176,7 +180,7 @@ func readJSON(path string, v any) error {
 }
 
 func readInputText(path string) (string, error) {
-	b, err := os.ReadFile(path)
+	b, err := readStateFile(path)
 	if err != nil {
 		return "", err
 	}
@@ -206,7 +210,7 @@ func jobPath(root, job string) (string, error) {
 	return filepath.Join(root, job), nil
 }
 func printStatus(dir string) error {
-	b, err := os.ReadFile(filepath.Join(dir, "status.json"))
+	b, err := readStateFile(filepath.Join(dir, "status.json"))
 	if err != nil {
 		return err
 	}
@@ -879,7 +883,7 @@ func main() {
 		if errors.Is(err, errDrained) {
 			os.Exit(10)
 		}
-		fmt.Fprintln(os.Stderr, "cxrun:", err)
+		diagnosticf("cxrun: %v\n", err)
 		os.Exit(1)
 	}
 }

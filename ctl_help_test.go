@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -51,7 +52,8 @@ func TestControllerHelp(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		out, err := exec.CommandContext(ctx, f.cx, args...).CombinedOutput()
 		cancel()
-		if exit, ok := err.(*exec.ExitError); !ok || exit.ExitCode() != 2 || !bytes.Contains(out, []byte("Usage: cx")) {
+		var exit *exec.ExitError
+		if !errors.As(err, &exit) || exit.ExitCode() != 2 || !bytes.Contains(out, []byte("Usage: cx")) {
 			t.Errorf("%v: expected usage and exit 2, got %v, %s", args, err, out)
 		}
 	}

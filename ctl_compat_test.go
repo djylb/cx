@@ -12,8 +12,11 @@ import (
 
 func TestControllerCompatibilityOptions(t *testing.T) {
 	opts, err := parseCtl("ls", []string{"--watch", "--interval", "2.5", "--role", "reviewer", "--all-hosts"})
-	if err != nil || !opts.watch || opts.interval != 2500*time.Millisecond || opts.role != "reviewer" {
-		t.Fatalf("ls options: %+v, %v", opts, err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !opts.watch || opts.interval != 2500*time.Millisecond || opts.role != "reviewer" {
+		t.Fatalf("ls options: %+v", opts)
 	}
 	for _, interval := range []string{"0", "-1", "NaN", "Inf", "1e20"} {
 		if _, parseErr := parseCtl("ls", []string{"--watch", "--interval", interval}); parseErr == nil {
@@ -21,8 +24,11 @@ func TestControllerCompatibilityOptions(t *testing.T) {
 		}
 	}
 	opts, err = parseCtl("wait", []string{"--any", "--host", "local", "one", "--host", "two"})
-	if err != nil || !slices.Equal(opts.hosts, []string{"local", "one", "two"}) {
-		t.Fatalf("wait hosts: %v, %v", opts.hosts, err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(opts.hosts, []string{"local", "one", "two"}) {
+		t.Fatalf("wait hosts: %v", opts.hosts)
 	}
 	if _, err := parseCtl("tail", []string{"p/job", "--from-start", "--since", "2"}); err == nil {
 		t.Error("accepted conflicting tail origins")
@@ -36,8 +42,12 @@ func TestControllerCompatibilityOptions(t *testing.T) {
 		{"base..HEAD", []string{"--with-history", "base..HEAD", "source"}},
 	} {
 		opts, err := parseCtl("snapshot", tc.args)
-		if err != nil || opts.history != tc.history || !slices.Equal(opts.pos, []string{"source"}) {
-			t.Errorf("snapshot options %q: history=%q, operands=%v, error=%v", tc.args, opts.history, opts.pos, err)
+		if err != nil {
+			t.Errorf("snapshot options %q: %v", tc.args, err)
+			continue
+		}
+		if opts.history != tc.history || !slices.Equal(opts.pos, []string{"source"}) {
+			t.Errorf("snapshot options %q: history=%q, operands=%v", tc.args, opts.history, opts.pos)
 		}
 	}
 }
@@ -124,7 +134,7 @@ func TestControllerListSubmissionReceipts(t *testing.T) {
 			if lockErr != nil || lock == nil {
 				t.Fatal(lock, lockErr)
 			}
-			defer closeBestEffort(lock)
+			t.Cleanup(func() { closeBestEffort(lock) })
 		}
 	}
 	dir := filepath.Join(f.home, "state", "p", "registered")

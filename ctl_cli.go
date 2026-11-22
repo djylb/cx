@@ -21,25 +21,27 @@ import (
 )
 
 type ctlOptions struct {
-	env                                                        map[string]string
-	project, session, tag, cwd, dir, host                      string
-	engine, model, effort, sandbox, role, parent               string
-	batch, snapshot, history, previous, input, image, profile  string
-	quiet, timeout, idle, turnLimit, approval, stall, queue    string
-	turn, cursor, since, kind, mention, repo, script, shell    string
-	hosts, channels, sets, argv, pos                           []string
-	interval                                                   time.Duration
-	max                                                        int
-	cleanBase, all, explicitSession                            bool
-	full, json, log, watch, any, wait, raw, refresh, fromStart bool
-	inplace, interactive, web, hard, network, noNetwork        bool
-	command, reuse, sync, force, noTools, messages             bool
+	env                                                                map[string]string
+	project, session, tag, cwd, dir, host                              string
+	engine, model, effort, sandbox, role, parent                       string
+	batch, snapshot, history, previous, input, image, profile          string
+	quiet, timeout, idle, turnLimit, approval, stall, queue            string
+	turn, sinceTurn, cursor, since, kind, mention, repo, script, shell string
+	hosts, channels, sets, argv, pos                                   []string
+	interval                                                           time.Duration
+	max                                                                int
+	cleanBase, all, explicitSession                                    bool
+	full, json, log, watch, any, wait, raw, refresh, fromStart         bool
+	inplace, interactive, web, hard, network, noNetwork                bool
+	command, reuse, sync, force, noTools, messages                     bool
+	incremental, allowConflicts                                        bool
 }
 
 func ctlFlags(op string, o *ctlOptions) *flag.FlagSet {
 	f := cliFlags(op)
 	cmd := ctlCommands[op]
 	bools := map[string]*bool{
+		"incremental": &o.incremental, "allow-conflicts": &o.allowConflicts,
 		"all": &o.all, "clean-base": &o.cleanBase,
 		"refresh": &o.refresh, "cmd": &o.command, "reuse": &o.reuse,
 		"inplace": &o.inplace, "interactive": &o.interactive, "web-search": &o.web,
@@ -59,7 +61,7 @@ func ctlFlags(op string, o *ctlOptions) *flag.FlagSet {
 		"script": &o.script, "shell": &o.shell, "project": &o.project,
 		"session": &o.session, "tag": &o.tag, "cwd": &o.cwd,
 		"timeout": &o.timeout, "quiet-timeout": &o.quiet, "turn": &o.turn,
-		"cursor": &o.cursor, "since": &o.since,
+		"cursor": &o.cursor, "since": &o.since, "since-turn": &o.sinceTurn,
 	}
 	const defaultPreviewBytes = 8192
 	o.max = defaultPreviewBytes
@@ -166,14 +168,22 @@ func parseCtl(op string, args []string) (ctlOptions, error) {
 		}
 	}
 	if hasSeparator && op != "exec" && op != "run" {
-		return o, errors.New("unexpected --")
+		return o, errors.New("unexpected argument separator")
 	}
 	e := f.Parse(flags)
 	f.Visit(func(fl *flag.Flag) {
-		if fl.Name == "session" {
+		switch fl.Name {
+		case "session":
 			o.explicitSession = true
+		case "since-turn":
+			if n, err := strconv.ParseInt(o.sinceTurn, 10, 64); err != nil || n < 1 {
+				e = errors.New("--since-turn requires a positive turn number")
+			}
 		}
 	})
+	if o.sinceTurn != "" && o.turn != "" {
+		return o, errors.New("--since-turn and --turn are mutually exclusive")
+	}
 	if o.all && o.explicitSession {
 		return o, errors.New("--all and --session are mutually exclusive")
 	}
@@ -319,7 +329,7 @@ func controller(ctx context.Context, a []string) error {
 	if (op == "ls" || op == "overview" || op == "wait" && o.any) && !o.all && !o.explicitSession {
 		o.session = currentSession()
 		if o.session == "" {
-			fmt.Fprintf(os.Stderr, "cx %s: current session unknown, showing jobs from all sessions\n", op)
+			diagnosticf("cx %s: current session unknown, showing jobs from all sessions\n", op)
 		}
 	}
 	hs, e := loadEndpoints()
@@ -572,7 +582,7 @@ func preview(b []byte, o ctlOptions) error {
 	if e = errors.Join(e, f.Close()); e != nil {
 		return e
 	}
-	fmt.Fprintln(os.Stderr, f.Name())
+	diagnosticf("%v\n", f.Name())
 	n := o.max
 	for n > 0 && n < len(b) && b[n]&0xc0 == 0x80 {
 		n--

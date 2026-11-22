@@ -224,15 +224,20 @@ func snapStage(source, stage snapGit, head string, isGit bool, tmp string) (stri
 				return "", fmt.Errorf("sensitive content or unresolved LFS: %s", n)
 			}
 		}
-		if oid := indexed[n]; oid != "" && snapMatches(raw, oid) {
-			fmt.Fprintf(&records, "%s %s\t%s\x00", mode, oid, n)
-			continue
+		oid := indexed[n]
+		if oid == "" || !snapMatches(raw, oid) {
+			hashed, hashErr := stage.input(raw, "hash-object", "-w", "--stdin")
+			if hashErr != nil {
+				return "", hashErr
+			}
+			oid = strings.TrimSpace(string(hashed))
 		}
-		oid, e := stage.input(raw, "hash-object", "-w", "--stdin")
-		if e != nil {
-			return "", e
-		}
-		fmt.Fprintf(&records, "%s %s\t%s\x00", mode, bytes.TrimSpace(oid), n)
+		records.WriteString(mode)
+		records.WriteByte(' ')
+		records.WriteString(oid)
+		records.WriteByte('\t')
+		records.WriteString(n)
+		records.WriteByte(0)
 	}
 	stage.env = append(stage.env, "GIT_INDEX_FILE="+filepath.Join(tmp, "index"))
 	if _, e := stage.input(records.Bytes(), "update-index", "-z", "--index-info"); e != nil {

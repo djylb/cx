@@ -141,7 +141,7 @@ func TestLocalHandshake(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer func() { _ = f.Close() }()
+		t.Cleanup(func() { closeBestEffort(f) })
 		*ptr = f
 	}
 	var err error

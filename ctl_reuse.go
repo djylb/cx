@@ -100,7 +100,8 @@ func findReuse(ctx context.Context, raw string) error {
 		}
 		var work string
 		sourceErr = readJSON(filepath.Join(path, "cx-work.json"), &work)
-		if sourceErr == nil {
+		switch {
+		case sourceErr == nil:
 			if q.Key == "" {
 				return false, nil
 			}
@@ -111,9 +112,9 @@ func findReuse(ctx context.Context, raw string) error {
 			if req.ReuseKey != q.Key {
 				return false, nil
 			}
-		} else if !os.IsNotExist(sourceErr) {
+		case !os.IsNotExist(sourceErr):
 			return false, sourceErr
-		} else {
+		default:
 			if q.Key != "" {
 				return false, nil
 			}

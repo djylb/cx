@@ -25,7 +25,7 @@ func snapManifest(store, id string) (Manifest, []byte, error) {
 	if !snapHex(id, 64) {
 		return m, nil, errors.New("invalid snapshot ID")
 	}
-	b, e := os.ReadFile(filepath.Join(store, "manifests", id+".json"))
+	b, e := readStateFile(filepath.Join(store, "manifests", id+".json"))
 	if e != nil {
 		return m, nil, e
 	}
@@ -122,7 +122,7 @@ func snapArchive(ctx context.Context, store, id, receipts, dst string, full bool
 		oids := groups[k]
 		var old []string
 		if !full {
-			if prior, readErr := os.ReadFile(filepath.Join(receipts, k)); readErr == nil {
+			if prior, readErr := readStateFile(filepath.Join(receipts, k)); readErr == nil {
 				if prev, _, manifestErr := snapManifest(store, string(prior)); manifestErr == nil {
 					old = snapGroups(prev)[k]
 				}
@@ -164,11 +164,18 @@ func snapArchive(ctx context.Context, store, id, receipts, dst string, full bool
 	if e != nil {
 		return e
 	}
-	defer closeBestEffort(f)
-	w := tar.NewWriter(f)
+	if e = errors.Join(writeSnapshotArchive(f, tmp, members), f.Close()); e != nil {
+		return e
+	}
+	return os.Rename(f.Name(), dst)
+}
+
+func writeSnapshotArchive(dst io.Writer, dir string, members []string) (err error) {
+	w := tar.NewWriter(dst)
+	defer func() { err = errors.Join(err, w.Close()) }()
 	sort.Strings(members)
 	for _, name := range members {
-		p := filepath.Join(tmp, name)
+		p := filepath.Join(dir, name)
 		st, archiveErr := os.Stat(p)
 		if archiveErr != nil {
 			return archiveErr
@@ -185,10 +192,7 @@ func snapArchive(ctx context.Context, store, id, receipts, dst string, full bool
 			return archiveErr
 		}
 	}
-	if e = errors.Join(w.Close(), f.Close()); e != nil {
-		return e
-	}
-	return os.Rename(f.Name(), dst)
+	return nil
 }
 func snapImport(ctx context.Context, store, id, packet string) error {
 	tmp, e := os.MkdirTemp(store, ".import-")
@@ -221,7 +225,7 @@ func snapImport(ctx context.Context, store, id, packet string) error {
 			return extractErr
 		}
 	}
-	raw, e := os.ReadFile(filepath.Join(tmp, "manifest.json"))
+	raw, e := readStateFile(filepath.Join(tmp, "manifest.json"))
 	if e != nil {
 		return e
 	}
@@ -307,7 +311,11 @@ func snapImportGroup(ctx context.Context, store, tmp string, r SnapshotRepo, oid
 		if kind != "commit" {
 			return errors.New("invalid snapshot commit")
 		}
-		fmt.Fprintf(&refs, "update refs/snapshots/%s %s\n", oid, oid)
+		refs.WriteString("update refs/snapshots/")
+		refs.WriteString(oid)
+		refs.WriteByte(' ')
+		refs.WriteString(oid)
+		refs.WriteByte('\n')
 	}
 	_, e = g.input([]byte(refs.String()), "update-ref", "--stdin")
 	return e
@@ -369,7 +377,7 @@ func snapReceiveAt(ctx context.Context, store string, args []string, input io.Re
 	process, stop := context.WithTimeout(ctx, 5*time.Minute)
 	defer stop()
 	if e = snapImport(process, store, id, p); e != nil {
-		fmt.Fprintln(os.Stderr, e)
+		diagnosticf("%v\n", e)
 		return ctlExit(65)
 	}
 	return os.Remove(p)

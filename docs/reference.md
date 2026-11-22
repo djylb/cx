@@ -313,6 +313,22 @@ B3 已接入节点分派。`nodeCLI` 的 `snap-receive` 参数交给 `ReceiveSna
 
 `cx result JOB` 输出摘要时，在 stderr 提示 `last.md` 的绝对路径。加 `--full` 输出完整报告。回收中退出 12 时，`--json` 在 stdout 输出包含 `job`、`status: "collecting"`、`turn`、`bytes` 和 `total` 的 JSON 对象，未知总大小为 `null`。同一退出码下，`--log` 的 stdout 为空，回收进度在 stderr。
 
+### 多轮补丁与应用
+
+`cx patch JOB [--turn N]` 和 `cx apply JOB [--turn N]` 默认使用相对派发快照的累计补丁。已应用并提交第 1 轮时，可用 `cx patch JOB --turn 2 --incremental` 检查第 2 轮相对第 1 轮的变化，再用 `cx apply JOB --since-turn 2` 应用第 2 轮至最新完成轮次的变化。三方合并以第 1 轮封存的树为基线。`--incremental` 选第 1 轮时，输出与第 1 轮累计补丁相同。`--since-turn` 与 `--turn` 互斥。
+
+Go 节点封存已完成的快照轮次，后续轮开始前确保上一轮已封存。控制端用派发快照和两端的累计补丁还原轮次树。增量操作使用派发控制端保存的快照。旧作业缺少前置封存时会指出所缺轮次。控制端三方合并需要 Git 2.38 或更新版本。
+
+| 退出码 | `cx apply` 的含义 |
+| --- | --- |
+| 0 | 应用成功或补丁为空。提交由调用方决定。 |
+| 1 | 应用失败或存在冲突。默认任何冲突都会阻止所有选中仓库的写入。`--allow-conflicts` 显式允许写入合并结果及文本冲突标记，冲突文件保留未合并索引条目，仍退出 1。 |
+| 9 | 传输失败。 |
+| 10 | 已写入，但读取 Git 状态失败。 |
+| 44 | 结果不可用，包括增量所需的旧轮次未封存。 |
+
+发生冲突时会列出文件，提示按已应用的轮次使用 `--since-turn`，或用 `cx rebase JOB TEXT` 以新快照重新派发。
+
 `cx tail JOB --messages` 在一次执行端调用内跟随 `events.jsonl`，通过 gzip 流返回完整的 `agentMessage`，每条消息以 `--- turn N, <time>` 开头。旧事件缺少时间戳时显示 `unknown`。`--cursor NAME` 独立保存消息流的字节偏移，重连后续读。`--since N` 跳过序号不大于 N 的事件，`--from-start` 从头重放。消息模式要求控制端和执行端都支持 `--messages`。
 
 `cx close` 先回收作业进程并封存可收集的最新结果。私有检出副本在最后一个使用它的作业关闭后，通过 `git worktree remove` 和 `git worktree prune` 回收。报告、补丁和 artifacts 仍可读取，继续在已回收的快照上工作需要重新提交。终态作业也可直接用 `cx clean` 回收检出副本和私有作业数据。显式指定的工作目录由调用方管理。

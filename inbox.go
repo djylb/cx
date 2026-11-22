@@ -227,13 +227,13 @@ func (r *runner) deliver(name string) error {
 		return nil
 	}
 	path := r.mail(name)
-	b, err := os.ReadFile(path)
+	b, err := readStateFile(path)
 	if err != nil {
 		return err
 	}
 	// A remote publisher retries by republishing the same immutable name and bytes.
 	for _, sub := range []string{"done", "uncertain"} {
-		previous, duplicateErr := os.ReadFile(r.mail(filepath.Join(sub, name)))
+		previous, duplicateErr := readStateFile(r.mail(filepath.Join(sub, name)))
 		if os.IsNotExist(duplicateErr) {
 			continue
 		}

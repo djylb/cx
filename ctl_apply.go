@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -35,6 +36,7 @@ type applyPlan struct {
 	src, index, head, repo, base, patch string
 	original, final, pack, delta        []byte
 	git, work                           snapGit
+	conflicts                           []string
 }
 
 func treeChanges(g snapGit, a, b string) (map[string]bool, error) {
@@ -67,7 +69,7 @@ func overlayIndex(g snapGit, tree string, paths []string) error {
 	return e
 }
 
-func planApply(ctx context.Context, store, src, patch, scratch string, row SnapshotPatch, base SnapshotRepo) (applyPlan, error) {
+func planApply(ctx context.Context, store, src, patch, scratch string, row turnPatch, base SnapshotRepo, since int64, allowConflicts bool) (applyPlan, error) {
 	g := snapGit{ctx: ctx, dir: src}
 	p := applyPlan{src: src, git: g, repo: row.Path, patch: patch}
 	if base.OID != row.SnapshotOID || base.RepoID != row.RepoID {
@@ -88,8 +90,8 @@ func planApply(ctx context.Context, store, src, patch, scratch string, row Snaps
 	if e != nil {
 		return p, e
 	}
-	p.head, e = g.get("rev-parse", "HEAD")
-	if e != nil {
+	p.head, e = g.get("rev-parse", "--verify", "HEAD")
+	if e != nil && base.Head != nil {
 		return p, e
 	}
 	p.base = p.head
@@ -114,7 +116,13 @@ func planApply(ctx context.Context, store, src, patch, scratch string, row Snaps
 	if e != nil {
 		return p, e
 	}
-	g.env = []string{"GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=core.splitIndex", "GIT_CONFIG_VALUE_0=false", "GIT_INDEX_FILE=" + index, "GIT_OBJECT_DIRECTORY=" + obj, "GIT_ALTERNATE_OBJECT_DIRECTORIES=" + strings.Join([]string{objects, filepath.Join(base.bare(store), "objects")}, string(os.PathListSeparator)), "GIT_OPTIONAL_LOCKS=0"}
+	alternates := []string{objects, filepath.Join(base.bare(store), "objects")}
+	patchBase := row.SnapshotOID
+	if row.mergeBase != "" {
+		patchBase = row.mergeBase
+		alternates = append(alternates, patch+".objects")
+	}
+	g.env = []string{"GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=core.splitIndex", "GIT_CONFIG_VALUE_0=false", "GIT_INDEX_FILE=" + index, "GIT_OBJECT_DIRECTORY=" + obj, "GIT_ALTERNATE_OBJECT_DIRECTORIES=" + strings.Join(alternates, string(os.PathListSeparator)), "GIT_OPTIONAL_LOCKS=0"}
 	stat, e := g.input(nil, "apply", "--numstat", "-z", patch)
 	if e != nil {
 		return p, e
@@ -154,7 +162,14 @@ func planApply(ctx context.Context, store, src, patch, scratch string, row Snaps
 	if e != nil {
 		return p, e
 	}
-	st, e := treeChanges(g, p.head, staged)
+	headTree := p.head
+	if headTree == "" {
+		headTree, e = g.get("mktree")
+		if e != nil {
+			return p, e
+		}
+	}
+	st, e := treeChanges(g, headTree, staged)
 	if e != nil {
 		return p, e
 	}
@@ -172,59 +187,52 @@ func planApply(ctx context.Context, store, src, patch, scratch string, row Snaps
 	if e = copyFile(index, filepath.Join(scratch, "work-index")); e != nil {
 		return p, e
 	}
-	if _, e = g.get("read-tree", row.SnapshotOID); e != nil {
-		return p, e
-	}
-	if _, e = g.get("apply", "--cached", patch); e != nil {
-		return p, e
-	}
-	theirs, e := g.get("write-tree")
+	theirs, e := resultTree(g, patchBase, filepath.Dir(patch), turnPatch{SnapshotPatch: SnapshotPatch{
+		SnapshotOID: patchBase, Patch: filepath.Base(patch),
+	}})
 	if e != nil {
 		return p, e
 	}
-	if _, e = g.get("read-tree", row.SnapshotOID); e != nil {
-		return p, e
-	}
-	changes, e := treeChanges(g, p.base, ours)
+	ancestor, e := g.get("rev-parse", patchBase+"^{tree}")
 	if e != nil {
 		return p, e
 	}
-	var fork []string
-	for _, n := range paths {
-		if !changes[n] {
-			fork = append(fork, n)
+	if since == 0 && base.Head != nil {
+		if _, e = g.get("read-tree", patchBase); e != nil {
+			return p, e
 		}
-	}
-	if e = overlayIndex(g, p.base, fork); e != nil {
-		return p, e
-	}
-	ancestor, e := g.get("write-tree")
-	if e != nil {
-		return p, e
-	}
-	if e = overlayIndex(g, theirs, paths); e != nil {
-		return p, e
-	}
-	diff := []string{"diff", "--cached", "--binary", "--full-index", "--no-renames", "--no-ext-diff", "--no-textconv", "--src-prefix=a/", "--dst-prefix=b/"}
-	delta, e := g.input(nil, append(diff, ancestor)...)
-	if e != nil {
-		return p, e
-	}
-	if _, e = g.get("read-tree", ours); e != nil {
-		return p, e
-	}
-	if len(delta) > 0 {
-		if _, e = g.input(delta, "apply", "--cached", "--3way", "-"); e != nil {
-			files, err := g.input(nil, "diff", "--name-only", "--diff-filter=U", "-z")
-			if err == nil && len(files) > 0 {
-				return p, mergeConflict(snapList(string(files)))
+		changes, err := treeChanges(g, p.base, ours)
+		if err != nil {
+			return p, err
+		}
+		var fork []string
+		for _, n := range paths {
+			if !changes[n] {
+				fork = append(fork, n)
 			}
+		}
+		if e = overlayIndex(g, p.base, fork); e != nil {
+			return p, e
+		}
+		if ancestor, e = g.get("write-tree"); e != nil {
 			return p, e
 		}
 	}
-	merged, e := g.get("write-tree")
+	if since > 0 || base.Head == nil {
+		p.base = ancestor
+	}
+	merged, stages, e := mergeApplyTrees(g, ancestor, ours, theirs)
 	if e != nil {
 		return p, e
+	}
+	for _, stage := range stages {
+		_, name, _ := strings.Cut(stage, "\t")
+		if !slices.Contains(p.conflicts, name) {
+			p.conflicts = append(p.conflicts, name)
+		}
+	}
+	if len(p.conflicts) > 0 && !allowConflicts {
+		return p, nil
 	}
 	changed, e := treeChanges(g, ours, merged)
 	if e != nil {
@@ -235,7 +243,10 @@ func planApply(ctx context.Context, store, src, patch, scratch string, row Snaps
 			return p, fmt.Errorf("merge displaces %s", n)
 		}
 	}
-	p.delta, e = g.input(nil, append(diff, ours)...)
+	if _, e = g.get("read-tree", merged); e != nil {
+		return p, e
+	}
+	p.delta, e = g.input(nil, append(append([]string{}, patchDiff...), ours)...)
 	if e != nil {
 		return p, e
 	}
@@ -255,11 +266,39 @@ func planApply(ctx context.Context, store, src, patch, scratch string, row Snaps
 	if e = overlayIndex(g, merged, paths); e != nil {
 		return p, e
 	}
+	if len(stages) > 0 {
+		var info bytes.Buffer
+		for _, name := range p.conflicts {
+			if !selected[name] {
+				return p, fmt.Errorf("merge conflict displaces %s", name)
+			}
+			info.WriteString("0 ")
+			info.WriteString(strings.Repeat("0", len(base.OID)))
+			info.WriteByte('\t')
+			info.WriteString(name)
+			info.WriteByte(0)
+		}
+		for _, stage := range stages {
+			info.WriteString(stage)
+			info.WriteByte(0)
+		}
+		if _, e = g.input(info.Bytes(), "update-index", "-z", "--index-info"); e != nil {
+			return p, e
+		}
+	}
 	p.final, e = os.ReadFile(index)
 	if e != nil {
 		return p, e
 	}
-	p.pack, e = g.input([]byte(merged+"\n^"+p.head+"\n"), "pack-objects", "--stdout", "--revs")
+	revs := []string{merged}
+	for _, stage := range stages {
+		meta, _, _ := strings.Cut(stage, "\t")
+		revs = append(revs, strings.Fields(meta)[1])
+	}
+	if p.head != "" {
+		revs = append(revs, "^"+p.head)
+	}
+	p.pack, e = g.input([]byte(strings.Join(revs, "\n")+"\n"), "pack-objects", "--stdout", "--revs")
 	return p, e
 }
 
@@ -292,8 +331,8 @@ func installPlans(plans []applyPlan, record func() error) (err error) {
 		if !bytes.Equal(p.original, current) || (current == nil) != (p.original == nil) {
 			return errors.New("index changed during preflight")
 		}
-		head, e := p.git.get("rev-parse", "HEAD")
-		if e != nil || head != p.head {
+		head, _ := p.git.get("rev-parse", "--verify", "HEAD")
+		if head != p.head {
 			return errors.New("HEAD changed during preflight")
 		}
 
@@ -321,48 +360,56 @@ func installPlans(plans []applyPlan, record func() error) (err error) {
 	return record()
 }
 
-type mergeConflict []string
-
-func (m mergeConflict) Error() string { return "conflicts: " + strings.Join(m, ", ") }
-
-// Unbased snapshots have no source commit for a linear merge. Check both
-// the index and worktree against the patch in a private object directory.
-func unbasedPreflight(ctx context.Context, src, patch, scratch string, exact bool) (snapGit, error) {
-	g := snapGit{ctx: ctx, dir: src}
-	top, e := g.get("rev-parse", "--show-toplevel")
-	if e != nil {
-		return g, e
+// merge-tree writes a result tree even when it reports conflicts. Its stage
+// records preserve unmerged paths and the blobs needed to resolve them.
+func mergeApplyTrees(g snapGit, ancestor, ours, theirs string) (tree string, stages []string, err error) {
+	if ancestor == ours || ours == theirs {
+		return theirs, nil, nil
 	}
-	if exact && top != src {
-		return g, errors.New("source root changed")
+	if ancestor == theirs {
+		return ours, nil, nil
 	}
-	g.dir = top
-	index, e := g.get("rev-parse", "--path-format=absolute", "--git-path", "index")
-	if e != nil {
-		return g, e
+	g.env = append(slices.Clone(g.env), "GIT_AUTHOR_NAME=cx", "GIT_AUTHOR_EMAIL=cx@example.invalid",
+		"GIT_COMMITTER_NAME=cx", "GIT_COMMITTER_EMAIL=cx@example.invalid")
+	base, err := g.get("commit-tree", ancestor, "-m", "apply base")
+	if err != nil {
+		return "", nil, err
 	}
-	objects, e := g.get("rev-parse", "--path-format=absolute", "--git-path", "objects")
-	if e != nil {
-		return g, e
+	left, err := g.get("commit-tree", ours, "-p", base, "-m", "current worktree")
+	if err != nil {
+		return "", nil, err
 	}
-	temporary := filepath.Join(scratch, "objects")
-	if e = os.MkdirAll(temporary, 0700); e != nil {
-		return g, e
+	right, err := g.get("commit-tree", theirs, "-p", base, "-m", "job result")
+	if err != nil {
+		return "", nil, err
 	}
-	private := filepath.Join(scratch, "index")
-	if e = copyFile(index, private); e != nil && !os.IsNotExist(e) {
-		return g, e
+	out, err := g.input(nil, "-c", "merge.renames=false", "merge-tree", "--write-tree", "-z", left, right)
+	var exit *exec.ExitError
+	if err != nil && (!errors.As(err, &exit) || exit.ExitCode() != 1) {
+		return "", nil, err
 	}
-	trial := g
-	trial.env = []string{"GIT_OPTIONAL_LOCKS=0", "GIT_INDEX_FILE=" + private, "GIT_OBJECT_DIRECTORY=" + temporary, "GIT_ALTERNATE_OBJECT_DIRECTORIES=" + objects}
-	if _, e = trial.get("-c", "core.splitIndex=false", "apply", "--check", "--index", patch); e != nil {
-		return g, e
+	entries := strings.Split(string(out), "\x00")
+	if !snapOID(entries[0]) {
+		return "", nil, errors.Join(errors.New("invalid git merge-tree result"), err)
 	}
-	_, e = trial.get("-c", "core.splitIndex=false", "apply", "--cached", "--3way", patch)
-	return g, e
+	for _, entry := range entries[1:] {
+		if entry == "" {
+			break
+		}
+		meta, name, ok := strings.Cut(entry, "\t")
+		fields := strings.Fields(meta)
+		if !ok || !snapPath(name) || len(fields) != 3 || !snapOID(fields[1]) {
+			return "", nil, errors.New("invalid git merge-tree conflict path")
+		}
+		stages = append(stages, entry)
+	}
+	if err != nil && len(stages) == 0 {
+		return "", nil, err
+	}
+	return entries[0], stages, nil
 }
 
-func applyTurn(ctx context.Context, dir, id, host string, o ctlOptions, m turnResult) error {
+func applyTurn(ctx context.Context, dir, patchDir, id, host string, since int64, o ctlOptions, m turnResult) error {
 	origin, store, manifest, e := applyOrigin(dir, host, id)
 	if e != nil {
 		return e
@@ -380,7 +427,6 @@ func applyTurn(ctx context.Context, dir, id, host string, o ctlOptions, m turnRe
 	}
 	defer removeTreeBestEffort(scratch)
 	var plans []applyPlan
-	var plain []applyPlan
 	var conflicts []string
 	var failures error
 	count := 0
@@ -406,19 +452,10 @@ func applyTurn(ctx context.Context, dir, id, host string, o ctlOptions, m turnRe
 				return e
 			}
 		}
-		patch := filepath.Join(dir, row.Patch)
+		patch := filepath.Join(patchDir, row.Patch)
 		temp := filepath.Join(scratch, fmt.Sprint(i))
 		if row.ResultBase != nil && row.Base != nil && (base.Head == nil || *row.Base != *base.Head) {
 			return errors.New("result base differs from frozen source")
-		}
-		if base.Head == nil {
-			g, err := unbasedPreflight(ctx, src, patch, temp, o.dir == "")
-			if err != nil {
-				failures = errors.Join(failures, fmt.Errorf("%s: %w", row.Path, err))
-			} else {
-				plain = append(plain, applyPlan{git: g, src: g.dir, repo: row.Path, patch: patch})
-			}
-			continue
 		}
 		if o.dir != "" {
 			src, e = (snapGit{ctx: ctx, dir: src}).get("rev-parse", "--show-toplevel")
@@ -426,14 +463,11 @@ func applyTurn(ctx context.Context, dir, id, host string, o ctlOptions, m turnRe
 				return e
 			}
 		}
-		plan, planErr := planApply(ctx, store, src, patch, temp, row.SnapshotPatch, *base)
+		plan, planErr := planApply(ctx, store, src, patch, temp, row, *base, since, o.allowConflicts)
+		for _, name := range plan.conflicts {
+			conflicts = append(conflicts, row.Path+"/"+name)
+		}
 		if planErr != nil {
-			var conflict mergeConflict
-			if errors.As(planErr, &conflict) {
-				for _, name := range conflict {
-					conflicts = append(conflicts, row.Path+"/"+name)
-				}
-			}
 			failures = errors.Join(failures, fmt.Errorf("%s: %w", row.Path, planErr))
 			continue
 		}
@@ -442,11 +476,17 @@ func applyTurn(ctx context.Context, dir, id, host string, o ctlOptions, m turnRe
 	if (o.dir != "" || o.repo != "") && count != 1 {
 		return errors.New("select exactly one changed repository")
 	}
-	if failures != nil {
+	if len(conflicts) > 0 {
+		diagnosticf("Conflicting files: %s\n", strings.Join(conflicts, ", "))
+		diagnosticf("If earlier turns are already applied, try cx apply %s --since-turn N; to resolve on a fresh snapshot, use cx rebase %s TEXT.\n", id, id)
 		if e = writeJSON(dir+".conflicts.json", conflicts); e != nil {
 			return e
 		}
-		fmt.Fprintln(os.Stderr, failures)
+	}
+	if failures != nil {
+		diagnosticf("%v\n", failures)
+	}
+	if failures != nil || len(conflicts) > 0 && !o.allowConflicts {
 		return ctlExit(1)
 	}
 	p, _, _ := strings.Cut(id, "/")
@@ -459,9 +499,6 @@ func applyTurn(ctx context.Context, dir, id, host string, o ctlOptions, m turnRe
 		return e
 	}
 	defer closeBestEffort(lock)
-	if len(plans) > 0 && len(plain) > 0 {
-		return errors.New("mixed based and unbased patches; select a repository with --repo")
-	}
 	record := func(changes []applyPlan) error {
 		log := filepath.Join(project, "apply-log.jsonl")
 		b, readErr := os.ReadFile(log)
@@ -473,7 +510,15 @@ func applyTurn(ctx context.Context, dir, id, host string, o ctlOptions, m turnRe
 			if plan.base != "" {
 				base = plan.base
 			}
-			row, encodeErr := json.Marshal(fields{"job": id, "host": host, "base": base, "turn": m.Turn, "repo": plan.repo, "source": plan.src, "patch": plan.patch, "applied_at": time.Now().UTC().Format(time.RFC3339Nano)})
+			entry := fields{"job": id, "host": host, "base": base, "turn": m.Turn, "repo": plan.repo, "source": plan.src, "patch": plan.patch, "applied_at": time.Now().UTC().Format(time.RFC3339Nano)}
+			if since > 0 {
+				entry["since_turn"] = since
+			}
+			if since > 1 {
+				delete(entry, "patch")
+				entry["result"] = filepath.Join(dir, "result.json")
+			}
+			row, encodeErr := json.Marshal(entry)
 			if encodeErr != nil {
 				return encodeErr
 			}
@@ -486,24 +531,20 @@ func applyTurn(ctx context.Context, dir, id, host string, o ctlOptions, m turnRe
 			return e
 		}
 	}
-	for _, p := range plain {
-		if _, e = p.git.get("apply", "--3way", "--index", p.patch); e != nil {
-			return e
-		}
-		if e = record([]applyPlan{p}); e != nil {
-			return e
-		}
-	}
 	var failed bool
-	for _, p := range append(plans, plain...) {
+	for _, p := range plans {
 		fmt.Println(p.repo + ":")
 		b, e := p.git.input(nil, "--no-optional-locks", "status", "--short")
 		if e != nil {
-			fmt.Fprintln(os.Stderr, e)
+			diagnosticf("%v\n", e)
 			failed = true
 		} else if _, e = os.Stdout.Write(b); e != nil {
 			return e
 		}
+	}
+	if len(conflicts) > 0 {
+		diagnosticf("Merge results written. Resolve the conflicts before committing.\n")
+		return ctlExit(1)
 	}
 	if count > 0 {
 		fmt.Println("Changes are ready for review and commit.")

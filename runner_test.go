@@ -36,7 +36,7 @@ func TestMain(m *testing.M) {
 			return
 		case "app-server":
 			if err := fixtureServer(); err != nil {
-				fmt.Fprintln(os.Stderr, err)
+				diagnosticf("%v\n", err)
 				os.Exit(1)
 			}
 			return
@@ -233,6 +233,17 @@ func fixtureServer() error {
 			result = fields{"turn": t}
 			notify("turn/started", result)
 			switch os.Getenv("FIXMODE") {
+			case "sealed-patches":
+				content := map[string]string{"a": "round 1\n", "undo": "round 1\n"}
+				if turnID == "second" {
+					content = map[string]string{"a": "round 2\n", "undo": "base\n", "new": "round 2\n"}
+				}
+				for name, text := range content {
+					if err := os.WriteFile(name, []byte(text), 0600); err != nil {
+						return err
+					}
+				}
+				notify("turn/completed", fields{"turn": fields{"id": turnID, "status": "completed", "items": []fields{{"type": "agentMessage", "text": "STATUS: DONE"}}}})
 			case "question":
 				text := "STATUS: QUESTION\nNext?"
 				if turnID == "second" {
@@ -431,6 +442,7 @@ func runnerFixture(t *testing.T) (root, work, prompt string) {
 		t.Fatal(err)
 	}
 	root = filepath.Join(tmp, "state")
+	setTestHost(t, root, nil, "")
 	t.Setenv("CXRUN_STATE", root)
 	t.Setenv("CXRUN_PREAMBLE_FILE", "")
 	return
@@ -1048,7 +1060,7 @@ func TestTurnSlotHandoff(t *testing.T) {
 func TestRestartKeepsActiveSlot(t *testing.T) {
 	h := newRuns(t, "silent")
 	setTestHost(t, h.root, map[string]int{"codex": 1}, "")
-	recover := h.start("recover", "--stall", "600ms")
+	recovery := h.start("recover", "--stall", "600ms")
 	h.await("recover", func(s status) bool { return s.Turn == "continued" && s.StallCount == 2 })
 	next := h.start("next")
 	h.await("next", func(s status) bool { return s.State == "queued" && s.PID != 0 })
@@ -1057,7 +1069,7 @@ func TestRestartKeepsActiveSlot(t *testing.T) {
 	if err := readJSON(filepath.Join(h.root, "recover", "status.json"), &s); err != nil || s.State != "stalled" {
 		t.Fatalf("competitor entered during restart: %+v %v", s, err)
 	}
-	if err := <-recover; !errors.Is(err, errStalled) {
+	if err := <-recovery; !errors.Is(err, errStalled) {
 		t.Fatal(err)
 	}
 	if err := h.ctl("close", "next"); err != nil {
