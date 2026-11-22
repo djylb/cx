@@ -2,6 +2,17 @@
 
 Run these steps with the user who will operate cx. Ask for missing deployment information, and get consent before installing system tools or changing system services. Keep authentication in the user's SSH agent, OS credential store, or agent CLI login. Keep connection details and real configuration out of the checkout.
 
+## 0. Get the source
+
+The project lives at https://github.com/djylb/cx. Clone it into a user-owned directory, or update an existing clone, and keep the checkout: later steps build from it and read its guides.
+
+```sh
+git clone https://github.com/djylb/cx
+cd cx
+```
+
+All paths in this guide are relative to that checkout.
+
 ## 1. Identify the controller and execution hosts
 
 - Determine the OS and CPU architecture of the controller and each intended execution host. Ask whether the controller itself should execute jobs. The built-in host `local` uses the controller account directly.

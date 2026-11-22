@@ -24,9 +24,9 @@ One Go binary serves as both the controller (`cx`) and the execution node (`cx n
 
 ## Installation prompt
 
-Copy this into the AI session you want to use as your manager:
+Copy this into the AI session you want to use as your manager. It needs no other context:
 
-> Read `docs/agent-install.md` in the cx source checkout and help me deploy cx. Detect my operating system and check which dependencies and credentials are already available. Ask me for missing information, including which execution hosts and accounts to use. Get my consent before installing tools. Put real connection details only in my user configuration. Run the documented short smoke checks, then summarize the setup and show me how to dispatch and monitor a job.
+> Install and set up cx for me from https://github.com/djylb/cx. Clone the repository with `git clone https://github.com/djylb/cx` (or update an existing clone), then read `docs/agent-install.md` in it and follow it step by step. Detect my operating system and check which dependencies and credentials are already available. Ask me for missing information, including which execution hosts and accounts to use. Get my consent before installing tools. Put real connection details only in my user configuration. Install the cx skill or guide reference for this AI as the guide describes. Run the documented short smoke checks, then summarize the setup and show me how to dispatch and monitor a job with `docs/agent-guide.md`.
 
 ## Quick start
 
