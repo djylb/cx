@@ -53,6 +53,7 @@ cxrun clean --job tools/review
 - 各类别有独立的 FIFO 票据和槽位锁。Codex 默认类别沿用 `.admit/queue/` 和 `.admit/slot-N.lock`，其他类别位于 `.admit/classes/类别/`。等待时显示 `queued`，可用 `close` 取消。空闲时 `say` 开新轮并重新排队，活动轮直接 steer。stall 中断后续跑及 app-server 重启沿用原槽位。跟进轮排队时仍处理控制消息、协议帧和空闲期限。
 - `min_free_bytes` 约束状态根所在卷的可用空间，默认取 20 GB 和该卷容量 5% 中的较大值。可显式设为 0。低于阈值时，作业保持 `queued`，`status` 用 `queue_reason` 说明原因，`doctor` 和 `overview` 输出 `disk_warning`。等到空间达到阈值后按原队列继续准入。
 - 作业进程继承原环境变量（包括 `GOCACHE`），执行端设置 `CARGO_TARGET_DIR=<state>/cache/cargo-target/<project>`，并加入 Codex `workspace-write` 的可写目录。同项目复用 Cargo 增量构建产物，无项目名的作业使用自己的缓存目录。准入前按目录最近使用时间从旧到新淘汰，直到管理的 Cargo 缓存总量达到 `cache_max_bytes` 以下，默认 50 GB。持有作业租约的目录会跳过，缓存总量可能暂时超过上限。
+- 执行端在 `<state>/cache/packages/` 下共享 npm、pnpm、Yarn、pip 和 Cargo 注册表缓存。作业收到 `npm_config_cache`、`PNPM_STORE_DIR`（以及 pnpm 的 `npm_config_store_dir`）、`YARN_CACHE_FOLDER`、`PIP_CACHE_DIR` 与 `CARGO_HOME`，这些目录也加入 Codex `workspace-write` 的可写目录。命令作业仍可通过 `--env` 显式覆盖变量。
 - 从旧版升级时，把 `--slots` 和 `--load-cmd` 的设置迁到主机文件，并从调用方删除这两个参数。旧作业快照中的 `slots` 和 `load_cmd` 不再参与准入。
 
 ### 执行账户与凭据

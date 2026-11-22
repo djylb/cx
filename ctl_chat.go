@@ -25,9 +25,9 @@ type channelRow struct {
 	Seq    int64  `json:"seq"`
 }
 type channelQuery struct {
+	Message                                *channelRow
 	Project, Channel, Root, Token, Mention string
 	Since                                  int64
-	Message                                *channelRow
 	Wait                                   time.Duration
 }
 
@@ -107,34 +107,34 @@ func ctlChat(ctx context.Context, hs endpoints, action string, o ctlOptions) err
 				return errors.New("chat forward JOB SEQ CH")
 			}
 			q.Channel = strings.TrimPrefix(o.pos[2], "#")
-			name, id, e := resolveJob(ctx, o.pos[0])
-			if e != nil {
-				return e
+			name, id, forwardErr := resolveJob(ctx, o.pos[0])
+			if forwardErr != nil {
+				return forwardErr
 			}
 			if !strings.HasPrefix(id, p+"/") {
 				return errors.New("job belongs to another project")
 			}
-			seq, e := strconv.ParseUint(o.pos[1], 10, 64)
-			if e != nil || seq == 0 {
+			seq, forwardErr := strconv.ParseUint(o.pos[1], 10, 64)
+			if forwardErr != nil || seq == 0 {
 				return errors.New("invalid sequence")
 			}
-			node, e := hs.get(name)
-			if e != nil {
-				return e
+			node, forwardErr := hs.get(name)
+			if forwardErr != nil {
+				return forwardErr
 			}
-			r, e := node.call(ctx, 30*time.Second, "forward-message", id, fmt.Sprint(seq))
-			if e != nil {
-				return e
+			r, forwardErr := node.call(ctx, 30*time.Second, "forward-message", id, fmt.Sprint(seq))
+			if forwardErr != nil {
+				return forwardErr
 			}
 			if r.code != 0 {
 				return r.output()
 			}
 			var msg struct {
-				Message          agentMail
 				Role, Generation string
+				Message          agentMail
 			}
-			if e = json.Unmarshal(r.data, &msg); e != nil {
-				return e
+			if forwardErr = json.Unmarshal(r.data, &msg); forwardErr != nil {
+				return forwardErr
 			}
 			if msg.Message.Type != "send" || msg.Message.To != "#"+q.Channel {
 				return errors.New("message does not target channel")
@@ -179,13 +179,13 @@ func ctlChat(ctx context.Context, hs endpoints, action string, o ctlOptions) err
 		if e != nil {
 			return e
 		}
-		l, e := lockUntil(ctx, cursor+".lock")
-		if e != nil {
-			return e
+		l, cursorErr := lockUntil(ctx, cursor+".lock")
+		if cursorErr != nil {
+			return cursorErr
 		}
-		defer l.Close()
-		if e = readJSON(cursor, &q.Since); e != nil && !os.IsNotExist(e) {
-			return e
+		defer closeBestEffort(l)
+		if cursorErr = readJSON(cursor, &q.Since); cursorErr != nil && !os.IsNotExist(cursorErr) {
+			return cursorErr
 		}
 	}
 	var rows []channelRow
@@ -283,7 +283,7 @@ func channelNode(ctx context.Context, raw string) error {
 		if e != nil {
 			return e
 		}
-		defer lock.Close()
+		defer closeBestEffort(lock)
 		if _, e = os.Stat(repo); os.IsNotExist(e) {
 			c := exec.CommandContext(ctx, "git", "init", "--bare", "--quiet", repo)
 			if e = c.Run(); e != nil {

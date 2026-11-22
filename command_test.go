@@ -17,16 +17,27 @@ import (
 
 func commandFixture(args []string) int {
 	switch args[0] {
+	case "package-cache-env":
+		if err := json.NewEncoder(os.Stdout).Encode(packageCacheFixtureEnv()); err != nil {
+			return 2
+		}
+		return 0
 	case "argv":
-		fmt.Fprint(os.Stdout, args[1])
-		fmt.Fprint(os.Stderr, args[2])
+		if _, err := fmt.Fprint(os.Stdout, args[1]); err != nil {
+			return 2
+		}
+		if _, err := fmt.Fprint(os.Stderr, args[2]); err != nil {
+			return 2
+		}
 		return 37
 	case "silent":
 		time.Sleep(30 * time.Second)
 	case "after-parent":
 		for i := 0; i < 150; i++ {
 			if _, err := os.Stat("parent-gone"); err == nil {
-				fmt.Print("survived")
+				if _, err := fmt.Print("survived"); err != nil {
+					return 2
+				}
 				return 0
 			}
 			time.Sleep(50 * time.Millisecond)
@@ -73,17 +84,19 @@ func commandFixture(args []string) int {
 		if err != nil || held == nil {
 			return 2
 		}
-		defer held.Close()
-		fmt.Println("grandchild ready")
+		defer func() { _ = held.Close() }()
+		if _, err := fmt.Println("grandchild ready"); err != nil {
+			return 2
+		}
 		time.Sleep(30 * time.Second)
 	}
 	return 2
 }
 
 type commandHarness struct {
-	root, work, exe string
 	ctx             context.Context
 	t               *testing.T
+	root, work, exe string
 }
 
 func commands(t *testing.T) *commandHarness {
@@ -98,7 +111,7 @@ func commands(t *testing.T) *commandHarness {
 	t.Setenv("GORACE", "atexit_sleep_ms=0")
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	t.Cleanup(cancel)
-	return &commandHarness{root, t.TempDir(), exe, ctx, t}
+	return &commandHarness{root: root, work: t.TempDir(), exe: exe, ctx: ctx, t: t}
 }
 
 // running blocks until job owns its slot (start returns before admission, so queue-order tests need this).
@@ -144,12 +157,14 @@ func TestCommandArgvExitAndLog(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	g.Close()
+	if closeErr := g.Close(); closeErr != nil {
+		t.Fatal(closeErr)
+	}
 	held, err := lockPath(filepath.Join(h.root, ".admit", "slot-0.lock"), os.O_CREATE)
 	if err != nil || held == nil {
 		t.Fatal(err)
 	}
-	defer held.Close()
+	defer func() { _ = held.Close() }()
 	h.start("args", []string{"--session", "suite"}, "argv", "a $b * ;", "tail")
 	if out := h.cli(1, "wait", "--job", "p/args"); !strings.Contains(out, "exit_code=37") {
 		t.Fatal(out)
@@ -215,7 +230,9 @@ func TestCloseReapsGrandchildAfterTimeout(t *testing.T) {
 	if err != nil || f == nil {
 		t.Fatal("grandchild still holds lock", err)
 	}
-	f.Close()
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestCommandClassQueueAndClose(t *testing.T) {

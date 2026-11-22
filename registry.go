@@ -15,9 +15,9 @@ var errDuplicate = errors.New("duplicate submission")
 // While the job exists only status.json is authoritative. Clean freezes its last
 // snapshot in the receipt before removing the directory.
 type receipt struct {
+	Archived *status `json:"archived,omitempty"`
 	Project  string  `json:"project"`
 	Job      string  `json:"job"`
-	Archived *status `json:"archived,omitempty"`
 }
 
 func claimKey(root string, c config, s status) error {
@@ -115,8 +115,8 @@ func scanJobs(ctx context.Context, root, project, session string, visit func(sta
 			fi, err := os.Stat(statePath)
 			if os.IsNotExist(err) || (err == nil && fi.IsDir()) {
 				if p == "" {
-					if stop, err := scan(path, entry.Name()); stop || err != nil {
-						return stop, err
+					if stop, scanErr := scan(path, entry.Name()); stop || scanErr != nil {
+						return stop, scanErr
 					}
 				}
 				continue
@@ -152,23 +152,27 @@ func listJobs(ctx context.Context, root, project, session string, briefOnly bool
 			return false, out.Encode(briefStatus(s))
 		}
 		return false, out.Encode(struct {
-			status
 			RateLimit rateLimitStatus `json:"rate_limit"`
-		}{s, s.rateLimitStatus})
+			status
+		}{RateLimit: s.rateLimitStatus, status: s})
 	})
 }
 
 func briefStatus(s status) any {
 	return struct {
-		Project   string    `json:"project"`
-		Job       string    `json:"job"`
-		Session   string    `json:"session"`
-		Profile   string    `json:"profile,omitempty"`
-		State     string    `json:"status"`
-		Turn      string    `json:"turn_id"`
-		Finished  int64     `json:"completed_turns"`
-		LastEvent time.Time `json:"last_event_time"`
-		turnSummary
+		LastEvent time.Time       `json:"last_event_time"`
 		RateLimit rateLimitStatus `json:"rate_limit"`
-	}{s.Project, s.Job, s.Session, s.Profile, s.State, s.Turn, s.Finished, s.LastEvent, s.turnSummary, s.rateLimitStatus}
+		Project   string          `json:"project"`
+		Job       string          `json:"job"`
+		Session   string          `json:"session"`
+		Profile   string          `json:"profile,omitempty"`
+		State     string          `json:"status"`
+		Turn      string          `json:"turn_id"`
+		turnSummary
+		Finished int64 `json:"completed_turns"`
+	}{
+		Project: s.Project, Job: s.Job, Session: s.Session, Profile: s.Profile, State: s.State,
+		Turn: s.Turn, Finished: s.Finished, LastEvent: s.LastEvent,
+		turnSummary: s.turnSummary, RateLimit: s.rateLimitStatus,
+	}
 }

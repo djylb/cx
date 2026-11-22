@@ -55,13 +55,13 @@ func snapPrerequisites(p string, oids []string) error {
 	if e != nil {
 		return e
 	}
-	defer in.Close()
+	defer closeBestEffort(in)
 	rd := bufio.NewReader(in)
 	out, e := os.Create(p + ".new")
 	if e != nil {
 		return e
 	}
-	defer out.Close()
+	defer closeBestEffort(out)
 	line, e := rd.ReadString('\n')
 	seen := map[string]bool{}
 	for e == nil {
@@ -106,7 +106,7 @@ func snapArchive(ctx context.Context, store, id, receipts, dst string, full bool
 	if e != nil {
 		return e
 	}
-	defer os.RemoveAll(tmp)
+	defer removeTreeBestEffort(tmp)
 	groups := snapGroups(m)
 	seen := map[string]bool{}
 	if e = os.WriteFile(filepath.Join(tmp, "manifest.json"), raw, 0600); e != nil {
@@ -122,8 +122,8 @@ func snapArchive(ctx context.Context, store, id, receipts, dst string, full bool
 		oids := groups[k]
 		var old []string
 		if !full {
-			if prior, e := os.ReadFile(filepath.Join(receipts, k)); e == nil {
-				if prev, _, e := snapManifest(store, string(prior)); e == nil {
+			if prior, readErr := os.ReadFile(filepath.Join(receipts, k)); readErr == nil {
+				if prev, _, manifestErr := snapManifest(store, string(prior)); manifestErr == nil {
 					old = snapGroups(prev)[k]
 				}
 			}
@@ -164,25 +164,25 @@ func snapArchive(ctx context.Context, store, id, receipts, dst string, full bool
 	if e != nil {
 		return e
 	}
-	defer f.Close()
+	defer closeBestEffort(f)
 	w := tar.NewWriter(f)
 	sort.Strings(members)
 	for _, name := range members {
 		p := filepath.Join(tmp, name)
-		st, e := os.Stat(p)
-		if e != nil {
-			return e
+		st, archiveErr := os.Stat(p)
+		if archiveErr != nil {
+			return archiveErr
 		}
-		if e = w.WriteHeader(&tar.Header{Name: name, Mode: 0600, Size: st.Size()}); e != nil {
-			return e
+		if archiveErr = w.WriteHeader(&tar.Header{Name: name, Mode: 0600, Size: st.Size()}); archiveErr != nil {
+			return archiveErr
 		}
-		input, e := os.Open(p)
-		if e != nil {
-			return e
+		input, archiveErr := os.Open(p)
+		if archiveErr != nil {
+			return archiveErr
 		}
-		_, e = io.Copy(w, input)
-		if e = errors.Join(e, input.Close()); e != nil {
-			return e
+		_, archiveErr = io.Copy(w, input)
+		if archiveErr = errors.Join(archiveErr, input.Close()); archiveErr != nil {
+			return archiveErr
 		}
 	}
 	if e = errors.Join(w.Close(), f.Close()); e != nil {
@@ -195,21 +195,21 @@ func snapImport(ctx context.Context, store, id, packet string) error {
 	if e != nil {
 		return e
 	}
-	defer os.RemoveAll(tmp)
+	defer removeTreeBestEffort(tmp)
 	f, e := os.Open(packet)
 	if e != nil {
 		return e
 	}
-	defer f.Close()
+	defer closeBestEffort(f)
 	rd := tar.NewReader(f)
 	seen := map[string]bool{}
 	for {
-		h, e := rd.Next()
-		if e == io.EOF {
+		h, extractErr := rd.Next()
+		if extractErr == io.EOF {
 			break
 		}
-		if e != nil {
-			return e
+		if extractErr != nil {
+			return extractErr
 		}
 		name := h.Name
 		key, ext, _ := strings.Cut(name, ".")
@@ -217,8 +217,8 @@ func snapImport(ctx context.Context, store, id, packet string) error {
 			return errors.New("invalid snapshot archive member")
 		}
 		seen[name] = true
-		if e = writeStream(filepath.Join(tmp, name), rd); e != nil {
-			return e
+		if extractErr = writeStream(filepath.Join(tmp, name), rd); extractErr != nil {
+			return extractErr
 		}
 	}
 	raw, e := os.ReadFile(filepath.Join(tmp, "manifest.json"))
@@ -271,7 +271,7 @@ func snapImportGroup(ctx context.Context, store, tmp string, r SnapshotRepo, oid
 	if e != nil {
 		return e
 	}
-	defer lock.Close()
+	defer closeBestEffort(lock)
 	g := snapGit{ctx: ctx, dir: bare}
 	if _, e = os.Stat(bare); os.IsNotExist(e) {
 		format := "sha1"
@@ -300,9 +300,9 @@ func snapImportGroup(ctx context.Context, store, tmp string, r SnapshotRepo, oid
 	}
 	var refs strings.Builder
 	for _, oid := range oids {
-		kind, e := g.get("cat-file", "-t", oid)
-		if e != nil {
-			return e
+		kind, typeErr := g.get("cat-file", "-t", oid)
+		if typeErr != nil {
+			return typeErr
 		}
 		if kind != "commit" {
 			return errors.New("invalid snapshot commit")
@@ -313,7 +313,8 @@ func snapImportGroup(ctx context.Context, store, tmp string, r SnapshotRepo, oid
 	return e
 }
 
-// The first stdout line is the durable uncompressed offset, or done on cache hit.
+// ReceiveSnapshot reads a snapshot packet. Its first stdout line is the durable
+// uncompressed offset, or done on a cache hit.
 func ReceiveSnapshot(ctx context.Context, args []string) error {
 	store, e := snapStore()
 	if e != nil {
@@ -354,7 +355,7 @@ func snapReceiveAt(ctx context.Context, store string, args []string, input io.Re
 	if e != nil {
 		return e
 	}
-	defer lock.Close()
+	defer closeBestEffort(lock)
 	if _, _, e = snapManifest(store, id); e == nil {
 		_, e = fmt.Fprintln(reply, "done")
 		return e
@@ -379,7 +380,7 @@ func receivePacket(p, digest string, size int64, input io.Reader, reply io.Write
 	if e != nil {
 		return e
 	}
-	defer f.Close()
+	defer closeBestEffort(f)
 	st, e := f.Stat()
 	if e != nil {
 		return e
@@ -395,22 +396,22 @@ func receivePacket(p, digest string, size int64, input io.Reader, reply io.Write
 		return e
 	}
 	if n < size {
-		z, e := gzip.NewReader(input)
-		if e != nil {
-			return e
+		z, streamErr := gzip.NewReader(input)
+		if streamErr != nil {
+			return streamErr
 		}
-		defer z.Close()
+		defer closeBestEffort(z)
 		last := time.Time{}
 		meter := &snapProgress{bytes: n, report: func(sizeNow int64) {
 			if sizeNow == size || time.Since(last) >= time.Second {
-				fmt.Fprintln(reply, "bytes", sizeNow)
+				_, _ = fmt.Fprintln(reply, "bytes", sizeNow)
 				last = time.Now()
 			}
 		}}
 		w := io.MultiWriter(f, &receiveProgress{}, meter)
-		written, e := io.Copy(w, io.LimitReader(z, size-n+1))
-		if e != nil {
-			return e
+		written, streamErr := io.Copy(w, io.LimitReader(z, size-n+1))
+		if streamErr != nil {
+			return streamErr
 		}
 		if written != size-n {
 			return fmt.Errorf("incomplete snapshot payload: got %d, expected %d", written, size-n)
@@ -424,17 +425,17 @@ func receivePacket(p, digest string, size int64, input io.Reader, reply io.Write
 		return e
 	}
 	if hash != digest {
-		os.Remove(p)
+		_ = os.Remove(p)
 		return errors.New("archive checksum mismatch")
 	}
 	return nil
 }
 
 type snapAck struct {
-	buf    string
 	ready  chan string
-	sent   bool
 	report func(int64)
+	buf    string
+	sent   bool
 }
 
 func (a *snapAck) Write(b []byte) (int, error) {
@@ -479,15 +480,15 @@ func sendPacket(ctx context.Context, hub endpoint, args []string, p string, prog
 	if e != nil {
 		return e
 	}
-	defer rd.Close()
-	defer wr.Close()
+	defer closeBestEffort(rd)
+	defer closeBestEffort(wr)
 	cmd.Stdin = rd
 	a := &snapAck{ready: make(chan string, 1), report: progress}
 	done := make(chan error, 1)
 	var diag bytes.Buffer
 	go func() {
 		err := runActive(cmd, cancel, hub.connectionBudget(idle), idle, a, &diag)
-		rd.Close()
+		_ = rd.Close()
 		done <- err
 	}()
 	var line string
@@ -509,7 +510,7 @@ func sendPacket(ctx context.Context, hub endpoint, args []string, p string, prog
 			var f *os.File
 			f, e = os.Open(p)
 			if e == nil {
-				defer f.Close()
+				defer closeBestEffort(f)
 				var st os.FileInfo
 				st, e = f.Stat()
 				if e == nil && (n < 0 || n > st.Size()) {
@@ -527,7 +528,7 @@ func sendPacket(ctx context.Context, hub endpoint, args []string, p string, prog
 			}
 		}
 	}
-	wr.Close()
+	_ = wr.Close()
 	if e != nil {
 		cancel()
 	}
@@ -571,7 +572,7 @@ func Publish(ctx context.Context, hub endpoint, sid SnapshotID, progress func(in
 	if e != nil {
 		return e
 	}
-	defer l.Close()
+	defer closeBestEffort(l)
 	p := filepath.Join(receipts, id+".tar")
 	full := false
 	return retryTransfer(ctx, func() error {
@@ -627,8 +628,8 @@ func Publish(ctx context.Context, hub endpoint, sid SnapshotID, progress func(in
 }
 
 type snapProgress struct {
-	bytes  int64
 	report func(int64)
+	bytes  int64
 }
 
 func (w *snapProgress) Write(b []byte) (int, error) {

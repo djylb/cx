@@ -19,8 +19,8 @@ import (
 
 func usage(f fields, raw json.RawMessage) {
 	var u struct {
-		ModelContextWindow float64
 		Last, Total        struct{ TotalTokens *int64 }
+		ModelContextWindow float64
 	}
 	_ = json.Unmarshal(raw, &u)
 	f["tokens"] = u.Total.TotalTokens
@@ -48,9 +48,9 @@ func workDir(dir string, s status) (string, error) {
 				continue
 			}
 			for _, prefix := range []string{filepath.Join(".locks", "cx-executor", "cx-v2", "jobs"), filepath.Join("cx-v2", "jobs")} {
-				work := filepath.Join(base, prefix, s.Project, s.Job)
-				if fi, e := os.Stat(work); e == nil && fi.IsDir() {
-					return work, nil
+				candidate := filepath.Join(base, prefix, s.Project, s.Job)
+				if fi, statErr := os.Stat(candidate); statErr == nil && fi.IsDir() {
+					return candidate, nil
 				}
 			}
 		}
@@ -139,7 +139,7 @@ func nodeRows(ctx context.Context, root, p, session string, chatProject string) 
 			if lock == nil {
 				used++
 			} else {
-				lock.Close()
+				_ = lock.Close()
 			}
 		}
 		slots[k] = fields{"used": used, "capacity": cap}
@@ -214,15 +214,15 @@ func showNode(dir, raw string, full bool) error {
 	changed := 0
 	f, e := os.Open(filepath.Join(dir, "events.jsonl"))
 	if e == nil {
-		defer f.Close()
+		defer closeBestEffort(f)
 		rd := bufio.NewReader(f)
 		for {
-			line, e := rd.ReadBytes('\n')
-			if e == io.EOF {
+			line, eventErr := rd.ReadBytes('\n')
+			if eventErr == io.EOF {
 				break
 			}
-			if e != nil {
-				return e
+			if eventErr != nil {
+				return eventErr
 			}
 			var ev struct {
 				Method string
@@ -236,8 +236,8 @@ func showNode(dir, raw string, full bool) error {
 					}
 				}
 			}
-			if e = json.Unmarshal(line, &ev); e != nil {
-				return e
+			if eventErr = json.Unmarshal(line, &ev); eventErr != nil {
+				return eventErr
 			}
 			v := ev.Params
 			if id == "" || v.TurnID != id {
@@ -285,15 +285,15 @@ func showNode(dir, raw string, full bool) error {
 		if sealed {
 			folder = archive
 		}
-		b, e := os.ReadFile(filepath.Join(folder, "last.md"))
-		if e != nil && !os.IsNotExist(e) {
-			return e
+		b, readErr := os.ReadFile(filepath.Join(folder, "last.md"))
+		if readErr != nil && !os.IsNotExist(readErr) {
+			return readErr
 		}
 		report = string(b)
 		if !sealed {
 			var after status
-			if e = readJSON(filepath.Join(dir, "status.json"), &after); e != nil {
-				return e
+			if readErr = readJSON(filepath.Join(dir, "status.json"), &after); readErr != nil {
+				return readErr
 			}
 			if s.Turn != after.Turn || s.Finished != after.Finished || s.TurnStatus != after.TurnStatus {
 				return errors.New("turn advanced during show")
@@ -306,8 +306,8 @@ func showNode(dir, raw string, full bool) error {
 			return e
 		}
 		var spec struct {
-			Direct bool     `json:"direct_exec"`
 			Argv   []string `json:"command_argv"`
+			Direct bool     `json:"direct_exec"`
 		}
 		if e = readJSON(filepath.Join(work, "request.json"), &spec); e != nil && !os.IsNotExist(e) {
 			return e

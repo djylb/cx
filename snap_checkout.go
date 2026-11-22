@@ -13,11 +13,11 @@ import (
 )
 
 type PreparedSnapshot struct {
-	Source      string            `json:"source"`
 	Env         map[string]string `json:"env"`
 	BaseOID     *string           `json:"base_oid"`
-	SnapshotOID string            `json:"snapshot_oid"`
 	ReviewDiff  *string           `json:"review_diff"`
+	Source      string            `json:"source"`
+	SnapshotOID string            `json:"snapshot_oid"`
 }
 type SnapshotPatch struct {
 	Path         string `json:"path"`
@@ -45,7 +45,7 @@ func (g snapGit) worktree(args ...string) error {
 	if err != nil {
 		return err
 	}
-	defer lock.Close()
+	defer closeBestEffort(lock)
 	_, err = g.get(append([]string{"worktree"}, args...)...)
 	return err
 }
@@ -77,7 +77,7 @@ func Materialize(ctx context.Context, job string, m Manifest, target string) (Pr
 	if e != nil {
 		return out, e
 	}
-	defer lock.Close()
+	defer closeBestEffort(lock)
 	b, e := snapJSON(m)
 	if e != nil {
 		return out, e
@@ -97,7 +97,7 @@ func Materialize(ctx context.Context, job string, m Manifest, target string) (Pr
 	ok := false
 	defer func() {
 		if !ok {
-			os.RemoveAll(work)
+			_ = os.RemoveAll(work)
 		}
 	}()
 	tree := filepath.Join(work, "tree")
@@ -144,9 +144,9 @@ func Materialize(ctx context.Context, job string, m Manifest, target string) (Pr
 			if len(m.Repositories) > 1 {
 				prefix = r.Path + "/"
 			}
-			b, e := g.input(nil, "diff", "--binary", "--no-ext-diff", "--no-textconv", "--src-prefix=a/"+prefix, "--dst-prefix=b/"+prefix, r.Base, r.OID, "--")
-			if e != nil {
-				return out, e
+			b, diffErr := g.input(nil, "diff", "--binary", "--no-ext-diff", "--no-textconv", "--src-prefix=a/"+prefix, "--dst-prefix=b/"+prefix, r.Base, r.OID, "--")
+			if diffErr != nil {
+				return out, diffErr
 			}
 			review.Write(b)
 			p := filepath.Join(job, "review.diff")
@@ -218,7 +218,7 @@ func Collect(ctx context.Context, job string) (SnapshotResult, error) {
 	ok := false
 	defer func() {
 		if !ok {
-			os.RemoveAll(out.Dir)
+			_ = os.RemoveAll(out.Dir)
 		}
 	}()
 	tree := filepath.Join(job, "work/tree")
@@ -230,49 +230,49 @@ func Collect(ctx context.Context, job string) (SnapshotResult, error) {
 	for i, r := range m.Repositories {
 		repo := filepath.Join(tree, r.Path)
 		g := snapGit{ctx: ctx, dir: repo}
-		index, e := filepath.Abs(filepath.Join(out.Dir, "index"))
-		if e != nil {
-			return out, e
+		index, indexErr := filepath.Abs(filepath.Join(out.Dir, "index"))
+		if indexErr != nil {
+			return out, indexErr
 		}
-		obj, e := g.get("rev-parse", "--path-format=absolute", "--git-path", "objects")
-		if e != nil {
-			return out, e
+		obj, indexErr := g.get("rev-parse", "--path-format=absolute", "--git-path", "objects")
+		if indexErr != nil {
+			return out, indexErr
 		}
-		scratch, e := os.MkdirTemp(out.Dir, ".objects-")
-		if e != nil {
-			return out, e
+		scratch, indexErr := os.MkdirTemp(out.Dir, ".objects-")
+		if indexErr != nil {
+			return out, indexErr
 		}
-		defer os.RemoveAll(scratch)
+		defer removeTreeBestEffort(scratch)
 		g.env = []string{"GIT_INDEX_FILE=" + index, "GIT_OPTIONAL_LOCKS=0", "GIT_OBJECT_DIRECTORY=" + scratch, "GIT_ALTERNATE_OBJECT_DIRECTORIES=" + obj}
-		if _, e = g.get("read-tree", r.OID); e != nil {
-			return out, e
+		if _, indexErr = g.get("read-tree", r.OID); indexErr != nil {
+			return out, indexErr
 		}
 		scope := []string{"--", "."}
 		if snapWithin(repo, art) {
-			rel, e := filepath.Rel(repo, art)
-			if e != nil {
-				return out, e
+			rel, relErr := filepath.Rel(repo, art)
+			if relErr != nil {
+				return out, relErr
 			}
 			scope = append(scope, ":(top,exclude,literal)"+filepath.ToSlash(rel))
 		}
-		if _, e = g.get(append([]string{"add", "-A"}, scope...)...); e != nil {
-			return out, e
+		if _, indexErr = g.get(append([]string{"add", "-A"}, scope...)...); indexErr != nil {
+			return out, indexErr
 		}
-		ignored, e := (snapGit{ctx: ctx, dir: repo}).input(nil, "ls-files", "-ci", "--exclude-standard", "-z")
-		if e != nil {
-			return out, e
+		ignored, indexErr := (snapGit{ctx: ctx, dir: repo}).input(nil, "ls-files", "-ci", "--exclude-standard", "-z")
+		if indexErr != nil {
+			return out, indexErr
 		}
 		var force bytes.Buffer
 		for _, n := range snapList(string(ignored)) {
 			p := filepath.Join(repo, n)
-			if st, e := os.Lstat(p); e == nil && !st.IsDir() && !snapWithin(art, p) {
+			if st, statErr := os.Lstat(p); statErr == nil && !st.IsDir() && !snapWithin(art, p) {
 				force.WriteString(n)
 				force.WriteByte(0)
 			}
 		}
 		if force.Len() > 0 {
-			if _, e = g.input(force.Bytes(), "--literal-pathspecs", "add", "-f", "--pathspec-from-file=-", "--pathspec-file-nul"); e != nil {
-				return out, e
+			if _, indexErr = g.input(force.Bytes(), "--literal-pathspecs", "add", "-f", "--pathspec-from-file=-", "--pathspec-file-nul"); indexErr != nil {
+				return out, indexErr
 			}
 		}
 		if runtime.GOOS == "windows" {
@@ -280,36 +280,36 @@ func Collect(ctx context.Context, job string) (SnapshotResult, error) {
 			if baseline == "" {
 				baseline = r.OID
 			}
-			if e = snapWindowsModes(g, baseline); e != nil {
-				return out, e
+			if indexErr = snapWindowsModes(g, baseline); indexErr != nil {
+				return out, indexErr
 			}
 		}
 		opts := []string{"diff", "--cached", "--no-ext-diff", "--no-textconv", "--no-renames", "--no-relative"}
 		args := append(append([]string{}, opts...), "--binary", "--full-index", "--src-prefix=a/", "--dst-prefix=b/", r.OID)
-		data, e := g.input(nil, append(args, scope...)...)
-		if e != nil {
-			return out, e
+		data, indexErr := g.input(nil, append(args, scope...)...)
+		if indexErr != nil {
+			return out, indexErr
 		}
 		if len(data) > 0 {
 			name := r.RepoID + ".patch"
 			if counts[r.RepoID] > 1 {
 				name = fmt.Sprintf("%s.%d.patch", r.RepoID, i)
 			}
-			if e = os.WriteFile(filepath.Join(out.Dir, name), data, 0600); e != nil {
-				return out, e
+			if indexErr = os.WriteFile(filepath.Join(out.Dir, name), data, 0600); indexErr != nil {
+				return out, indexErr
 			}
-			tree, e := g.get("rev-parse", r.OID+"^{tree}")
-			if e != nil {
-				return out, e
+			baseTree, treeErr := g.get("rev-parse", r.OID+"^{tree}")
+			if treeErr != nil {
+				return out, treeErr
 			}
-			names, e := g.input(nil, append(append(opts, "--name-only", "-z", r.OID), scope...)...)
-			if e != nil {
-				return out, e
+			names, treeErr := g.input(nil, append(append(opts, "--name-only", "-z", r.OID), scope...)...)
+			if treeErr != nil {
+				return out, treeErr
 			}
-			out.Repositories = append(out.Repositories, SnapshotPatch{r.Path, r.RepoID, r.key(), r.OID, tree, name, len(data), bytes.Count(names, []byte{0})})
+			out.Repositories = append(out.Repositories, SnapshotPatch{r.Path, r.RepoID, r.key(), r.OID, baseTree, name, len(data), bytes.Count(names, []byte{0})})
 		}
-		if e = os.Remove(index); e != nil {
-			return out, e
+		if indexErr = os.Remove(index); indexErr != nil {
+			return out, indexErr
 		}
 	}
 	src := filepath.Dir(art)

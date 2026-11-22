@@ -21,13 +21,15 @@ import (
 type SnapshotID string
 type FreezeOptions struct{ History string }
 
-// Fields follow v1's lexicographically sorted wire order.
+// Manifest describes a frozen snapshot. Fields follow v1's sorted wire order.
 type Manifest struct {
 	Main         string             `json:"main"`
 	Repositories []SnapshotRepo     `json:"repositories"`
 	Version      int                `json:"version"`
 	Workspace    *SnapshotWorkspace `json:"workspace"`
 }
+
+// SnapshotRepo describes one frozen repository. Field order is part of the v1 snapshot hash.
 type SnapshotRepo struct {
 	Base    string   `json:"base,omitempty"`
 	Head    *string  `json:"head"`
@@ -165,7 +167,7 @@ func snapImmutable(path string, data []byte) error {
 	if e != nil {
 		return e
 	}
-	defer os.Remove(f.Name())
+	defer removeBestEffort(f.Name())
 	_, e = f.Write(data)
 	if e = errors.Join(e, f.Close()); e != nil {
 		return e

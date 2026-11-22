@@ -12,21 +12,21 @@ import (
 )
 
 type envelope struct {
-	Version    int             `json:"version"`
 	Kind       string          `json:"kind"`
 	Method     string          `json:"method,omitempty"`
 	Params     json.RawMessage `json:"params,omitempty"`
-	Generation uint64          `json:"generation,omitempty"`
 	Request    json.RawMessage `json:"request_id,omitempty"`
 	Result     json.RawMessage `json:"result,omitempty"`
 	Error      json.RawMessage `json:"error,omitempty"`
+	Version    int             `json:"version"`
+	Generation uint64          `json:"generation,omitempty"`
 }
 type rpcReceipt struct {
+	Error      *rpcError       `json:"error,omitempty"`
 	Op         string          `json:"op_id"`
-	Generation uint64          `json:"generation"`
 	State      string          `json:"status"`
 	Result     json.RawMessage `json:"result,omitempty"`
-	Error      *rpcError       `json:"error,omitempty"`
+	Generation uint64          `json:"generation"`
 }
 
 func (r *runner) receiptPath(id string) string { return filepath.Join(r.dir, "outbox", id+".json") }
@@ -114,6 +114,13 @@ func (r *runner) finishRPC(name, id string, env envelope, parseErr error) error 
 	res := rpcReceipt{Op: id, Generation: r.s.Generation, State: "completed"}
 	if parseErr == nil {
 		res.Result, parseErr = r.executeRPC(id, env)
+	}
+	if len(res.Result) != 0 {
+		filtered, err := r.c.secret.jsonOutput(res.Result)
+		if err != nil {
+			return err
+		}
+		res.Result = filtered
 	}
 	if parseErr != nil {
 		res.State = "error"
@@ -278,20 +285,20 @@ func (r *runner) fork(params fields, dst any) error {
 	const id = "initial-fork"
 	var res rpcReceipt
 	if err := readJSON(r.receiptPath(id), &res); os.IsNotExist(err) {
-		raw, err := json.Marshal(params)
-		if err != nil {
-			return err
+		raw, marshalErr := json.Marshal(params)
+		if marshalErr != nil {
+			return marshalErr
 		}
 		e := envelope{Version: 1, Kind: "call", Method: "thread/fork", Params: raw}
 		name := id + ".rpc"
-		if err := writeJSON(r.mail(filepath.Join("pending", name)), e); err != nil {
-			return err
+		if writeErr := writeJSON(r.mail(filepath.Join("pending", name)), e); writeErr != nil {
+			return writeErr
 		}
-		if err := r.finishRPC(name, id, e, nil); err != nil {
-			return err
+		if finishErr := r.finishRPC(name, id, e, nil); finishErr != nil {
+			return finishErr
 		}
-		if err := readJSON(r.receiptPath(id), &res); err != nil {
-			return err
+		if readErr := readJSON(r.receiptPath(id), &res); readErr != nil {
+			return readErr
 		}
 	} else if err != nil {
 		return err

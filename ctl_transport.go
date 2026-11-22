@@ -27,13 +27,13 @@ type ctlExit int
 func (e ctlExit) Error() string { return fmt.Sprintf("exit %d", e) }
 
 type endpoint struct {
-	Via       string `toml:"via"`
 	relay     *endpoint
-	defaultCX bool
+	Via       string `toml:"via"`
 	SSH       string `toml:"ssh"`
 	CX        string `toml:"cx"`
 	State     string `toml:"state"`
 	Platform  string `toml:"platform"`
+	defaultCX bool
 }
 type endpoints map[string]endpoint
 
@@ -211,7 +211,6 @@ func nodeCLI(ctx context.Context, args []string) error {
 			if err = os.Setenv("CXRUN_STATE", req.State); err != nil {
 				return err
 			}
-			applyHostMux(nil) // the state root arrives in the request, not on the command line
 		}
 		args = req.Args
 		if len(args) > 0 && !strings.HasPrefix(args[0], "forward") && args[0] != "platform-probe" {

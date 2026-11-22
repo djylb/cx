@@ -32,7 +32,7 @@ func receive(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	defer lock.Close()
+	defer closeBestEffort(lock)
 	var size int64
 	info, err := os.Stat(path)
 	if err == nil {
@@ -52,7 +52,7 @@ func receive(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	defer z.Close()
+	defer closeBestEffort(z)
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
 	if err != nil {
 		return err
@@ -65,7 +65,7 @@ func fileHash(path string) (string, error) {
 	if e != nil {
 		return "", e
 	}
-	defer f.Close()
+	defer closeBestEffort(f)
 	h := sha256.New()
 	_, e = io.Copy(h, f)
 	return hex.EncodeToString(h.Sum(nil)), e
@@ -89,12 +89,12 @@ func installNode(ctx context.Context, root, src, dst, digest string) error {
 		if e != nil {
 			return e
 		}
-		defer f.Close()
+		defer closeBestEffort(f)
 		tmp, e := os.CreateTemp(filepath.Dir(dst), ".cx-install-*")
 		if e != nil {
 			return e
 		}
-		defer os.Remove(tmp.Name())
+		defer removeBestEffort(tmp.Name())
 		h := sha256.New()
 		_, e = io.Copy(io.MultiWriter(tmp, h), f)
 		if e = errors.Join(e, tmp.Chmod(0700), tmp.Sync(), tmp.Close()); e != nil {
@@ -103,7 +103,7 @@ func installNode(ctx context.Context, root, src, dst, digest string) error {
 		if hex.EncodeToString(h.Sum(nil)) != digest {
 			return errors.New("binary checksum mismatch")
 		}
-		if e = publishBinary(tmp.Name(), dst); e != nil {
+		if e = publishBinary(ctx, tmp.Name(), dst); e != nil {
 			return e
 		}
 	}
@@ -133,26 +133,26 @@ func upload(ctx context.Context, h endpoint, source, dest string) error {
 		}
 		st, e := f.Stat()
 		if e != nil {
-			f.Close()
+			_ = f.Close()
 			return e
 		}
 		if n > st.Size() {
-			f.Close()
+			_ = f.Close()
 			return errors.New("staged object exceeds source length")
 		}
 		if n == st.Size() {
-			f.Close()
+			_ = f.Close()
 			return nil
 		}
 		if _, e = f.Seek(n, 0); e != nil {
-			f.Close()
+			_ = f.Close()
 			return e
 		}
 		attempt, stop := context.WithCancel(ctx)
 		cmd, e := h.command(attempt, []string{"recv", dest, "--offset", strconv.FormatInt(n, 10)})
 		if e != nil {
 			stop()
-			f.Close()
+			_ = f.Close()
 			return e
 		}
 		rd, wr := io.Pipe()
@@ -167,13 +167,13 @@ func upload(ctx context.Context, h endpoint, source, dest string) error {
 		}()
 		var diag bytes.Buffer
 		e = runActive(cmd, stop, h.connectionBudget(45*time.Second), 45*time.Second, io.Discard, &diag)
-		rd.Close()
+		_ = rd.Close()
 		e = errors.Join(e, <-sent)
 		if e != nil {
 			fmt.Fprint(os.Stderr, cleanDiag(diag.Bytes()))
 		}
 		stop()
-		f.Close()
+		_ = f.Close()
 		if e == nil {
 			return nil
 		}
@@ -188,9 +188,9 @@ func setupArtifact(ctx context.Context, h endpoint, source string) error {
 		return e
 	}
 	if h.SSH == "" {
-		root, e := stateRoot()
-		if e != nil {
-			return e
+		root, rootErr := stateRoot()
+		if rootErr != nil {
+			return rootErr
 		}
 		if h.State != "" {
 			root = h.State
@@ -225,8 +225,8 @@ func setupArtifact(ctx context.Context, h endpoint, source string) error {
 			name += ".exe"
 		}
 		sftp := func(batch string) error {
-			_, e := h.rawSSH(ctx, "sftp", []string{"-b", "-", "--", h.SSH}, batch, 45*time.Second)
-			return e
+			_, uploadErr := h.rawSSH(ctx, "sftp", []string{"-b", "-", "--", h.SSH}, batch, 45*time.Second)
+			return uploadErr
 		}
 		if strings.ContainsAny(source, "\r\n") {
 			return errors.New("invalid local artifact path")

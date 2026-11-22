@@ -37,7 +37,7 @@ func submitScript(ctx context.Context, h endpoint, args []string, path, shell st
 	if e != nil {
 		return reply{}, e
 	}
-	defer f.Close()
+	defer closeBestEffort(f)
 	idle, e := transferSetting("CX_TRANSFER_IDLE", 120*time.Second, false)
 	if e != nil {
 		return reply{}, e
@@ -49,8 +49,12 @@ func submitScript(ctx context.Context, h endpoint, args []string, path, shell st
 		return reply{}, e
 	}
 	rd, wr := io.Pipe()
-	defer rd.Close()
-	go func() { z := gzip.NewWriter(wr); _, e := io.Copy(z, f); wr.CloseWithError(errors.Join(e, z.Close())) }()
+	defer closeBestEffort(rd)
+	go func() {
+		z := gzip.NewWriter(wr)
+		_, copyErr := io.Copy(z, f)
+		wr.CloseWithError(errors.Join(copyErr, z.Close()))
+	}()
 	cmd.Stdin = rd
 	var out, diag bytes.Buffer
 	e = runActive(cmd, cancel, h.connectionBudget(idle), idle, &out, &diag)
@@ -83,7 +87,7 @@ func receiveScript(ctx context.Context, args []string) error {
 	if e != nil {
 		return e
 	}
-	defer lock.Close()
+	defer closeBestEffort(lock)
 	dir, e := jobDir(filepath.Join(root, ".scripts"), args[2])
 	if e != nil {
 		return e
@@ -95,12 +99,12 @@ func receiveScript(ctx context.Context, args []string) error {
 	if e != nil {
 		return e
 	}
-	defer z.Close()
+	defer closeBestEffort(z)
 	f, e := os.CreateTemp(dir, ".script-*")
 	if e != nil {
 		return e
 	}
-	defer os.Remove(f.Name())
+	defer removeBestEffort(f.Name())
 	hash := sha256.New()
 	_, e = io.Copy(io.MultiWriter(f, hash, &receiveProgress{}), z)
 	if e = errors.Join(e, f.Close()); e != nil {

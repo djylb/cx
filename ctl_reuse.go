@@ -21,10 +21,10 @@ type reuseQuery struct {
 }
 type reuseHit struct {
 	Job    string `json:"job"`
-	Reused bool   `json:"reused"`
-	Exit   int64  `json:"exit_code"`
 	Host   string `json:"host"`
 	Log    string `json:"log"`
+	Exit   int64  `json:"exit_code"`
+	Reused bool   `json:"reused"`
 }
 
 func lookupReuse(ctx context.Context, h endpoint, q reuseQuery) (bool, error) {
@@ -94,40 +94,40 @@ func findReuse(ctx context.Context, raw string) error {
 		if exists && id != q.ID {
 			return false, nil
 		}
-		path, e := jobDir(root, id)
-		if e != nil {
-			return false, e
+		path, sourceErr := jobDir(root, id)
+		if sourceErr != nil {
+			return false, sourceErr
 		}
 		var work string
-		e = readJSON(filepath.Join(path, "cx-work.json"), &work)
-		if e == nil {
+		sourceErr = readJSON(filepath.Join(path, "cx-work.json"), &work)
+		if sourceErr == nil {
 			if q.Key == "" {
 				return false, nil
 			}
 			var req jobSubmission
-			if e = readJSON(filepath.Join(work, "request.json"), &req); e != nil {
-				return false, e
+			if sourceErr = readJSON(filepath.Join(work, "request.json"), &req); sourceErr != nil {
+				return false, sourceErr
 			}
 			if req.ReuseKey != q.Key {
 				return false, nil
 			}
-		} else if !os.IsNotExist(e) {
-			return false, e
+		} else if !os.IsNotExist(sourceErr) {
+			return false, sourceErr
 		} else {
 			if q.Key != "" {
 				return false, nil
 			}
 			var c config
-			if e = readJSON(filepath.Join(path, "config.json"), &c); e != nil {
-				return false, e
+			if sourceErr = readJSON(filepath.Join(path, "config.json"), &c); sourceErr != nil {
+				return false, sourceErr
 			}
 			targetDir := q.Dir
 			if targetDir == "" {
 				targetDir = filepath.Join(root, ".work", id)
 			}
-			cwd, e := filepath.Abs(targetDir)
-			if e != nil {
-				return false, e
+			cwd, absErr := filepath.Abs(targetDir)
+			if absErr != nil {
+				return false, absErr
 			}
 			if c.Dir != cwd || !maps.Equal(c.Env, q.Env) {
 				return false, nil
@@ -135,9 +135,9 @@ func findReuse(ctx context.Context, raw string) error {
 			argv := q.Argv
 			if q.ScriptHash != "" {
 				sh := scriptShell(q.Shell)
-				ext, e := scriptExtension(sh)
-				if e != nil {
-					return false, e
+				ext, scriptErr := scriptExtension(sh)
+				if scriptErr != nil {
+					return false, scriptErr
 				}
 				argv = scriptArgv(sh, filepath.Join(root, ".scripts", id, q.ScriptHash+ext))
 			}
@@ -146,7 +146,7 @@ func findReuse(ctx context.Context, raw string) error {
 			}
 		}
 		newest = s.LastEvent
-		hit = &reuseHit{id, true, *s.ExitCode, q.Host, filepath.Join(path, "output.log")}
+		hit = &reuseHit{Job: id, Reused: true, Exit: *s.ExitCode, Host: q.Host, Log: filepath.Join(path, "output.log")}
 		return false, nil
 	})
 	if e != nil {

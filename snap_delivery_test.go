@@ -96,20 +96,20 @@ func TestSnapResume(t *testing.T) {
 	send := func(data []byte) (string, error) {
 		var wire, ack bytes.Buffer
 		z := gzip.NewWriter(&wire)
-		_, e := z.Write(data)
-		if e != nil {
-			t.Fatal(e)
+		_, receiveErr := z.Write(data)
+		if receiveErr != nil {
+			t.Fatal(receiveErr)
 		}
-		if e = z.Close(); e != nil {
-			t.Fatal(e)
+		if receiveErr = z.Close(); receiveErr != nil {
+			t.Fatal(receiveErr)
 		}
-		e = snapReceiveAt(ctx, dest, args, &wire, &ack)
+		receiveErr = snapReceiveAt(ctx, dest, args, &wire, &ack)
 		line, _, _ := strings.Cut(ack.String(), "\n")
-		return line, e
+		return line, receiveErr
 	}
 	split := len(b) / 2
-	if off, e := send(b[:split]); e == nil || off != "0" {
-		t.Fatalf("partial: %s %v", off, e)
+	if off, sendErr := send(b[:split]); sendErr == nil || off != "0" {
+		t.Fatalf("partial: %s %v", off, sendErr)
 	}
 	if _, _, e = snapManifest(dest, string(sid)); !os.IsNotExist(e) {
 		t.Fatalf("early publication: %v", e)

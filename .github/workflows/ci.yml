@@ -4,6 +4,43 @@ on:
     branches: [main]
   pull_request:
 jobs:
+  static:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.3'
+      - name: Format and modules
+        run: |
+          unformatted=$(git ls-files -z '*.go' | xargs -0 gofmt -l)
+          if [ -n "$unformatted" ]; then
+            printf '%s\n' "$unformatted"
+            exit 1
+          fi
+          timeout 60 go mod tidy -diff
+      - name: Lint
+        run: |
+          timeout 180 go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.15.0 run ./...
+          timeout 120 go run honnef.co/go/tools/cmd/staticcheck@v0.8.2 -checks all ./...
+      - name: Field alignment
+        run: |
+          GOBIN="$RUNNER_TEMP" timeout 120 go install golang.org/x/tools/go/analysis/passes/fieldalignment/cmd/fieldalignment@v0.53.0
+          rc=0
+          result=$(timeout 60 "$RUNNER_TEMP/fieldalignment" ./... 2>&1) || rc=$?
+          printf '%s\n' "$result"
+          if [ "$rc" -eq 3 ]; then
+            # Both v1 snapshot structs retain field order because it determines snapshot IDs.
+            ! printf '%s\n' "$result" | grep -Ev '^.+/snap_model\.go:[0-9]+:[0-9]+: (Manifest|SnapshotRepo) has [0-9]+ leading bytes of pointer data but optimal value is [0-9]+$'
+          else
+            [ "$rc" -eq 0 ]
+          fi
+      - name: Vet 32-bit builds
+        run: |
+          GOOS=linux GOARCH=386 CGO_ENABLED=0 timeout 90 go vet ./...
+          GOOS=windows GOARCH=386 CGO_ENABLED=0 timeout 90 go build ./...
+          GOOS=linux GOARCH=arm CGO_ENABLED=0 timeout 90 go build ./...
   test:
     strategy:
       fail-fast: false

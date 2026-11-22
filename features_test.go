@@ -141,11 +141,11 @@ func TestLocalHandshake(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer f.Close()
+		defer func() { _ = f.Close() }()
 		*ptr = f
 	}
 	var err error
-	r.srv, err = openServer(r.c, dir)
+	r.srv, err = openServer(r.c, dir, dir)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -294,7 +294,7 @@ func TestB1ReleaseFallback(t *testing.T) {
 		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader("release"))}, nil
 	})}
 	key := strings.ReplaceAll(plat, "/", "-")
-	release := releaseSource{"fixture:/{platform}/{version}", map[string]string{key: strings.Repeat("0", 64)}}
+	release := releaseSource{URL: "fixture:/{platform}/{version}", SHA256: map[string]string{key: strings.Repeat("0", 64)}}
 	if _, e := cacheArtifact(ctx, version, plat, release); e == nil {
 		t.Fatal("bad digest accepted")
 	}

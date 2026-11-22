@@ -38,7 +38,7 @@ func cleanNodeJob(ctx context.Context, id string) error {
 	if e != nil {
 		return e
 	}
-	defer lock.Close()
+	defer closeBestEffort(lock)
 	work, e := jobDir(filepath.Join(root, ".work"), id)
 	if e != nil {
 		return e
@@ -126,7 +126,7 @@ func (r *runner) releaseClosedWorkspace() error {
 	if err != nil {
 		return err
 	}
-	defer lock.Close()
+	defer closeBestEffort(lock)
 	if _, err = os.Stat(filepath.Join(work, "input", "manifest.json")); os.IsNotExist(err) {
 		return nil // Explicit source, whose directory belongs to the caller.
 	} else if err != nil {
@@ -159,7 +159,7 @@ func cleanControllerJob(ctx context.Context, h endpoint, host, id string) error 
 	if e != nil {
 		return e
 	}
-	defer schedule.Close()
+	defer closeBestEffort(schedule)
 	owner, e := lockPath(filepath.Join(dir, "worker.lock"), os.O_CREATE)
 	if e != nil {
 		return e
@@ -167,7 +167,7 @@ func cleanControllerJob(ctx context.Context, h endpoint, host, id string) error 
 	if owner == nil {
 		return errors.New("job is still being submitted")
 	}
-	defer owner.Close()
+	defer closeBestEffort(owner)
 	var old legacyCleanup
 	var oldPath string
 	args := []string{"clean-job", id}
@@ -177,13 +177,13 @@ func cleanControllerJob(ctx context.Context, h endpoint, host, id string) error 
 			err = readJSON(path, &old)
 		}
 		if err == nil && old.Host == host && old.Work != "" {
-			l, err := lockUntil(ctx, strings.TrimSuffix(path, ".env")+".lock")
-			if err != nil {
-				return err
+			l, routeErr := lockUntil(ctx, strings.TrimSuffix(path, ".env")+".lock")
+			if routeErr != nil {
+				return routeErr
 			}
-			defer l.Close()
-			if err = readJSON(path, &old); err != nil {
-				return err
+			defer closeBestEffort(l)
+			if routeErr = readJSON(path, &old); routeErr != nil {
+				return routeErr
 			}
 			if old.Host != host || old.Project+"/"+old.Tag != id || old.Submit == "submitting" || !snapHex(old.Request, 64) {
 				return errors.New("legacy registration changed or is still submitting")
@@ -302,7 +302,7 @@ func cleanLegacyJob(ctx context.Context, id, work, token string) error {
 	if e != nil {
 		return e
 	}
-	defer lock.Close()
+	defer closeBestEffort(lock)
 	var old legacyCleanup
 	if e = readJSON(filepath.Join(work, "request.json"), &old); e != nil {
 		return e
@@ -328,8 +328,9 @@ func cleanLegacyJob(ctx context.Context, id, work, token string) error {
 		args := []string{}
 		session := "=" + old.Mux
 		if runtime.GOOS == "windows" {
-			exe = psmuxProgram()
-			args = []string{"-L", muxSocket()}
+			var socket string
+			exe, socket = psmuxSettings(root)
+			args = []string{"-L", socket}
 			session = old.Mux
 		} else if old.Socket != "" {
 			args = []string{"-S", old.Socket}
@@ -360,16 +361,16 @@ func cleanLegacyJob(ctx context.Context, id, work, token string) error {
 			target := filepath.Join(checkout, "work", "tree", r.Path)
 			if info, err := os.Lstat(filepath.Join(target, ".git")); err == nil && info.Mode().IsRegular() {
 				g := snapGit{ctx: ctx, dir: target}
-				common, err := g.get("rev-parse", "--path-format=absolute", "--git-common-dir")
-				if err != nil {
-					return err
+				common, gitErr := g.get("rev-parse", "--path-format=absolute", "--git-common-dir")
+				if gitErr != nil {
+					return gitErr
 				}
 				g.dir = common
-				if err = g.worktree("remove", "--force", target); err != nil {
-					return err
+				if gitErr = g.worktree("remove", "--force", target); gitErr != nil {
+					return gitErr
 				}
-				if err = g.worktree("prune", "--expire", "now"); err != nil {
-					return err
+				if gitErr = g.worktree("prune", "--expire", "now"); gitErr != nil {
+					return gitErr
 				}
 			} else if err != nil && !os.IsNotExist(err) {
 				return err

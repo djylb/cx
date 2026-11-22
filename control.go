@@ -83,20 +83,15 @@ func waitOutcome(dir string, before, now status) (id, outcome string, err error)
 	if err != nil {
 		return "", "", err
 	}
-	defer f.Close()
+	defer closeBestEffort(f)
 	after := before.LastCompleted == ""
 	lines := bufio.NewScanner(f)
 	for lines.Scan() {
-		line := lines.Text()
-		first, rest, _ := strings.Cut(line, "\t")
-		if _, e := strconv.ParseUint(first, 10, 64); e == nil {
-			line = rest
-		}
-		parts := strings.SplitN(line, "\t", 3)
-		if len(parts) != 3 || parts[1] != "turn/completed" {
+		kind, detail := progressRecord(lines.Text())
+		if kind != "turn/completed" {
 			continue
 		}
-		turn := strings.Fields(parts[2])
+		turn := strings.Fields(detail)
 		if len(turn) < 2 {
 			continue
 		}
@@ -118,6 +113,23 @@ func waitOutcome(dir string, before, now status) (id, outcome string, err error)
 	return "", "", errors.New("completion record missing for wait target")
 }
 
+// progressRecord accepts both byte-sequenced records and the older format
+// with a timestamp in the first column.
+func progressRecord(line string) (kind, detail string) {
+	first, rest, ok := strings.Cut(line, "\t")
+	if !ok {
+		return "", ""
+	}
+	if _, err := strconv.ParseUint(first, 10, 64); err == nil {
+		_, rest, _ = strings.Cut(rest, "\t")
+	}
+	kind, detail, ok = strings.Cut(rest, "\t")
+	if !ok {
+		return "", ""
+	}
+	return kind, strings.TrimRight(detail, "\r\n")
+}
+
 func observe(ctx context.Context, op, dir string) error {
 	if op == "wait" {
 		_, err := waitJob(ctx, dir)
@@ -131,7 +143,7 @@ func observe(ctx context.Context, op, dir string) error {
 	if err != nil {
 		return err
 	}
-	defer log.Close()
+	defer closeBestEffort(log)
 	for {
 		if err = projected(ctx, dir, &s); err != nil {
 			return err
@@ -178,9 +190,9 @@ func waitJob(ctx context.Context, dir string) (status, error) {
 		terminal := isTerminal(s.State)
 		question := s.State == "waiting_input"
 		if question && (!busy || advanced || s.InputKind != "next_turn") {
-			fresh, err := claimQuestion(dir, s)
-			if err != nil {
-				return s, err
+			fresh, claimErr := claimQuestion(dir, s)
+			if claimErr != nil {
+				return s, claimErr
 			}
 			if fresh {
 				fmt.Printf("job=%s status=waiting_input input_kind=%s\n", s.Job, s.InputKind)
@@ -263,8 +275,8 @@ func control(ctx context.Context, op, dir string, args []string) error {
 			if errors.Is(err, os.ErrNotExist) && errors.As(err, &pathErr) &&
 				pathErr.Path == filepath.Join(dir, "status.json") {
 				row := map[string]string{"job": filepath.Base(dir), "status": "not_registered"}
-				if err := json.NewEncoder(os.Stdout).Encode(row); err != nil {
-					return err
+				if encodeErr := json.NewEncoder(os.Stdout).Encode(row); encodeErr != nil {
+					return encodeErr
 				}
 				return errNotRegistered
 			}
@@ -272,12 +284,12 @@ func control(ctx context.Context, op, dir string, args []string) error {
 		}
 		return printStatus(dir)
 	case "wait", "tail":
-		ctx, cancel, err := monitorContext(ctx, 0)
+		waitCtx, cancel, err := monitorContext(ctx, 0)
 		if err != nil {
 			return err
 		}
 		defer cancel()
-		return observe(ctx, op, dir)
+		return observe(waitCtx, op, dir)
 	case "log":
 		return logFrom(dir, args)
 	case "close", "interrupt", "approve", "deny":
@@ -372,7 +384,7 @@ func writeLogFrom(out io.Writer, dir string, args []string) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer closeBestEffort(f)
 	if _, err = f.Seek(off, io.SeekStart); err != nil {
 		return err
 	}
@@ -420,7 +432,7 @@ func writeLogSince(out io.Writer, dir, raw string) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer closeBestEffort(f)
 	// seq is the one-based byte position of a record. A positive cursor
 	// points into the last excluded line, including for non-record cursors.
 	fi, err := f.Stat()

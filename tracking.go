@@ -12,20 +12,20 @@ import (
 )
 
 type process struct {
+	Command    string `json:"command_line"`
 	PID        int    `json:"pid"`
 	PPID       int    `json:"ppid"`
 	Start      uint64 `json:"start_time"` // platform-native process creation timestamp
-	Command    string `json:"command_line"`
 	InTree     bool   `json:"in_runner_tree"`
 	Unreadable bool   `json:"metadata_unreadable,omitempty"`
 	Marked     bool   `json:"run_marked"`
 	jobObject  bool
 }
 type inventory struct {
+	scanErr    error
+	Warning    string    `json:"warning,omitempty"`
 	Processes  []process `json:"processes"`
 	Unreadable int       `json:"unreadable"`
-	Warning    string    `json:"warning,omitempty"`
-	scanErr    error
 }
 
 func (c config) mark(cmd *exec.Cmd, dir string) {
@@ -92,7 +92,7 @@ func (r *runner) reclaim() error {
 		if err != nil {
 			return err
 		}
-		defer f.Close()
+		defer closeBestEffort(f)
 		r.log = f
 		defer func() { r.log = nil }()
 	}

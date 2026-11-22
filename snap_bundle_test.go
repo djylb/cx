@@ -45,16 +45,16 @@ func TestSnapIncrementalPrerequisite(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	rd := tar.NewReader(f)
 	declared := false
 	for {
-		h, e := rd.Next()
-		if e == io.EOF {
+		h, nextErr := rd.Next()
+		if nextErr == io.EOF {
 			break
 		}
-		if e != nil {
-			t.Fatal(e)
+		if nextErr != nil {
+			t.Fatal(nextErr)
 		}
 		if !strings.HasSuffix(h.Name, ".bundle") {
 			continue
@@ -64,9 +64,9 @@ func TestSnapIncrementalPrerequisite(t *testing.T) {
 		}
 		header := bufio.NewReader(rd)
 		for {
-			line, e := header.ReadString('\n')
-			if e != nil {
-				t.Fatal(e)
+			line, readErr := header.ReadString('\n')
+			if readErr != nil {
+				t.Fatal(readErr)
 			}
 			if line == "\n" {
 				break

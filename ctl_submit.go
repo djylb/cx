@@ -109,13 +109,13 @@ func ctlSubmit(ctx context.Context, hs endpoints, op string, o ctlOptions) error
 			return e
 		}
 		if o.previous != "" {
-			name, id, e := resolveJob(ctx, o.previous)
-			if e != nil {
-				return e
+			name, id, continueErr := resolveJob(ctx, o.previous)
+			if continueErr != nil {
+				return continueErr
 			}
-			h, e := hs.get(name)
-			if e != nil {
-				return e
+			h, continueErr := hs.get(name)
+			if continueErr != nil {
+				return continueErr
 			}
 			if o.queue != "" {
 				return errors.New("--queue-timeout applies to the original submission")
@@ -125,16 +125,16 @@ func ctlSubmit(ctx context.Context, hs endpoints, op string, o ctlOptions) error
 				shown = o.previous
 			}
 			fmt.Fprintln(os.Stderr, "JOB="+shown)
-			if e = forgetResult(name, id); e != nil {
-				return e
+			if continueErr = forgetResult(name, id); continueErr != nil {
+				return continueErr
 			}
 			argv := []string{"continue-job", name, id, prompt}
 			if o.profile != "" {
 				argv = append(argv, o.profile)
 			}
-			r, e := h.invoke(ctx, 185*time.Second, false, argv...)
-			if e != nil {
-				return e
+			r, continueErr := h.invoke(ctx, 185*time.Second, false, argv...)
+			if continueErr != nil {
+				return continueErr
 			}
 			if r.code != 0 {
 				return r.output()
@@ -279,9 +279,9 @@ func ctlSubmit(ctx context.Context, hs endpoints, op string, o ctlOptions) error
 		req.Options = append(req.Options, "--interactive")
 	}
 	if o.input != "" {
-		b, e := rawArg(o.input)
-		if e != nil {
-			return e
+		b, inputErr := rawArg(o.input)
+		if inputErr != nil {
+			return inputErr
 		}
 		warnInputCredentials(b)
 		req.Options = append(req.Options, "--input-json", string(b))
@@ -300,9 +300,9 @@ func ctlSubmit(ctx context.Context, hs endpoints, op string, o ctlOptions) error
 			}
 			h = hs[host]
 		}
-		r, e := h.call(ctx, 20*time.Second, "check-profile", o.profile)
-		if e != nil {
-			return e
+		r, profileErr := h.call(ctx, 20*time.Second, "check-profile", o.profile)
+		if profileErr != nil {
+			return profileErr
 		}
 		if r.code != 0 {
 			return r.output()
@@ -325,9 +325,9 @@ func ctlSubmit(ctx context.Context, hs endpoints, op string, o ctlOptions) error
 	if o.command {
 		req.ReuseKey = runReuseKey(req.Snapshot, src, req.Command)
 		if o.reuse {
-			found, e := lookupReuse(ctx, h, reuseQuery{ID: id, Host: host, Key: req.ReuseKey, Profile: o.profile})
-			if e != nil || found {
-				return e
+			found, reuseErr := lookupReuse(ctx, h, reuseQuery{ID: id, Host: host, Key: req.ReuseKey, Profile: o.profile})
+			if reuseErr != nil || found {
+				return reuseErr
 			}
 		}
 	}
@@ -375,9 +375,9 @@ func submitBatch(ctx context.Context, hs endpoints, o ctlOptions) error {
 		if _, e = jobDir("", parts[0]); e != nil {
 			return e
 		}
-		p, e := readInputText(parts[1])
-		if e != nil {
-			return e
+		p, readErr := readInputText(parts[1])
+		if readErr != nil {
+			return readErr
 		}
 		if seen[parts[0]] || strings.TrimSpace(p) == "" {
 			return errors.New("duplicate tag or empty prompt")

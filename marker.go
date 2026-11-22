@@ -14,8 +14,8 @@ import (
 )
 
 type markerOptions struct {
-	ID   string
 	Turn *string
+	ID   string
 }
 type controlMarker struct {
 	ID        string  `json:"cmd_id"`
@@ -66,14 +66,14 @@ func deliverClose(ctx context.Context, dir string, opt markerOptions, args []str
 			return false, err
 		}
 		if !pending {
-			claimed, err := fileExists(filepath.Join(dir, "inbox", ".claimed-close"))
-			if err != nil {
-				return false, err
+			claimed, claimedErr := fileExists(filepath.Join(dir, "inbox", ".claimed-close"))
+			if claimedErr != nil {
+				return false, claimedErr
 			}
 			if !claimed {
-				accepted, err := fileExists(filepath.Join(dir, "inbox", "done", markerReceipt(opt.ID)))
-				if err != nil || !accepted {
-					return false, err
+				accepted, receiptErr := fileExists(filepath.Join(dir, "inbox", "done", markerReceipt(opt.ID)))
+				if receiptErr != nil || !accepted {
+					return false, receiptErr
 				}
 			}
 		}
@@ -138,7 +138,7 @@ func publishMarker(dir, op string, opt markerOptions, args []string) error {
 	if err != nil {
 		return err
 	}
-	defer lock.Close()
+	defer closeBestEffort(lock)
 	for {
 		var previous controlMarker
 		err := readJSON(path, &previous)

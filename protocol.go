@@ -17,25 +17,25 @@ import (
 
 type fields = map[string]any
 type rpcError struct {
-	Code    int             `json:"code"`
 	Message string          `json:"message"`
 	Data    json.RawMessage `json:"data,omitempty"`
+	Code    int             `json:"code"`
 }
 
 func (e *rpcError) Error() string { return fmt.Sprintf("RPC %d: %s", e.Code, e.Message) }
 
 type message struct {
-	ID             json.RawMessage
-	Method         string
-	Params, Result json.RawMessage
 	Error          *rpcError
+	Method         string
+	ID             json.RawMessage
+	Params, Result json.RawMessage
 }
 
 var errServerClosed = errors.New("app-server transport closed")
 
 type frame struct {
-	raw []byte
 	err error
+	raw []byte
 }
 type server struct {
 	cmd             *exec.Cmd
@@ -52,14 +52,10 @@ type server struct {
 	next            int
 }
 
-func openServer(c config, dir string) (*server, error) {
+func openServer(c config, root, dir string) (*server, error) {
 	args := []string{"app-server", "--listen", "stdio://"}
 	if c.JobTools {
 		exe, e := os.Executable()
-		if e != nil {
-			return nil, e
-		}
-		root, e := stateRoot()
 		if e != nil {
 			return nil, e
 		}
@@ -81,7 +77,7 @@ func openServer(c config, dir string) (*server, error) {
 	keepLog := false
 	defer func() {
 		if !keepLog {
-			log.Close()
+			_ = log.Close()
 		}
 	}()
 	stderr, flush := c.secret.output(cmd, log)
@@ -92,14 +88,14 @@ func openServer(c config, dir string) (*server, error) {
 	}
 	out, err := cmd.StdoutPipe()
 	if err != nil {
-		in.Close()
+		_ = in.Close()
 		return nil, err
 	}
 	c.mark(cmd, dir)
 	tree, err := startCommand(cmd, c.RunID)
 	if err != nil {
-		in.Close()
-		out.Close()
+		_ = in.Close()
+		_ = out.Close()
 		return nil, err
 	}
 	s := &server{tree: tree, writes: make(chan writeRequest, 16), expired: make(map[string]bool), writeTimeout: 10 * time.Second, cmd: cmd, in: in, frames: make(chan frame, 32), stop: make(chan struct{})}
@@ -179,11 +175,11 @@ drain:
 	}
 	drainErr = errors.Join(drainErr, r.flushTurnFailure())
 	close(s.stop)
-	done := make(chan error, 1)
-	go func() { done <- s.wait() }()
+	done := make(chan processWait, 1)
+	go func() { done <- processWait{s.wait()} }()
 	select {
-	case err := <-done:
-		return errors.Join(drainErr, err)
+	case waited := <-done:
+		return errors.Join(drainErr, waited.err)
 	case <-time.After(3 * time.Second):
 	}
 	if closing {
@@ -202,8 +198,8 @@ drain:
 }
 
 type writeRequest struct {
-	data []byte
 	done chan error
+	data []byte
 }
 
 func (s *server) writer() {
@@ -230,7 +226,7 @@ func (s *server) send(v fields) error {
 	if err != nil {
 		return err
 	}
-	w := writeRequest{append(b, '\n'), make(chan error, 1)}
+	w := writeRequest{data: append(b, '\n'), done: make(chan error, 1)}
 	timer := time.NewTimer(s.writeTimeout)
 	defer timer.Stop()
 	select {
@@ -257,17 +253,20 @@ func (r *runner) read(f frame) (message, error) {
 		}
 		return m, fmt.Errorf("%w: %v", errServerClosed, f.err)
 	}
-	raw, err := r.c.secret.jsonStrings(f.raw)
-	if err != nil {
-		return m, err
-	}
-	if err := json.Unmarshal(raw, &m); err != nil {
+	if err := json.Unmarshal(f.raw, &m); err != nil {
 		return m, fmt.Errorf("invalid app-server JSON: %w", err)
 	}
 	if m.Method != "" {
 		var record map[string]json.RawMessage
-		if err := json.Unmarshal(raw, &record); err != nil {
+		if err := json.Unmarshal(f.raw, &record); err != nil {
 			return m, err
+		}
+		if r.c.secret != nil && len(m.Params) != 0 {
+			filtered, err := r.c.secret.jsonOutput(m.Params)
+			if err != nil {
+				return m, err
+			}
+			record["params"] = filtered
 		}
 		if err := r.appendEvent(r.events, record); err != nil {
 			return m, err
@@ -283,7 +282,7 @@ func (r *runner) read(f frame) (message, error) {
 		r.s.LastEvent = time.Now().UTC()
 		r.dirty = true
 		if len(m.ID) > 0 {
-			return m, r.request(m)
+			return m, r.request(m, record["params"])
 		}
 		return m, r.notify(m)
 	}
@@ -346,6 +345,12 @@ func (r *runner) call(method string, p any, result any) error {
 				return fmt.Errorf("%w: %s: unexpected response id %s", errRPCUncertain, method, m.ID)
 			}
 			if m.Error != nil {
+				data, filterErr := r.c.secret.jsonOutput(m.Error.Data)
+				if filterErr != nil {
+					return filterErr
+				}
+				m.Error.Data = data
+				m.Error.Message = r.c.secret.text(m.Error.Message)
 				return fmt.Errorf("%s: %w", method, m.Error)
 			}
 			if result != nil {
@@ -357,25 +362,26 @@ func (r *runner) call(method string, p any, result any) error {
 }
 
 type runner struct {
-	claude     *claudeSession
-	budget     *runtimeBudget
-	ctx        context.Context
-	c          config
-	s          status
-	root, dir  string
-	slot       *os.File
-	cacheLease *os.File
+	ctx         context.Context
+	claude      *claudeSession
+	budget      *runtimeBudget
+	slot        *os.File
+	cacheLease  *os.File
+	events, log *os.File
+	srv         *server
+	turnFailure *pendingTurnFailure
+	cmdOpen     map[string]time.Time // command items in progress
+	follow      *followAdmission
 
-	events, log                   *os.File
-	srv                           *server
-	dirty                         bool
-	lastText, failureReport       string
-	turnFailure                   *pendingTurnFailure
 	idleSince, turnSince, closing time.Time
 	lastAction                    time.Time
-	pending                       string               // a turn to start once the current one ended (stall recovery)
-	cmdOpen                       map[string]time.Time // command items in progress
-	follow                        *followAdmission
+	root, dir                     string
+	lastText, failureReport       string
+	pending                       string // a turn to start once the current one ended (stall recovery)
+
+	c     config
+	s     status
+	dirty bool
 }
 
 func (r *runner) save() error {
@@ -387,9 +393,9 @@ func (r *runner) save() error {
 		}
 	}
 	return writeJSON(filepath.Join(r.dir, "status.json"), struct {
-		status
 		Legacy []approval `json:"waiting_approval,omitempty"`
-	}{r.s, approvals})
+		status
+	}{Legacy: approvals, status: r.s})
 }
 func (r *runner) active() bool { return r.s.TurnStatus == "inProgress" }
 func (r *runner) deriveState() {
@@ -457,7 +463,7 @@ func (r *runner) serveAgent(session func() error) (err error) {
 	if err != nil {
 		return err
 	}
-	defer r.log.Close()
+	defer closeBestEffort(r.log)
 	defer func() {
 		if err != nil {
 			err = errors.Join(err, r.note("failed", err.Error()))
@@ -469,12 +475,12 @@ func (r *runner) serveAgent(session func() error) (err error) {
 	if err != nil {
 		return err
 	}
-	defer r.events.Close()
+	defer closeBestEffort(r.events)
 	return session()
 }
 
 func (r *runner) serveCodex() (err error) {
-	r.srv, err = openServer(r.c, r.dir)
+	r.srv, err = openServer(r.c, r.root, r.dir)
 	if err != nil {
 		return err
 	}

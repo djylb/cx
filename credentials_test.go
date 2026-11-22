@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io/fs"
 	"maps"
@@ -40,6 +41,106 @@ func TestCredentialFilterAcrossWrites(t *testing.T) {
 	}
 	if err := w.flush(len(w.pending)); err != nil || out.String() != "before [REDACTED] after [REDACTED]" {
 		t.Fatalf("got %q, %v", out.String(), err)
+	}
+}
+
+func TestCredentialFilterProtocolFields(t *testing.T) {
+	dir := t.TempDir()
+	filter, err := newSecretFilter(map[string]string{
+		"FIELD": "id", "METHOD": "item/commandExecution/requestApproval",
+		"TURN_METHOD": "turn/completed", "ITEM_TYPE": "agentMessage",
+		"TURN_ID": "turn-fixture", "REQUEST_ID": "request-fixture",
+		"STATE": "completed", "REPORT_STATE": "DONE", "FAILURE": "FAILED",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	log, err := os.Create(filepath.Join(dir, "progress.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { closeBestEffort(log) })
+	events, err := os.Create(filepath.Join(dir, "events.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { closeBestEffort(events) })
+	r := runner{
+		dir: dir, log: log, events: events, srv: &server{},
+		c: config{secret: filter, Approval: time.Second}, s: status{Thread: "thread-fixture"},
+	}
+	read := func(raw string) message {
+		t.Helper()
+		m, readErr := r.read(frame{raw: []byte(raw)})
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		return m
+	}
+	request := read(`{"id":"request-fixture","method":"item/commandExecution/requestApproval","params":{"reason":"reveal request-fixtur\u0065","permissions":{"id":"request-fixture"}}}`)
+	if len(r.s.Approvals) != 1 || string(r.s.Approvals[0].ID) != `"request-fixture"` ||
+		r.s.Approvals[0].Method != request.Method || r.s.Approvals[0].Reason != "reveal "+hiddenValue ||
+		string(r.s.Approvals[0].Permissions) != `{"id":"request-fixture"}` {
+		t.Fatalf("approval lost control metadata or redaction: %+v", r.s.Approvals)
+	}
+	if !strings.Contains(r.s.Approvals[0].Summary, `"reason":"reveal [REDACTED]"`) {
+		t.Fatalf("unfiltered approval summary: %s", r.s.Approvals[0].Summary)
+	}
+	read(`{"method":"serverRequest/resolved","params":{"requestId":"request-fixture"}}`)
+	if len(r.s.Approvals) != 0 {
+		t.Fatal("resolution did not match the original request ID")
+	}
+	read(`{"method":"turn/started","params":{"turn":{"id":"turn-fixture","status":"inProgress"}}}`)
+	read(`{"method":"item/completed","params":{"turnId":"turn-fixture","item":{"type":"commandExecution","id":"id","status":"completed","command":"echo request-fixture","exitCode":1}}}`)
+	read(`{"method":"item/completed","params":{"turnId":"turn-fixture","item":{"type":"fileChange","id":"id","status":"completed","changes":[{"path":"dir/request-fixture","kind":{"type":"add"}}]}}}`)
+	call := read(`{"method":"item/tool/call","params":{"arguments":{"opaque":["request-fixture"],"threadId":"turn-fixture","status":"completed"}}}`)
+	if !strings.Contains(string(call.Params), `"opaque":["request-fixture"]`) {
+		t.Fatal("tool arguments changed before dispatch")
+	}
+	read(`{"method":"turn/completed","params":{"turn":{"id":"turn-fixture","status":"completed","items":[{"type":"agentMessage","text":"STATUS: DONE\r\nagentMessage completed turn-fixture"}]}}}`)
+	response := read(`{"id":"request-fixture","result":{"id":"turn-fixture","status":"completed","text":"request-fixture"}}`)
+	if string(response.ID) != `"request-fixture"` || !strings.Contains(string(response.Result), `"text":"request-fixture"`) {
+		t.Fatal("the message used for dispatch was filtered")
+	}
+	if r.s.Turn != "turn-fixture" || r.s.LastCompleted != r.s.Turn || r.s.CompletedStatus != "completed" ||
+		r.s.FailedCommand == nil || r.s.FailedCommand.Command != "echo "+hiddenValue {
+		t.Fatalf("unexpected persisted state: %+v", r.s)
+	}
+	report, err := os.ReadFile(filepath.Join(dir, "last.md"))
+	if err != nil || string(report) != "STATUS: DONE\r\n[REDACTED] [REDACTED] [REDACTED]" {
+		t.Fatalf("unexpected report %q: %v", report, err)
+	}
+	progress, err := os.ReadFile(log.Name())
+	if err != nil || !bytes.Contains(progress, []byte("\tturn/completed\tturn-fixture completed\n")) ||
+		!bytes.Contains(progress, []byte("\tturn/started\tturn-fixture\n")) {
+		t.Fatalf("progress changed control data: %s (%v)", progress, err)
+	}
+	records, err := os.ReadFile(events.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		`"path":"dir/[REDACTED]"`,
+		`"arguments":{"opaque":["[REDACTED]"],"status":"completed","threadId":"turn-fixture"}`,
+	} {
+		if !bytes.Contains(records, []byte(want)) {
+			t.Fatalf("event capture missing %s", want)
+		}
+	}
+	lines := bytes.Split(bytes.TrimSpace(records), []byte("\n"))
+	var captured struct{ Params struct{ Turn turn } }
+	if err = json.Unmarshal(lines[len(lines)-1], &captured); err != nil {
+		t.Fatal(err)
+	}
+	got := captured.Params.Turn
+	if got.ID != "turn-fixture" || got.Status != "completed" || len(got.Items) != 1 ||
+		got.Items[0].Type != "agentMessage" || got.Items[0].Text != string(report) {
+		t.Fatalf("captured turn lost control data or output filtering: %+v", got)
+	}
+	read(`{"method":"turn/completed","params":{"turn":{"id":"second-turn","status":"failed","error":{"message":"FAILED request-fixture"}}}}`)
+	report, err = os.ReadFile(filepath.Join(dir, "last.md"))
+	if err != nil || !bytes.HasPrefix(report, []byte("STATUS: FAILED\n[REDACTED] [REDACTED]\n")) {
+		t.Fatalf("failed report changed control data or leaked output: %s (%v)", report, err)
 	}
 }
 
@@ -240,7 +341,7 @@ func TestCredentialProfilesClaudeCLI(t *testing.T) {
 	t.Setenv("CX_CONTEXT_DIR", t.TempDir())
 	root := os.Getenv("CXRUN_STATE")
 	value := "fixture-mock-auth-claude"
-	writeCredentialFixture(t, filepath.Join(root, "profile.env"), "AUTH_VALUE="+value+"\n", 0600)
+	writeCredentialFixture(t, filepath.Join(root, "profile.env"), "AUTH_VALUE="+value+"\nTYPE_COLLISION=result\nID_COLLISION=fixture-session\n", 0600)
 	writeCredentialFixture(t, filepath.Join(root, "host.json"), `{
 		"min_free_bytes":0,"profiles":{"claude-test":{"claude_config_dir":"claude-home","env_file":"profile.env"}}
 	}`, 0600)
@@ -262,7 +363,9 @@ printf '{"type":"result","session_id":"fixture-session","result":"%s"}\n' "$AUTH
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	h := &testRuns{t: t, ctx: ctx, root: root}
-	h.await("p/claude", func(s status) bool { return s.State == "done" && s.Profile == "claude-test" })
+	h.await("p/claude", func(s status) bool {
+		return s.State == "done" && s.Profile == "claude-test" && s.Thread == "fixture-session"
+	})
 	assertJobHasNoCredential(t, filepath.Join(root, "p", "claude"), value)
 	assertJobHasNoCredential(t, filepath.Join(root, ".work", "p", "claude"), value)
 }

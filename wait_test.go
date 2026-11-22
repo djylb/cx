@@ -158,9 +158,9 @@ func TestWaitAnyFollowup(t *testing.T) {
 	}
 	wait(124, "150ms")
 	for _, job := range []struct {
-		id   string
 		done <-chan error
-	}{{active, first}, {idle, other}} {
+		id   string
+	}{{id: active, done: first}, {id: idle, done: other}} {
 		if err := h.ctl("close", job.id); err != nil {
 			t.Fatal(err)
 		}

@@ -7,7 +7,7 @@ Run these steps with the user who will operate cx. Ask for missing deployment in
 - Determine the OS and CPU architecture of the controller and each intended execution host. Ask whether the controller itself should execute jobs. The built-in host `local` uses the controller account directly.
 - Check Git, the system `ssh` client, and access to an OpenSSH server with SFTP on each remote. Check the selected agent CLI under the execution account, including `codex login status` or `claude auth status --json`. A command-only host can skip model login.
 - Check tmux if you plan to host a Unix node in a tmux session. The normal Go Unix launch path detaches workers directly. On Windows, check psmux on PATH and its logged-in session for both command and agent jobs.
-- Check free disk space and writable state and cache directories. If building, check a working Go 1.23+ toolchain. Install missing dependencies with the platform's package manager after the user agrees. Ask the user to complete logins that require credentials or a browser.
+- Check free disk space and writable state and cache directories. If building, check a working Go 1.26+ toolchain. Install missing dependencies with the platform's package manager after the user agrees. Ask the user to complete logins that require credentials or a browser.
 
 ## 2. Obtain the controller binary
 

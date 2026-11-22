@@ -35,18 +35,18 @@ func startNodeJob(ctx context.Context, raw string) error {
 	if e != nil {
 		return e
 	}
-	defer lock.Close()
+	defer closeBestEffort(lock)
 	if e = os.MkdirAll(work, 0700); e != nil {
 		return e
 	}
 	receipt := filepath.Join(work, "request.json")
 	if _, e = os.Stat(filepath.Join(dir, "status.json")); e == nil {
-		b, e := os.ReadFile(receipt)
-		if e != nil || string(b) != raw {
+		b, receiptErr := os.ReadFile(receipt)
+		if receiptErr != nil || string(b) != raw {
 			return errors.New("job already registered with different input")
 		}
-		if e = writeJSON(filepath.Join(dir, "cx-work.json"), work); e != nil {
-			return e
+		if receiptErr = writeJSON(filepath.Join(dir, "cx-work.json"), work); receiptErr != nil {
+			return receiptErr
 		}
 		return printStatus(dir)
 	} else if !os.IsNotExist(e) {
@@ -57,13 +57,13 @@ func startNodeJob(ctx context.Context, raw string) error {
 	}
 	var prep PreparedSnapshot
 	if req.Source == "" {
-		m, e := loadSnapshot(req.Snapshot)
-		if e != nil {
-			return e
+		m, snapshotErr := loadSnapshot(req.Snapshot)
+		if snapshotErr != nil {
+			return snapshotErr
 		}
-		prep, e = Materialize(ctx, work, m, "")
-		if e != nil {
-			return e
+		prep, snapshotErr = Materialize(ctx, work, m, "")
+		if snapshotErr != nil {
+			return snapshotErr
 		}
 	} else {
 		prep.Source = req.Source
@@ -115,26 +115,26 @@ func startNodeJob(ctx context.Context, raw string) error {
 		argv = append(argv, "--cmd", "--")
 		argv = append(argv, req.Command...)
 	}
-	if e = launchRunner(ctx, dir, work, argv, env, false); e != nil {
+	if e = launchRunner(ctx, root, dir, work, argv, env, false); e != nil {
 		return e
 	}
 	return writeJSON(filepath.Join(dir, "cx-work.json"), work)
 }
 
 // The runner owns its lifetime. The caller waits only for registration.
-func launchRunner(ctx context.Context, dir, work string, argv []string, env map[string]string, resume bool) error {
+func launchRunner(ctx context.Context, root, dir, work string, argv []string, env map[string]string, resume bool) error {
 	exe, e := os.Executable()
 	if e != nil {
 		return e
 	}
 	if runtime.GOOS == "windows" {
-		return launchMuxRunner(ctx, exe, dir, work, argv, env, resume)
+		return launchMuxRunner(ctx, root, exe, dir, work, argv, env, resume)
 	}
 	log, e := os.OpenFile(filepath.Join(work, "launch.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
 	if e != nil {
 		return e
 	}
-	defer log.Close()
+	defer closeBestEffort(log)
 	cmd := exec.Command(exe, append([]string{"node"}, argv...)...)
 	detachWorker(cmd)
 	cmd.Stdout = log
@@ -279,21 +279,22 @@ func restartNode(ctx context.Context, a []string) error {
 		if err != nil {
 			return err
 		}
-		defer lock.Close()
+		defer closeBestEffort(lock)
 	}
 	lock, e := jobOperationLock(ctx, root, target)
 	if e != nil {
 		return e
 	}
-	defer lock.Close()
+	defer closeBestEffort(lock)
 	if e = readJSON(filepath.Join(dir, "status.json"), &s); e != nil {
 		return e
 	}
-	if op == "resume" {
+	switch op {
+	case "resume":
 		if e = checkResumeProfile(root, s.Profile, profile); e != nil {
 			return e
 		}
-	} else if op == "fork" {
+	case "fork":
 		selected := profile
 		if selected == "" {
 			selected = s.Profile
@@ -317,7 +318,7 @@ func restartNode(ctx context.Context, a []string) error {
 	} else if !os.IsNotExist(e) {
 		return e
 	}
-	if st, e := os.Stat(filepath.Join(work, "context")); e == nil && st.IsDir() {
+	if st, statErr := os.Stat(filepath.Join(work, "context")); statErr == nil && st.IsDir() {
 		env["CX_CONTEXT"] = filepath.Join(work, "context")
 	}
 	if op == "resume" && readyResult(s) {
@@ -354,7 +355,7 @@ func restartNode(ctx context.Context, a []string) error {
 	if profile != "" {
 		argv = append(argv, "--profile", profile)
 	}
-	return launchRunner(ctx, dir, work, argv, env, resume)
+	return launchRunner(ctx, root, dir, work, argv, env, resume)
 }
 
 func continueNode(ctx context.Context, host, id, text, profile string) error {

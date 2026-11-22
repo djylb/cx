@@ -26,7 +26,7 @@ func TestWaitAnyIgnoresQuietClose(t *testing.T) {
 	if err != nil || owner == nil {
 		t.Fatal(owner, err)
 	}
-	defer owner.Close()
+	defer func() { _ = owner.Close() }()
 	reg := func(s status) {
 		t.Helper()
 		if err := writeJSON(filepath.Join(dir, "status.json"), s); err != nil {

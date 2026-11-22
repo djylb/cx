@@ -7,28 +7,28 @@ import (
 )
 
 type rateLimitWindow struct {
-	UsedPercent int    `json:"used_percent"`
 	ResetAt     *int64 `json:"reset_at,omitempty"`
+	UsedPercent int    `json:"used_percent"`
 }
 
 type rateLimitStatus struct {
-	RateLimited bool             `json:"rate_limited"`
 	ResetAt     *int64           `json:"reset_at,omitempty"`
 	Primary     *rateLimitWindow `json:"primary,omitempty"`
 	Secondary   *rateLimitWindow `json:"secondary,omitempty"`
 	LimitID     string           `json:"limit_id,omitempty"`
+	RateLimited bool             `json:"rate_limited"`
 }
 
 // account/rateLimits/updated is a sparse snapshot. Null windows do not
 // invalidate recent readings, but windows from different meters cannot mix.
 type rateLimitSnapshot struct {
-	LimitID            string
 	Primary, Secondary *struct {
-		UsedPercent int
 		ResetsAt    *int64
+		UsedPercent int
 	}
-	RateLimitReachedType string
 	SpendControlReached  *bool
+	LimitID              string
+	RateLimitReachedType string
 }
 
 func (s *rateLimitStatus) update(snapshot rateLimitSnapshot, now int64) {
@@ -39,10 +39,10 @@ func (s *rateLimitStatus) update(snapshot rateLimitSnapshot, now int64) {
 		s.LimitID = snapshot.LimitID
 	}
 	if snapshot.Primary != nil {
-		s.Primary = &rateLimitWindow{snapshot.Primary.UsedPercent, snapshot.Primary.ResetsAt}
+		s.Primary = &rateLimitWindow{UsedPercent: snapshot.Primary.UsedPercent, ResetAt: snapshot.Primary.ResetsAt}
 	}
 	if snapshot.Secondary != nil {
-		s.Secondary = &rateLimitWindow{snapshot.Secondary.UsedPercent, snapshot.Secondary.ResetsAt}
+		s.Secondary = &rateLimitWindow{UsedPercent: snapshot.Secondary.UsedPercent, ResetAt: snapshot.Secondary.ResetsAt}
 	}
 	if snapshot.Primary == nil && snapshot.Secondary == nil && snapshot.RateLimitReachedType == "" && snapshot.SpendControlReached == nil {
 		return
@@ -101,5 +101,5 @@ func (r *runner) noteRateLimit(turnID, source string, retry bool, failure *turnE
 		return nil
 	}
 	r.s.RateLimited = true
-	return r.localEvent("turn/rate_limited", fmt.Sprintf("turn=%s source=%s retry=%t %s", turnID, source, retry, brief(failure.Message)))
+	return r.localEvent("turn/rate_limited", fmt.Sprintf("turn=%s source=%s retry=%t %s", turnID, source, retry, brief(r.c.secret.text(failure.Message))))
 }

@@ -52,7 +52,7 @@ func scanProcesses(run string, v *inventory) map[int]process {
 		for size := 1024; ; size *= 2 {
 			ids := make([]int32, size)
 			//lint:ignore SA1019 proc_listpids fallback for CGO-free binaries when kern.proc.all is denied; x/sys exposes no libSystem wrapper.
-			n, _, errno := unix.Syscall6(unix.SYS_PROC_INFO, 1, 4, uintptr(os.Getuid()), 0, uintptr(unsafe.Pointer(&ids[0])), uintptr(size*4))
+			n, _, errno := unix.Syscall6(unix.SYS_PROC_INFO, 1, 4, uintptr(os.Getuid()), 0, uintptr(unsafe.Pointer(&ids[0])), uintptr(size*4)) //nolint:staticcheck // The CGO-free UID scan fallback has no x/sys libSystem wrapper.
 			if errno != 0 {
 				v.scanErr = errno
 				v.Warning += "; UID scan failed: " + errno.Error()

@@ -113,7 +113,7 @@ func (o options) dispatch(ctx context.Context, dir, op string, args []string) (b
 	if op == "events" || op == "diff" || op == "plan" {
 		return true, o.events(dir, op)
 	}
-	if !(op == "say" || op == "reply" || op == "requests" || op == "rpc" || op == "settings" || op == "mcp" || aliases[op] != "") {
+	if op != "say" && op != "reply" && op != "requests" && op != "rpc" && op != "settings" && op != "mcp" && aliases[op] == "" {
 		return false, nil
 	}
 	var s status
@@ -292,15 +292,15 @@ func (o options) publish(ctx context.Context, dir string, s status, e envelope) 
 		return err
 	}
 	err = func() error {
-		defer lock.Close()
+		defer closeBestEffort(lock)
 		for _, sub := range []string{"", "pending", "done", "uncertain"} {
 			var old envelope
-			err := readJSON(filepath.Join(dir, "inbox", sub, id+".rpc"), &old)
-			if os.IsNotExist(err) {
+			readErr := readJSON(filepath.Join(dir, "inbox", sub, id+".rpc"), &old)
+			if os.IsNotExist(readErr) {
 				continue
 			}
-			if err != nil {
-				return err
+			if readErr != nil {
+				return readErr
 			}
 			a, _ := json.Marshal(old)
 			b, _ := json.Marshal(e)
@@ -358,7 +358,7 @@ func (o options) events(dir, op string) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer closeBestEffort(f)
 	br := bufio.NewReader(f)
 	var last json.RawMessage
 	for {
@@ -371,11 +371,11 @@ func (o options) events(dir, op string) error {
 		}
 		var v struct {
 			Method string
-			Seq    uint64
 			Params struct {
 				ThreadID, TurnID string
 				Turn             struct{ ID string }
 			}
+			Seq uint64
 		}
 		if err = json.Unmarshal(line, &v); err != nil {
 			return err

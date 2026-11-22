@@ -40,12 +40,12 @@ func freezeCompilerSource(ctx context.Context) (SnapshotID, Manifest, error) {
 	if e != nil {
 		return "", empty, e
 	}
-	defer lock.Close()
+	defer closeBestEffort(lock)
 	tmp, e := os.MkdirTemp(dir, ".export-")
 	if e != nil {
 		return "", empty, e
 	}
-	defer os.RemoveAll(tmp)
+	defer removeTreeBestEffort(tmp)
 	files := map[string]bool{"go.mod": true, "go.sum": true}
 	e = filepath.WalkDir(module, func(path string, d fs.DirEntry, e error) error {
 		if e != nil {
@@ -130,24 +130,24 @@ func freezeCompilerSource(ctx context.Context) (SnapshotID, Manifest, error) {
 	fingerprint := sha256.New()
 	for _, n := range names {
 		src := filepath.Join(module, n)
-		st, e := os.Lstat(src)
-		if e != nil {
-			return "", empty, e
+		st, copyErr := os.Lstat(src)
+		if copyErr != nil {
+			return "", empty, copyErr
 		}
 		if !st.Mode().IsRegular() {
 			return "", empty, fmt.Errorf("invalid compiler input %s", n)
 		}
 		dst := filepath.Join(tmp, n)
-		if e = os.MkdirAll(filepath.Dir(dst), 0700); e != nil {
-			return "", empty, e
+		if copyErr = os.MkdirAll(filepath.Dir(dst), 0700); copyErr != nil {
+			return "", empty, copyErr
 		}
-		data, e := os.ReadFile(src)
-		if e != nil {
-			return "", empty, e
+		data, copyErr := os.ReadFile(src)
+		if copyErr != nil {
+			return "", empty, copyErr
 		}
-		fmt.Fprintf(fingerprint, "%s\x00%x\n", filepath.ToSlash(n), sha256.Sum256(data))
-		if e = os.WriteFile(dst, data, 0600); e != nil {
-			return "", empty, e
+		_, _ = fmt.Fprintf(fingerprint, "%s\x00%x\n", filepath.ToSlash(n), sha256.Sum256(data))
+		if copyErr = os.WriteFile(dst, data, 0600); copyErr != nil {
+			return "", empty, copyErr
 		}
 	}
 	key := fmt.Sprintf("%x", fingerprint.Sum(nil))
@@ -157,7 +157,7 @@ func freezeCompilerSource(ctx context.Context) (SnapshotID, Manifest, error) {
 		ID  SnapshotID
 	}
 	if readJSON(receipt, &previous) == nil && previous.Key == key {
-		if m, e := loadSnapshot(previous.ID); e == nil {
+		if m, loadErr := loadSnapshot(previous.ID); loadErr == nil {
 			return previous.ID, m, nil
 		}
 	}
@@ -188,8 +188,8 @@ func compileSnapshot(ctx context.Context, sid, plat string) (binary string, err 
 	if e != nil {
 		return "", e
 	}
-	defer l.Close()
-	if st, e := os.Stat(path); e == nil && st.Mode().IsRegular() {
+	defer closeBestEffort(l)
+	if st, statErr := os.Stat(path); statErr == nil && st.Mode().IsRegular() {
 		return path, nil
 	}
 	m, e := loadSnapshot(SnapshotID(sid))
@@ -200,7 +200,7 @@ func compileSnapshot(ctx context.Context, sid, plat string) (binary string, err 
 	if e != nil {
 		return "", e
 	}
-	defer os.RemoveAll(tmp)
+	defer removeTreeBestEffort(tmp)
 	prep, e := Materialize(ctx, tmp, m, "")
 	if e != nil {
 		return "", e

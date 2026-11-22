@@ -15,18 +15,18 @@ import (
 const agentAsk = "agent_ask"
 
 type agentMail struct {
-	Seq        uint64     `json:"seq"`
-	Type       string     `json:"type"`
+	Deadline   *time.Time `json:"deadline,omitempty"`
 	Time       time.Time  `json:"time"`
+	Type       string     `json:"type"`
 	To         string     `json:"to"`
 	Text       string     `json:"text,omitempty"`
 	Question   string     `json:"question,omitempty"`
-	Options    []string   `json:"options,omitempty"`
-	Blocking   bool       `json:"blocking,omitempty"`
 	Request    string     `json:"request_id,omitempty"`
-	Deadline   *time.Time `json:"deadline,omitempty"`
-	Generation uint64     `json:"generation"`
 	RunID      string     `json:"run_id"`
+	Options    []string   `json:"options,omitempty"`
+	Seq        uint64     `json:"seq"`
+	Generation uint64     `json:"generation"`
+	Blocking   bool       `json:"blocking,omitempty"`
 }
 
 func mailPath(dir string, seq uint64) string {
@@ -50,7 +50,7 @@ func appendMail(ctx context.Context, dir string, m *agentMail) error {
 	if err != nil {
 		return err
 	}
-	defer lock.Close()
+	defer closeBestEffort(lock)
 	// The runner's cursor is a lower bound; unpublished gaps cannot exist under the append lock.
 	m.Seq = s.OutboxSeq + 1
 	for {

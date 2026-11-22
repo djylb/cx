@@ -38,7 +38,7 @@ func TestWaitAnyConsumers(t *testing.T) {
 	if err != nil || owner == nil {
 		t.Fatal(owner, err)
 	}
-	defer owner.Close()
+	defer func() { _ = owner.Close() }()
 	registerJob(status{Project: "p", Job: "other", Session: "other", State: "done"}, "other")
 	registerJob(status{Project: "q", Job: "work", Session: "s", State: "stalled"}, "stalled")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

@@ -20,7 +20,7 @@ One Go binary serves as both the controller (`cx`) and the execution node (`cx n
 | Controller | A `cx` binary for your OS and architecture, Git for Git snapshots and patch workflows, and an OpenSSH client for remote jobs. |
 | Remote host | Linux, macOS, or Windows with OpenSSH Server and an account usable from non-interactive SSH. Git is needed for Git checkouts. |
 | Execution host for agent jobs | A signed-in Codex CLI with `app-server` support or a Claude Code CLI compatible with the selected mode. Windows command and agent jobs use psmux in a logged-in session. The current Go launcher detaches workers directly on macOS and Linux. The Unix node can also be hosted under tmux for manual operation. |
-| Building from source | Go 1.23 or later. See the [installation guide](docs/agent-install.md) for cross-platform deployment and the optional rsync upgrade path. |
+| Building from source | Go 1.26 or later. See the [installation guide](docs/agent-install.md) for cross-platform deployment and the optional rsync upgrade path. |
 
 ## Installation prompt
 

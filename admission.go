@@ -23,7 +23,7 @@ func lockFile(path string, flags int, lock func(*os.File) (bool, error)) (*os.Fi
 	}
 	locked, err := lock(f)
 	if !locked {
-		f.Close()
+		_ = f.Close()
 		return nil, err
 	}
 	return f, nil
@@ -75,8 +75,8 @@ func (r *runner) newTicket() (*queueTicket, error) {
 func (t *queueTicket) release() {
 	if t.file != nil {
 		path := t.file.Name()
-		t.file.Close()
-		os.Remove(path)
+		_ = t.file.Close()
+		_ = os.Remove(path)
 		t.file = nil
 	}
 }
@@ -103,7 +103,7 @@ func (t *queueTicket) first() (bool, error) {
 		if f == nil {
 			return false, nil
 		}
-		f.Close()
+		_ = f.Close()
 		if err = os.Remove(path); err != nil && !os.IsNotExist(err) {
 			return false, err
 		}
@@ -129,9 +129,9 @@ func loadOK(ctx context.Context, command string) bool {
 // but is suspended each time a follow-up turn needs a new FIFO ticket.
 type runtimeBudget struct {
 	parent    context.Context
-	remaining time.Duration
-	deadline  time.Time
 	cancel    context.CancelFunc
+	deadline  time.Time
+	remaining time.Duration
 }
 
 func (r *runner) startRuntime() func() {
@@ -163,7 +163,7 @@ var errQueuedClose = errors.New("closed while queued")
 
 func (r *runner) releaseSlot() {
 	if r.slot != nil {
-		r.slot.Close()
+		_ = r.slot.Close()
 		r.slot = nil
 	}
 }
@@ -230,7 +230,7 @@ func (r *runner) reserve(ctx context.Context, t *queueTicket, controls bool, rep
 			return err
 		}
 		t, err = r.newTicket()
-		guard.Close()
+		_ = guard.Close()
 		if err != nil {
 			return err
 		}
@@ -284,7 +284,7 @@ func (r *runner) reserve(ctx context.Context, t *queueTicket, controls bool, rep
 					}
 				}
 			}
-			guard.Close()
+			_ = guard.Close()
 			if err != nil {
 				return err
 			}
@@ -294,7 +294,7 @@ func (r *runner) reserve(ctx context.Context, t *queueTicket, controls bool, rep
 					err = report(reason)
 				}
 				if reason != "" || err != nil {
-					slot.Close()
+					_ = slot.Close()
 					if err != nil {
 						return err
 					}

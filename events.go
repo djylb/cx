@@ -20,54 +20,65 @@ type item struct {
 	}
 }
 type turn struct {
+	Error      *turnError
 	ID, Status string
 	Items      []item
-	Error      *turnError
 }
 type event struct {
+	Error                               *turnError
+	WillRetry, Retry                    *bool
 	ThreadID, TurnID, Diff, Explanation string
-	Turn                                turn
 	Item                                item
+	RateLimits                          rateLimitSnapshot
 	Plan                                []struct{ Step, Status string }
 	TokenUsage, RequestID               json.RawMessage
-	Error                               *turnError
-	RateLimits                          rateLimitSnapshot
-	WillRetry, Retry                    *bool
+	Turn                                turn
 }
 
 type turnError struct {
 	Message           string
+	AdditionalDetails string
 	Code              json.RawMessage
 	CodexErrorInfo    json.RawMessage
-	AdditionalDetails string
 }
 
 const failedReportHeading = "STATUS: FAILED"
 
-func failureReport(e *turnError) string {
+func reportStatus(firstLine string) string {
+	state, ok := strings.CutPrefix(strings.TrimSuffix(firstLine, "\r"), "STATUS: ")
+	if ok {
+		switch state {
+		case "DONE", "PARTIAL", "BLOCKED", "QUESTION", "FAILED":
+			return state
+		}
+	}
+	return ""
+}
+
+func (r *runner) describeFailure(e *turnError) string {
 	report := failedReportHeading + "\n"
 	if e != nil {
-		report += e.Message + "\n"
+		report += r.c.secret.text(e.Message) + "\n"
 		if e.AdditionalDetails != "" {
-			report += e.AdditionalDetails + "\n"
+			report += r.c.secret.text(e.AdditionalDetails) + "\n"
 		}
 	}
 	report += "retry=false\n"
 	if e != nil {
 		if len(e.Code) != 0 && string(e.Code) != "null" {
-			report += "code=" + string(e.Code) + "\n"
+			report += "code=" + r.c.secret.text(string(e.Code)) + "\n"
 		}
 		if len(e.CodexErrorInfo) != 0 && string(e.CodexErrorInfo) != "null" {
-			report += "codexErrorInfo=" + string(e.CodexErrorInfo) + "\n"
+			report += "codexErrorInfo=" + r.c.secret.text(string(e.CodexErrorInfo)) + "\n"
 		}
 	}
 	return report
 }
 
 type pendingTurnFailure struct {
-	id       string
-	failure  *turnError
 	deadline time.Time
+	failure  *turnError
+	id       string
 }
 
 func (r *runner) flushTurnFailure() error {
@@ -90,9 +101,9 @@ type failedCommand struct {
 }
 
 type turnSummary struct {
+	FailedCommand *failedCommand `json:"failed_command"`
 	PlanStep      string         `json:"plan_step"`
 	ChangedFiles  int            `json:"changed_files"`
-	FailedCommand *failedCommand `json:"failed_command"`
 }
 
 func brief(s string) string {
@@ -104,11 +115,17 @@ func brief(s string) string {
 	return s
 }
 func (r *runner) note(kind, s string) error {
+	return r.writeProgress(kind, r.c.secret.text(s))
+}
+
+// Some progress records are read back to locate a turn. Their identity and
+// status columns must agree with the status file and the unmodified protocol.
+func (r *runner) writeProgress(kind, s string) error {
 	fi, err := r.log.Stat()
 	if err != nil {
 		return err
 	}
-	_, err = fmt.Fprintf(r.log, "%d\t%s\t%s\t%s\n", fi.Size()+1, time.Now().UTC().Format(time.RFC3339Nano), kind, brief(r.c.secret.text(s)))
+	_, err = fmt.Fprintf(r.log, "%d\t%s\t%s\t%s\n", fi.Size()+1, time.Now().UTC().Format(time.RFC3339Nano), kind, brief(s))
 	return err
 }
 func (r *runner) begin(id string) error {
@@ -175,18 +192,18 @@ func (r *runner) finish(t turn) error {
 			r.lastText = i.Text
 		}
 	}
-	report := r.lastText
+	report := r.c.secret.reportText(r.lastText)
 	if t.Status == "failed" {
 		r.s.Approvals = nil
 		if !alreadyFailed {
-			r.failureReport = failureReport(t.Error)
+			r.failureReport = r.describeFailure(t.Error)
 		}
-		report = r.failureReport
-		if r.lastText != "" {
-			report += "\n" + r.lastText
+		if report != "" {
+			report = "\n" + report
 		}
+		report = r.failureReport + report
 	}
-	if err := atomicWrite(filepath.Join(r.dir, "last.md"), []byte(r.c.secret.text(report))); err != nil {
+	if err := atomicWrite(filepath.Join(r.dir, "last.md"), []byte(report)); err != nil {
 		return err
 	}
 	r.s.Turn = t.ID
@@ -198,17 +215,17 @@ func (r *runner) finish(t turn) error {
 	r.s.CompletedStatus = t.Status
 	r.s.InputKind = ""
 	line, _, _ := strings.Cut(r.lastText, "\n")
-	if r.c.Interactive && t.Status == "completed" && strings.TrimSuffix(line, "\r") == "STATUS: QUESTION" {
+	if r.c.Interactive && t.Status == "completed" && reportStatus(line) == "QUESTION" {
 		r.s.InputKind = "next_turn"
 	}
 	r.deriveState()
 	r.idleSince = time.Now()
 	info := t.ID + " " + t.Status
 	if t.Error != nil {
-		info += " " + t.Error.Message
+		info += " " + r.c.secret.text(t.Error.Message)
 	}
 	if !alreadyFailed {
-		if err := r.note("turn/completed", info); err != nil {
+		if err := r.writeProgress("turn/completed", info); err != nil {
 			return err
 		}
 	}
@@ -218,7 +235,7 @@ func (r *runner) notify(m message) error {
 	if m.Method == "item/agentMessage/delta" || m.Method == "item/commandExecution/outputDelta" {
 		r.s.StallCount = 0
 	}
-	// Deltas remain available verbatim in events.jsonl. Completed items carry full text.
+	// Deltas remain in events.jsonl. Completed items carry full text.
 	switch m.Method {
 	case "turn/started", "turn/completed", "turn/plan/updated", "turn/diff/updated", "item/started", "item/completed", "thread/tokenUsage/updated", "account/rateLimits/updated", "error", "serverRequest/resolved":
 	default:
@@ -241,7 +258,7 @@ func (r *runner) notify(m message) error {
 		if e.Turn.ID != "" && e.Turn.ID == r.s.LastCompleted {
 			return nil
 		}
-		if err := r.note(m.Method, e.Turn.ID); err != nil {
+		if err := r.writeProgress(m.Method, e.Turn.ID); err != nil {
 			return err
 		}
 		if e.Turn.Error != nil || e.Turn.Status == "failed" {
@@ -253,7 +270,7 @@ func (r *runner) notify(m message) error {
 	case "thread/tokenUsage/updated":
 		r.s.Usage = e.TokenUsage
 	case "account/rateLimits/updated":
-		r.s.rateLimitStatus.update(e.RateLimits, time.Now().Unix())
+		r.s.update(e.RateLimits, time.Now().Unix())
 	case "error":
 		if e.Error != nil {
 			retry := e.Retry != nil && *e.Retry
@@ -267,25 +284,26 @@ func (r *runner) notify(m message) error {
 			if err := r.noteRateLimit(id, m.Method, retry, e.Error); err != nil {
 				return err
 			}
-			if err := r.note(m.Method, fmt.Sprintf("retry=%t %s", retry, e.Error.Message)); err != nil {
+			if err := r.writeProgress(m.Method, fmt.Sprintf("retry=%t %s", retry, r.c.secret.text(e.Error.Message))); err != nil {
 				return err
 			}
 			if !retry && id != "" && r.turnFailure == nil && id != r.s.LastCompleted {
 				// Allow the completion frame to provide final items before
 				// making the result visible. Some servers send only error.
-				r.turnFailure = &pendingTurnFailure{id, e.Error, time.Now().Add(250 * time.Millisecond)}
+				r.turnFailure = &pendingTurnFailure{id: id, failure: e.Error, deadline: time.Now().Add(250 * time.Millisecond)}
 			}
 		}
 	case "turn/plan/updated":
-		parts := []string{e.Explanation}
+		parts := []string{r.c.secret.text(e.Explanation)}
 		r.s.PlanStep = ""
 		for _, p := range e.Plan {
+			step := r.c.secret.text(p.Step)
 			if p.Status == "inProgress" && r.s.PlanStep == "" {
-				r.s.PlanStep = brief(p.Step)
+				r.s.PlanStep = brief(step)
 			}
-			parts = append(parts, p.Status+" "+p.Step)
+			parts = append(parts, p.Status+" "+step)
 		}
-		return r.note(m.Method, strings.Join(parts, " | "))
+		return r.writeProgress(m.Method, strings.Join(parts, " | "))
 	case "turn/diff/updated":
 		var files []string
 		var oldFile string
@@ -317,6 +335,7 @@ func (r *runner) notify(m message) error {
 		i := e.Item
 		switch i.Type {
 		case "commandExecution":
+			command := r.c.secret.text(i.Command)
 			if r.cmdOpen == nil {
 				r.cmdOpen = map[string]time.Time{}
 			}
@@ -325,17 +344,17 @@ func (r *runner) notify(m message) error {
 			} else {
 				delete(r.cmdOpen, i.ID)
 				if i.ExitCode != nil && *i.ExitCode != 0 {
-					r.s.FailedCommand = &failedCommand{brief(i.Command), int64(*i.ExitCode)}
+					r.s.FailedCommand = &failedCommand{brief(command), int64(*i.ExitCode)}
 				}
 			}
-			info := i.Status + " " + i.Command
+			info := i.Status + " " + command
 			if i.ExitCode != nil {
 				info = fmt.Sprintf("exit=%d %s", *i.ExitCode, info)
 			}
-			return r.note(m.Method+" commandExecution", info)
+			return r.writeProgress(m.Method+" commandExecution", info)
 		case "fileChange":
 			for _, f := range i.Changes {
-				if err := r.note(m.Method+" fileChange", i.Status+" "+f.Kind.Type+" "+f.Path); err != nil {
+				if err := r.writeProgress(m.Method+" fileChange", i.Status+" "+f.Kind.Type+" "+r.c.secret.text(f.Path)); err != nil {
 					return err
 				}
 			}
@@ -417,7 +436,7 @@ func (r *runner) connectThread() error {
 	if err := r.save(); err != nil {
 		return err
 	}
-	if err := r.note(method, th.ID); err != nil {
+	if err := r.writeProgress(method, th.ID); err != nil {
 		return err
 	}
 	if (previous != "" || method == "thread/fork") && th.HistoryMode == "paginated" {
@@ -503,7 +522,7 @@ func (r *runner) sendInput(input any, id string, steer bool) error {
 		if err := r.call("turn/steer", p, nil); err != nil {
 			return err
 		}
-		return r.note("turn/steer", id+" → "+r.s.Turn)
+		return r.writeProgress("turn/steer", id+" → "+r.s.Turn)
 	}
 	if err := r.acquireSlot(); err != nil {
 		return err
@@ -527,7 +546,7 @@ func (r *runner) sendInput(input any, id string, steer bool) error {
 		}
 		return err
 	}
-	if err := r.note("turn/start", id+" → "+result.Turn.ID); err != nil {
+	if err := r.writeProgress("turn/start", id+" → "+result.Turn.ID); err != nil {
 		return err
 	}
 	if r.s.LastCompleted == result.Turn.ID {
@@ -560,7 +579,7 @@ func (r *runner) localEvent(method, detail string) error {
 		if err != nil {
 			return err
 		}
-		defer events.Close()
+		defer closeBestEffort(events)
 	}
 	name, _ := json.Marshal(method)
 	params, _ := json.Marshal(fields{"detail": detail})
@@ -568,13 +587,13 @@ func (r *runner) localEvent(method, detail string) error {
 		return err
 	}
 	if r.log != nil {
-		return r.note(method, detail)
+		return r.writeProgress(method, detail)
 	}
 	f, err := os.OpenFile(filepath.Join(r.dir, "progress.log"), os.O_APPEND|os.O_WRONLY, 0600)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer closeBestEffort(f)
 	temp := runner{log: f}
-	return temp.note(method, detail)
+	return temp.writeProgress(method, detail)
 }

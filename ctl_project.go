@@ -118,8 +118,8 @@ func ctlProject(ctx context.Context, a []string) error {
 		return e
 	}
 	path := filepath.Join(dir, name+".toml")
-	if _, e := jobPath("", host); e != nil {
-		return e
+	if _, validateErr := jobPath("", host); validateErr != nil {
+		return validateErr
 	}
 	type repository struct {
 		Path       string `toml:"path"`
@@ -165,7 +165,7 @@ func ctlProject(ctx context.Context, a []string) error {
 	if e != nil {
 		return e
 	}
-	defer lock.Close()
+	defer closeBestEffort(lock)
 	if _, e = os.Lstat(path); e == nil {
 		return fmt.Errorf("project already exists: %s", name)
 	} else if !os.IsNotExist(e) {

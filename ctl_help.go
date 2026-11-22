@@ -40,7 +40,7 @@ var ctlCommands = map[string]ctlCommand{
 	"hosts":        {"[HOST]", "Print current execution host facts.", ""},
 	"interrupt":    {"JOB", "Stop an active turn or command.", ""},
 	"limits":       {"JOB", "Read Codex account rate limits.", ""},
-	"ls":           {"[HOST:PROJECT/JOB]", "List jobs.", "json watch project session all max-bytes"},
+	"ls":           {"[JOB]", "List jobs.", "json watch interval project session role all all-hosts max-bytes"},
 	"mcp":          {"JOB list|reload|login|resource|call", "Call a Codex MCP operation.", ""},
 	"mirror":       {"[DIR | --project PROJECT]", "Publish a source baseline.", "project"},
 	"models":       {"JOB", "List available Codex models.", ""},
@@ -56,7 +56,7 @@ var ctlCommands = map[string]ctlCommand{
 	"rebase":       {"JOB TEXT", "Submit a follow-up to resolve patch conflicts.", ""},
 	"reply":        {"JOB [--request ID] (--result JSON|@FILE | --error JSON|@FILE)", "Reply to a Codex request.", ""},
 	"requests":     {"JOB", "List pending Codex requests.", ""},
-	"result":       {"JOB", "Collect and display a sealed turn's report.", "turn full wait refresh max-bytes"},
+	"result":       {"JOB", "Collect a sealed turn's report, JSON metadata, or full log.", "turn full json log wait refresh max-bytes"},
 	"resume":       {"JOB [--profile NAME]", "Restart a recoverable Codex job.", ""},
 	"review":       {"JOB --target JSON|@FILE", "Start a Codex review.", ""},
 	"rpc":          {"JOB METHOD", "Invoke a Codex RPC method.", ""},
@@ -67,7 +67,7 @@ var ctlCommands = map[string]ctlCommand{
 	"show":         {"JOB", "Show a job or turn summary.", "full json turn max-bytes"},
 	"snapshot":     {"DIR", "Freeze and publish a source snapshot.", "with-history"},
 	"status":       {"JOB", "Print the current job status.", "json"},
-	"tail":         {"JOB", "Follow job progress or raw output.", "raw cursor since timeout"},
+	"tail":         {"JOB", "Follow job progress or raw output.", "raw cursor since from-start timeout"},
 	"test":         {"[TEST-ARGS ...]", "Run the executable configured by CX_TEST_COMMAND.", ""},
 	"threads":      {"JOB [loaded]", "List Codex threads.", ""},
 	"undo":         {"JOB --before TURN", "Revert a Codex thread to before a turn.", ""},
@@ -95,21 +95,21 @@ func ctlUsage(op string, err error) error {
 
 func printCtlHelp(w io.Writer, op string) {
 	if op == "" {
-		fmt.Fprintln(w, "Usage: cx COMMAND [ARGS ...]\n\nCommands:")
+		_, _ = fmt.Fprintln(w, "Usage: cx COMMAND [ARGS ...]\n\nCommands:")
 		printCtlCommands(w, "")
-		fmt.Fprintln(w, "\nUse cx COMMAND --help for details.\nExit codes: 0 help, 2 invalid command or arguments.")
+		_, _ = fmt.Fprintln(w, "\nUse cx COMMAND --help for details.\nExit codes: 0 help, 2 invalid command or arguments.")
 		return
 	}
 
 	cmd := ctlCommands[op]
-	fmt.Fprintf(w, "Usage: cx %s", strings.ReplaceAll(op, "-", " "))
+	_, _ = fmt.Fprintf(w, "Usage: cx %s", strings.ReplaceAll(op, "-", " "))
 	if cmd.usage != "" {
-		fmt.Fprint(w, " ", cmd.usage)
+		_, _ = fmt.Fprint(w, " ", cmd.usage)
 	}
 	if cmd.flags != "" && !strings.Contains(cmd.usage, "[options]") {
-		fmt.Fprint(w, " [options]")
+		_, _ = fmt.Fprint(w, " [options]")
 	}
-	fmt.Fprintf(w, "\n\n%s\n\nOptions:\n  -h, --help\n    \tShow this help and exit.\n", cmd.summary)
+	_, _ = fmt.Fprintf(w, "\n\n%s\n\nOptions:\n  -h, --help\n    \tShow this help and exit.\n", cmd.summary)
 
 	var o ctlOptions
 	f := ctlFlags(op, &o)
@@ -124,24 +124,24 @@ func printCtlHelp(w io.Writer, op string) {
 
 	switch op {
 	case "chat", "project":
-		fmt.Fprintln(w, "\nActions:")
+		_, _ = fmt.Fprintln(w, "\nActions:")
 		printCtlCommands(w, op+"-")
 	case "project-init":
-		fmt.Fprintln(w, "  --repo DIR [DIR ...]\n    \tGit checkouts in the project (required).\n  --default-host HOST\n    \tExecution host (CX_DEFAULT_HOST, otherwise local).")
+		_, _ = fmt.Fprintln(w, "  --repo DIR [DIR ...]\n    \tGit checkouts in the project (required).\n  --default-host HOST\n    \tExecution host (CX_DEFAULT_HOST, otherwise local).")
 	case "node":
-		fmt.Fprintln(w, "\nCOMMAND and ARGS use the cxrun execution-node interface and wire protocol.")
+		_, _ = fmt.Fprintln(w, "\nCOMMAND and ARGS use the cxrun execution-node interface and wire protocol.")
 	case "test", "gate":
-		fmt.Fprintln(w, "\nArguments are forwarded to the executable. LAN_SOURCE_MODE defaults to snapshot.")
+		_, _ = fmt.Fprintln(w, "\nArguments are forwarded to the executable. LAN_SOURCE_MODE defaults to snapshot.")
 	}
 	if strings.Contains(cmd.usage, "JOB") {
-		fmt.Fprintln(w, "\nJOB accepts [HOST:]PROJECT/TAG or TAG in the current project.")
+		_, _ = fmt.Fprintln(w, "\nJOB accepts [HOST:]PROJECT/TAG or TAG in the current project.")
 	}
 	if cmd.flags != "" || isThinControl(op) || op == "fork" {
-		fmt.Fprintln(w, "Unspecified flags are off or unset unless a default is given.")
+		_, _ = fmt.Fprintln(w, "Unspecified flags are off or unset unless a default is given.")
 	}
-	fmt.Fprintln(w, "\nExit codes:")
-	fmt.Fprintln(w, "  0 success or help")
-	fmt.Fprintln(w, "  2 invalid arguments or controller error")
+	_, _ = fmt.Fprintln(w, "\nExit codes:")
+	_, _ = fmt.Fprintln(w, "  0 success or help")
+	_, _ = fmt.Fprintln(w, "  2 invalid arguments or controller error")
 	switch op {
 	case "wait", "tail", "exec":
 		for _, state := range []string{"failed", "stalled", "timeout", "orphaned"} {
@@ -149,46 +149,48 @@ func printCtlHelp(w io.Writer, op string) {
 			if state == "timeout" {
 				name = "job timeout or queue timeout"
 			}
-			fmt.Fprintf(w, "  %d %s\n", terminalCodes[state], name)
+			_, _ = fmt.Fprintf(w, "  %d %s\n", terminalCodes[state], name)
 		}
-		fmt.Fprintln(w, "  6 waiting for input\n  8 submission failed\n  9 transport failure\n  11 job registration not found\n  124 observation timeout\n  130 observation canceled")
-		fmt.Fprintln(w, "  Command jobs can return the command's exit code.")
+		_, _ = fmt.Fprintln(w, "  6 waiting for input\n  8 submission failed\n  9 transport failure\n  11 job registration not found\n  124 observation timeout\n  130 observation canceled")
+		_, _ = fmt.Fprintln(w, "  Command jobs can return the command's exit code.")
 	case "agent":
-		fmt.Fprintln(w, "  1 failed turn\n  6 waiting for input\n  7 duplicate job\n  9 transport failure\n  44 result unavailable\n  124 observation timeout")
+		_, _ = fmt.Fprintln(w, "  1 failed turn\n  6 waiting for input\n  7 duplicate job\n  9 transport failure\n  44 result unavailable\n  124 observation timeout")
 	case "run":
-		fmt.Fprintln(w, "  7 duplicate job\n  9 transport failure")
+		_, _ = fmt.Fprintln(w, "  7 duplicate job\n  9 transport failure")
 	case "result", "patch", "apply", "rebase":
-		fmt.Fprintln(w, "  1 failed turn or operation\n  9 transport failure\n  44 result unavailable")
+		_, _ = fmt.Fprintln(w, "  1 failed turn or operation\n  9 transport failure\n  44 result unavailable")
 		if op == "result" {
-			fmt.Fprintln(w, "  12 background download in progress")
+			_, _ = fmt.Fprintln(w, "  12 background download in progress")
 		}
 		if op == "apply" {
-			fmt.Fprintln(w, "  10 changes applied but Git status failed")
+			_, _ = fmt.Fprintln(w, "  10 changes applied but Git status failed")
 		}
 	case "chat-wait":
-		fmt.Fprintln(w, "  124 observation timeout")
+		_, _ = fmt.Fprintln(w, "  124 observation timeout")
 	case "test", "gate":
-		fmt.Fprintln(w, "  The executable's exit code is propagated.")
+		_, _ = fmt.Fprintln(w, "  The executable's exit code is propagated.")
 	case "node":
-		fmt.Fprintln(w, "  Node commands return their own status codes, including 1 for node errors. Use cx node states for job terminal codes.")
+		_, _ = fmt.Fprintln(w, "  Node commands return their own status codes, including 1 for node errors. Use cx node states for job terminal codes.")
 	case "version", "project", "project-ls", "project-init", "project-show", "chat":
 	default:
-		fmt.Fprintln(w, "  Execution-node exit codes are propagated when applicable.")
+		_, _ = fmt.Fprintln(w, "  Execution-node exit codes are propagated when applicable.")
 	}
 }
 
 var ctlFlagDescriptions = map[string]string{
-	"all": "include every session", "any": "select multiple jobs",
+	"all": "include every session", "all-hosts": "include all configured hosts (default)", "any": "select multiple jobs",
 	"batch": "read tagged prompt paths from `FILE`", "chat": "watch `CHANNEL` (repeatable)",
 	"clean-base": "require a clean Git baseline", "cmd": "run command arguments after --",
 	"continue": "continue an existing `JOB`", "cwd": "remote working `DIR` (node default when unset)",
 	"dir": "source `DIR` (defaults to the current directory)", "effort": "reasoning `LEVEL` (engine default, or high with --hard)",
 	"engine": "agent `ENGINE`: codex (default) or claude", "env": "set `NAME=VALUE` (repeatable)",
-	"force": "bypass duplicate detection", "full": "show full output", "hard": "use high reasoning effort",
-	"host":  "limit to `HOST` (repeatable, defaults to all configured hosts)",
+	"force": "bypass duplicate detection", "from-start": "follow from the beginning, resetting any saved cursor",
+	"full": "show full output", "hard": "use high reasoning effort",
+	"host":  "limit to one or more `HOST` values (repeatable, defaults to all configured hosts)",
 	"image": "attach image `FILE`", "inplace": "run in the original directory on local",
 	"input-json": "use structured input from `JSON|@FILE`", "interactive": "recognize input questions",
-	"json": "emit JSON", "mention": "wait for a mention of `NAME`",
+	"interval": "seconds between watch polls (defaults to 1)",
+	"json":     "emit JSON", "mention": "wait for a mention of `NAME`",
 	"model": "agent `MODEL` (engine default)", "network": "enable sandbox network access (enabled by default with workspace-write)",
 	"no-network": "disable sandbox network access", "no-tools": "omit Codex job-scoped messaging tools",
 	"parent":  "parent `JOB` or session (defaults to CX_PARENT, then current session)",
@@ -205,6 +207,12 @@ var ctlFlagDescriptions = map[string]string{
 
 func ctlFlagHelp(op, key string) string {
 	switch key {
+	case "log":
+		return "stream the complete command log or the selected agent turn's progress log"
+	case "role":
+		if op == "ls" {
+			return "filter jobs by `ROLE`"
+		}
 	case "idle-exit":
 		return fmt.Sprintf("idle lifetime `DURATION` (defaults to %s)", defaultIdle)
 	case "turn-timeout":
@@ -229,7 +237,7 @@ func ctlFlagHelp(op, key string) string {
 		return "persist progress under cursor `NAME` (unset by default)"
 	case "since":
 		if op == "tail" {
-			return "start after sequence `N` (otherwise resume the cursor or use the current end)"
+			return "start after sequence `N` (otherwise resume the cursor or start at the beginning)"
 		}
 		return "exclusive sequence `N` (defaults to 0 when no cursor applies)"
 	case "shell":
@@ -247,6 +255,6 @@ func printCtlCommands(w io.Writer, prefix string) {
 	}
 	slices.Sort(names)
 	for _, name := range names {
-		fmt.Fprintf(w, "  %-12s %s\n", strings.TrimPrefix(name, prefix), ctlCommands[name].summary)
+		_, _ = fmt.Fprintf(w, "  %-12s %s\n", strings.TrimPrefix(name, prefix), ctlCommands[name].summary)
 	}
 }

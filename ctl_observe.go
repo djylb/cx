@@ -15,9 +15,79 @@ import (
 )
 
 type hostReply struct {
+	e    error
 	name string
 	r    reply
-	e    error
+}
+
+func listingJobID(row fields) string {
+	return strings.TrimLeft(fmt.Sprint(row["project"], "/", row["job"]), "/")
+}
+
+func mergeSubmissionRows(ctx context.Context, host, filter string, o ctlOptions, rows []fields) ([]fields, error) {
+	root, err := submissionRoot(host)
+	if err != nil {
+		return nil, err
+	}
+	projects, err := os.ReadDir(root)
+	if os.IsNotExist(err) {
+		return rows, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	registered := make(map[string]bool, len(rows))
+	for _, row := range rows {
+		registered[listingJobID(row)] = true
+	}
+	for _, project := range projects {
+		p := project.Name()
+		if !project.IsDir() || o.project != "" && p != o.project {
+			continue
+		}
+		jobs, readErr := os.ReadDir(filepath.Join(root, p))
+		if os.IsNotExist(readErr) {
+			continue
+		}
+		if readErr != nil {
+			return nil, readErr
+		}
+		for _, job := range jobs {
+			if err = ctx.Err(); err != nil {
+				return nil, err
+			}
+			id := p + "/" + job.Name()
+			if !job.IsDir() || registered[id] || filter != "" && id != filter {
+				continue
+			}
+			dir, pathErr := jobDir(root, id)
+			if pathErr != nil {
+				continue
+			}
+			s, progressErr := readSubmissionProgress(dir)
+			if os.IsNotExist(progressErr) {
+				continue
+			}
+			if progressErr != nil {
+				return nil, progressErr
+			}
+			if s.Host != host || s.Project != p || s.Job != job.Name() ||
+				o.session != "" && s.Session != o.session ||
+				s.State != "submitting" && s.State != "submit_failed" {
+				continue
+			}
+			data, marshalErr := json.Marshal(s)
+			if marshalErr != nil {
+				return nil, marshalErr
+			}
+			var row fields
+			if decodeErr := decodeRows(data, &row); decodeErr != nil {
+				return nil, decodeErr
+			}
+			rows = append(rows, row)
+		}
+	}
+	return rows, nil
 }
 
 func displayHosts(ctx context.Context, hs endpoints, op string, o ctlOptions) error {
@@ -26,12 +96,13 @@ func displayHosts(ctx context.Context, hs endpoints, op string, o ctlOptions) er
 	if op == "doctor" && len(o.pos) > 0 {
 		names = o.pos
 	} else if op == "ls" && len(o.pos) == 1 {
-		host, id, ok := strings.Cut(o.pos[0], ":")
-		if !ok {
-			return errors.New("expected HOST:project/job")
+		host, id, err := resolveJob(ctx, o.pos[0])
+		if err != nil {
+			return err
 		}
 		names = []string{host}
 		filter = id
+		o.project, _, _ = strings.Cut(id, "/")
 	} else if len(o.pos) > 0 {
 		return errors.New("unexpected arguments")
 	}
@@ -56,7 +127,7 @@ func displayHosts(ctx context.Context, hs endpoints, op string, o ctlOptions) er
 				if op == "doctor" && h.SSH != "" && h.Platform == "" {
 					plat, err := detectPlatform(ctx, h)
 					if err != nil {
-						ch <- hostReply{name, reply{}, err}
+						ch <- hostReply{name: name, e: err}
 						return
 					}
 					h.setPlatform(plat)
@@ -81,7 +152,7 @@ func displayHosts(ctx context.Context, hs endpoints, op string, o ctlOptions) er
 						r.code = 0
 					}
 				}
-				ch <- hostReply{name, r, e}
+				ch <- hostReply{name: name, r: r, e: e}
 			}()
 		}
 		results := map[string]hostReply{}
@@ -96,13 +167,14 @@ func displayHosts(ctx context.Context, hs endpoints, op string, o ctlOptions) er
 		current := map[string]string{}
 		for _, name := range names {
 			v := results[name]
-			if v.e != nil || v.r.code != 0 {
+			nodeFailed := v.e != nil || v.r.code != 0
+			if nodeFailed {
 				failed = true
 				reports[name] = fields{"error": fmt.Sprintf("node error %v (code %d)", v.e, v.r.code), "jobs": []fields{}}
-				if op == "ls" {
-					fmt.Fprintln(os.Stderr, name, reports[name]["error"])
+				if op != "ls" {
+					continue
 				}
-				continue
+				fmt.Fprintln(os.Stderr, name, reports[name]["error"])
 			}
 			if op != "ls" {
 				var obj fields
@@ -132,16 +204,25 @@ func displayHosts(ctx context.Context, hs endpoints, op string, o ctlOptions) er
 				continue
 			}
 			var rows []fields
-			if e := decodeRows(v.r.data, &rows); e != nil {
+			if !nodeFailed {
+				if e := decodeRows(v.r.data, &rows); e != nil {
+					return e
+				}
+			}
+			rows, e := mergeSubmissionRows(ctx, name, filter, o, rows)
+			if e != nil {
 				return e
 			}
 			for _, row := range rows {
-				id := strings.TrimLeft(fmt.Sprint(row["project"], "/", row["job"]), "/")
+				id := listingJobID(row)
 				if filter != "" && id != filter {
 					continue
 				}
 				key := name + ":" + id
 				role := row["role"]
+				if o.role != "" && role != o.role {
+					continue
+				}
 				delete(row, "role")
 				priv := row["privileged"]
 				delete(row, "privileged")
@@ -229,8 +310,18 @@ func displayHosts(ctx context.Context, hs endpoints, op string, o ctlOptions) er
 					b, _ := json.MarshalIndent(obj, "", "  ")
 					fmt.Fprintf(&output, "%s %s\n", name, b)
 					if rows, ok := jobs.([]fields); ok {
-						for _, r := range rows {
-							fmt.Fprintf(&output, "%s%s/%s %s %s %v", strings.Repeat("  ", 1+r["depth"].(int)), r["project"], r["job"], r["role"], r["status"], r["plan_step"])
+						var previousSession string
+						for i, r := range rows {
+							session, _ := r["session"].(string)
+							if i == 0 || session != previousSession {
+								if session == "" {
+									fmt.Fprintln(&output, "  No session")
+								} else {
+									fmt.Fprintf(&output, "  %q\n", session)
+								}
+								previousSession = session
+							}
+							fmt.Fprintf(&output, "%s%s/%s %s %s %v", strings.Repeat("  ", 2+r["depth"].(int)), r["project"], r["job"], r["role"], r["status"], r["plan_step"])
 							if profile, ok := r["profile"].(string); ok {
 								fmt.Fprintf(&output, " profile=%s", profile)
 							}
@@ -250,7 +341,7 @@ func displayHosts(ctx context.Context, hs endpoints, op string, o ctlOptions) er
 			return nil
 		}
 		prev = current
-		if e := pause(ctx, time.Second); e != nil {
+		if e := pause(ctx, o.interval); e != nil {
 			return e
 		}
 	}
@@ -337,7 +428,7 @@ func ctlWaitAny(ctx context.Context, hs endpoints, o ctlOptions) error {
 	if e != nil {
 		return e
 	}
-	defer lock.Close()
+	defer closeBestEffort(lock)
 	names := o.hosts
 	if len(names) == 0 {
 		names = hs.names()
@@ -357,7 +448,7 @@ func ctlWaitAny(ctx context.Context, hs endpoints, o ctlOptions) error {
 			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) || errors.Is(err, ctlExit(124)) {
 				r, err = reply{code: 124}, nil
 			}
-			ch <- hostReply{name, r, err}
+			ch <- hostReply{name: name, r: r, e: err}
 		}()
 	}
 	chatFiles := map[string]string{}
@@ -370,54 +461,54 @@ func ctlWaitAny(ctx context.Context, hs endpoints, o ctlOptions) error {
 			}
 		}
 		key := strings.TrimPrefix(channel, "#")
-		if _, e := jobDir("", p+"/"+key); e != nil {
-			return e
+		if _, validateErr := jobDir("", p+"/"+key); validateErr != nil {
+			return validateErr
 		}
-		path := filepath.Join(filepath.Dir(path), "chat", p, key+".json")
-		if e = os.MkdirAll(filepath.Dir(path), 0700); e != nil {
+		cursorPath := filepath.Join(filepath.Dir(path), "chat", p, key+".json")
+		if e = os.MkdirAll(filepath.Dir(cursorPath), 0700); e != nil {
 			return e
 		}
 		var since int64
-		if e = readJSON(path, &since); e != nil && !os.IsNotExist(e) {
+		if e = readJSON(cursorPath, &since); e != nil && !os.IsNotExist(e) {
 			return e
 		}
-		h, root, e := channelCenter(hs)
-		if e != nil {
-			return e
+		h, root, centerErr := channelCenter(hs)
+		if centerErr != nil {
+			return centerErr
 		}
 		label := "#" + key
-		chatFiles[label] = path
+		chatFiles[label] = cursorPath
 		start(label, func() (reply, error) {
 			q := channelQuery{Project: p, Channel: key, Root: root, Since: since, Wait: limit}
-			rows, e := channelCall(ctx, h, q)
-			if e != nil {
-				return reply{}, e
+			rows, channelErr := channelCall(ctx, h, q)
+			if channelErr != nil {
+				return reply{}, channelErr
 			}
 			if len(rows) == 0 {
 				return reply{}, errors.New("missing channel event")
 			}
 			row := struct {
-				channelRow
 				Channel string `json:"channel"`
 				Project string `json:"project"`
-				Code    int    `json:"code"`
-			}{rows[0], channel, p, 0}
-			b, e := json.Marshal(fields{"row": row, "cursor": rows[0].Seq})
-			return reply{data: b}, e
+				channelRow
+				Code int `json:"code"`
+			}{channelRow: rows[0], Channel: channel, Project: p}
+			b, channelErr := json.Marshal(fields{"row": row, "cursor": rows[0].Seq})
+			return reply{data: b}, channelErr
 		})
 	}
 
 	for _, name := range names {
-		h, e := hs.get(name)
-		if e != nil {
-			return e
+		h, hostErr := hs.get(name)
+		if hostErr != nil {
+			return hostErr
 		}
 		file := filepath.Join(filepath.Dir(path), name+".json")
-		b, e := os.ReadFile(file)
-		if os.IsNotExist(e) {
+		b, hostErr := os.ReadFile(file)
+		if os.IsNotExist(hostErr) {
 			b = []byte("{}")
-		} else if e != nil {
-			return e
+		} else if hostErr != nil {
+			return hostErr
 		}
 		start(name, func() (reply, error) {
 			for ctx.Err() == nil {
@@ -426,9 +517,9 @@ func ctlWaitAny(ctx context.Context, hs endpoints, o ctlOptions) error {
 				if d <= 0 {
 					break
 				}
-				r, e := h.call(ctx, d+2*time.Second, "wait-poll", o.project, o.session, string(b), d.String())
-				if e != nil || r.code != 124 {
-					return r, e
+				r, pollErr := h.call(ctx, d+2*time.Second, "wait-poll", o.project, o.session, string(b), d.String())
+				if pollErr != nil || r.code != 124 {
+					return r, pollErr
 				}
 			}
 			return reply{code: 124}, nil

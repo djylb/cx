@@ -130,12 +130,12 @@ func snapWindowsModes(g snapGit, baseline string) error {
 			continue
 		}
 		n := entries[i+1]
-		st, e := os.Lstat(filepath.Join(g.dir, n))
-		if os.IsNotExist(e) {
+		st, statErr := os.Lstat(filepath.Join(g.dir, n))
+		if os.IsNotExist(statErr) {
 			continue
 		}
-		if e != nil {
-			return e
+		if statErr != nil {
+			return statErr
 		}
 		if st.Mode().IsRegular() {
 			modes[meta[1]] = append(modes[meta[1]], n)

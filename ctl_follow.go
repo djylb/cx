@@ -22,9 +22,9 @@ type tailPosition struct {
 	Raw  bool   `json:"raw"`
 }
 type tailFrame struct {
+	Terminal *status      `json:"terminal,omitempty"`
 	Data     []byte       `json:"data,omitempty"`
 	Position tailPosition `json:"position"`
-	Terminal *status      `json:"terminal,omitempty"`
 }
 
 // Frame complete records with their successor cursor. A partial SSH frame
@@ -137,8 +137,8 @@ func follow(ctx context.Context, h endpoint, name, id string, o ctlOptions) erro
 		if e != nil {
 			return e
 		}
-		defer lock.Close()
-		if o.since == "" {
+		defer closeBestEffort(lock)
+		if o.since == "" && !o.fromStart {
 			if e = readJSON(path, &pos); e != nil && !os.IsNotExist(e) {
 				return e
 			}
@@ -179,7 +179,7 @@ func follow(ctx context.Context, h endpoint, name, id string, o ctlOptions) erro
 			pos = frame.Position
 			terminal = frame.Terminal
 		}
-		rd.Close()
+		_ = rd.Close()
 		stop()
 		processErr := <-done
 		if terminal != nil && errors.Is(e, io.EOF) {

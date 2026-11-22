@@ -120,8 +120,8 @@ func TestB3CenterBuildAndTaskResume(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	if st, e := os.Stat(binary); e != nil || st.Size() == 0 {
-		t.Fatal(e)
+	if st, statErr := os.Stat(binary); statErr != nil || st.Size() == 0 {
+		t.Fatal(statErr)
 	}
 	first, e := os.Stat(binary)
 	if e != nil {
@@ -141,14 +141,22 @@ func TestB3CenterBuildAndTaskResume(t *testing.T) {
 	}
 	var compressed bytes.Buffer
 	z := gzip.NewWriter(&compressed)
-	z.Write(raw[:15])
-	z.Close()
+	if _, err := z.Write(raw[:15]); err != nil {
+		t.Fatal(err)
+	}
+	if err := z.Close(); err != nil {
+		t.Fatal(err)
+	}
 	args := []string{"node", "task-receive", req.ID, snapSum(raw), strconv.Itoa(len(raw)), "2s"}
 	cliOutput(t, 1, compressed.Bytes(), f.cx, args...)
 	compressed.Reset()
 	z.Reset(&compressed)
-	z.Write(raw[15:])
-	z.Close()
+	if _, err := z.Write(raw[15:]); err != nil {
+		t.Fatal(err)
+	}
+	if err := z.Close(); err != nil {
+		t.Fatal(err)
+	}
 	out := cliOutput(t, 0, compressed.Bytes(), f.cx, args...)
 	if !bytes.HasPrefix(out, []byte("15\n")) {
 		t.Fatal(string(out))
@@ -388,7 +396,9 @@ func TestB3SubmissionShow(t *testing.T) {
 		}
 	}
 	show("submitting")
-	lock.Close()
+	if err := lock.Close(); err != nil {
+		t.Fatal(err)
+	}
 	show("submit_failed")
 }
 
@@ -494,7 +504,7 @@ func TestB3ResumeResultStream(t *testing.T) {
 	defer cancel()
 	dest := filepath.Join(f.home, "received")
 	h := endpoint{SSH: "fixture", CX: f.cx, State: os.Getenv("CXRUN_STATE"), Platform: runtime.GOOS + "/" + runtime.GOARCH}
-	if err = fetchTurn(ctx, h, "p/download", s.RunID, "1", dest); !errors.Is(err, ctlExit(9)) {
+	if err = fetchTurn(ctx, h, "p/download", s.RunID, "1", dest, true); !errors.Is(err, ctlExit(9)) {
 		t.Fatal(err)
 	}
 	fi, err := os.Stat(dest + ".part")
@@ -504,11 +514,14 @@ func TestB3ResumeResultStream(t *testing.T) {
 	if err = os.WriteFile(ssh, []byte(shim+"exec sh -c \"$1\"\n"), 0700); err != nil {
 		t.Fatal(err)
 	}
-	if err = fetchTurn(ctx, h, "p/download", s.RunID, "1", dest); err != nil {
+	if err = fetchTurn(ctx, h, "p/download", s.RunID, "1", dest, true); err != nil {
 		t.Fatal(err)
 	}
 	if report, err := os.ReadFile(filepath.Join(dest, "last.md")); err != nil || !bytes.Contains(report, []byte("finished")) {
 		t.Fatal(string(report), err)
+	}
+	if log, err := os.ReadFile(filepath.Join(dest, "output.log")); err != nil || string(log) != "finished\n" {
+		t.Fatal(string(log), err)
 	}
 }
 
@@ -642,12 +655,12 @@ func TestB3SessionScope(t *testing.T) {
 	t.Setenv("CLAUDE_CODE_HOST_SESSION_ID", "two")
 	cliOutput(t, 0, nil, f.cx, "exec", "local", "--tag", "two", "--wait", "--", "true")
 	for _, tc := range []struct {
-		args []string
 		want map[string]string
+		args []string
 	}{
-		{nil, map[string]string{"two": "two"}},
-		{[]string{"--all"}, map[string]string{"one": "one", "two": "two"}},
-		{[]string{"--session", "one"}, map[string]string{"one": "one"}},
+		{want: map[string]string{"two": "two"}},
+		{args: []string{"--all"}, want: map[string]string{"one": "one", "two": "two"}},
+		{args: []string{"--session", "one"}, want: map[string]string{"one": "one"}},
 	} {
 		args := append([]string{"ls", "--json"}, tc.args...)
 		goOut := cliOutput(t, 0, nil, f.cx, args...)

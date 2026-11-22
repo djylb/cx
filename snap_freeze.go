@@ -8,7 +8,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"hash"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -103,9 +102,9 @@ func snapStage(source, stage snapGit, head string, isGit bool, tmp string) (stri
 			}
 		}
 		if head != "" {
-			b, e := source.input(nil, "ls-tree", "-rz", head)
-			if e != nil {
-				return "", e
+			b, treeErr := source.input(nil, "ls-tree", "-rz", head)
+			if treeErr != nil {
+				return "", treeErr
 			}
 			for _, v := range snapList(string(b)) {
 				meta, n, _ := strings.Cut(v, "\t")
@@ -116,13 +115,13 @@ func snapStage(source, stage snapGit, head string, isGit bool, tmp string) (stri
 			}
 		}
 		for i, args := range [][]string{{"ls-files", "-o", "--exclude-standard", "-z"}, {"ls-files", "-o", "-z", "--", "internal/web/dist"}, {"ls-files", "-oi", "--exclude-standard", "--directory", "-z"}} {
-			b, e := source.input(nil, args...)
-			if e != nil {
-				return "", e
+			b, listErr := source.input(nil, args...)
+			if listErr != nil {
+				return "", listErr
 			}
 			for _, n := range snapList(string(b)) {
-				if e = snapName(n); e != nil {
-					return "", e
+				if listErr = snapName(n); listErr != nil {
+					return "", listErr
 				}
 				if i < 2 {
 					if _, ok := modes[n]; !ok {
@@ -195,9 +194,9 @@ func snapStage(source, stage snapGit, head string, isGit bool, tmp string) (stri
 		var raw []byte
 		switch {
 		case st.Mode()&os.ModeSymlink != 0:
-			t, e := os.Readlink(p)
-			if e != nil {
-				return "", e
+			t, linkErr := os.Readlink(p)
+			if linkErr != nil {
+				return "", linkErr
 			}
 			if !snapLinkInside(source.dir, parent, t) {
 				return "", fmt.Errorf("nonportable symlink: %s", n)
@@ -218,8 +217,8 @@ func snapStage(source, stage snapGit, head string, isGit bool, tmp string) (stri
 			return "", fmt.Errorf("unsupported file: %s", n)
 		}
 		if !tracked[n] {
-			if e := snapName(n); e != nil {
-				return "", e
+			if nameErr := snapName(n); nameErr != nil {
+				return "", nameErr
 			}
 			if snapSecret.Match(raw) || strings.EqualFold(path.Base(n), ".npmrc") && snapAuth.Match(raw) || bytes.HasPrefix(raw, []byte("version https://git-lfs.github.com/spec/v1\n")) {
 				return "", fmt.Errorf("sensitive content or unresolved LFS: %s", n)
@@ -276,22 +275,22 @@ func snapCapture(ctx context.Context, repo, store, tmp, history string, isGit bo
 		return r, e
 	}
 	if isGit {
-		obj, e := g.get("rev-parse", "--path-format=absolute", "--git-path", "objects")
-		if e != nil {
-			return r, e
+		obj, objectsErr := g.get("rev-parse", "--path-format=absolute", "--git-path", "objects")
+		if objectsErr != nil {
+			return r, objectsErr
 		}
 		if strings.ContainsAny(obj, "\r\n") {
 			return r, errors.New("unsupported object directory")
 		}
-		if e = os.WriteFile(filepath.Join(stage.dir, "objects/info/alternates"), []byte(obj+"\n"), 0600); e != nil {
-			return r, e
+		if objectsErr = os.WriteFile(filepath.Join(stage.dir, "objects/info/alternates"), []byte(obj+"\n"), 0600); objectsErr != nil {
+			return r, objectsErr
 		}
 	}
 	tree, e := snapStage(g, stage, head, isGit, tmp)
 	if e != nil {
 		return r, e
 	}
-	if history != "" && !(history == "HEAD" && !isGit) {
+	if history != "" && (history != "HEAD" || isGit) {
 		if head == "" {
 			return r, errors.New("history requires committed HEAD")
 		}
@@ -302,16 +301,16 @@ func snapCapture(ctx context.Context, repo, store, tmp, history string, isGit bo
 			if !ok || start == "" || strings.Contains(start, "..") {
 				return r, errors.New("history requires A..HEAD")
 			}
-			oid, e := g.get("rev-parse", "--verify", "--end-of-options", start+"^{commit}")
-			if e != nil {
-				return r, e
+			oid, historyErr := g.get("rev-parse", "--verify", "--end-of-options", start+"^{commit}")
+			if historyErr != nil {
+				return r, historyErr
 			}
-			if _, e = g.get("merge-base", "--is-ancestor", oid, head); e != nil {
-				return r, e
+			if _, historyErr = g.get("merge-base", "--is-ancestor", oid, head); historyErr != nil {
+				return r, historyErr
 			}
-			b, e := g.get("rev-list", "--boundary", oid+".."+head)
-			if e != nil {
-				return r, e
+			b, historyErr := g.get("rev-list", "--boundary", oid+".."+head)
+			if historyErr != nil {
+				return r, historyErr
 			}
 			for _, s := range strings.Fields(b) {
 				if strings.HasPrefix(s, "-") {
@@ -322,23 +321,23 @@ func snapCapture(ctx context.Context, repo, store, tmp, history string, isGit bo
 				r.Shallow = []string{oid}
 			}
 			sort.Strings(r.Shallow)
-			data, e := snapJSON([]any{r.RepoID, r.Shallow})
-			if e != nil {
-				return r, e
+			data, historyErr := snapJSON([]any{r.RepoID, r.Shallow})
+			if historyErr != nil {
+				return r, historyErr
 			}
 			r.StoreID = snapSum(data)
-			if e = snapImmutable(filepath.Join(stage.dir, "shallow"), []byte(strings.Join(r.Shallow, "\n")+"\n")); e != nil {
-				return r, e
+			if historyErr = snapImmutable(filepath.Join(stage.dir, "shallow"), []byte(strings.Join(r.Shallow, "\n")+"\n")); historyErr != nil {
+				return r, historyErr
 			}
 		}
 	} else if head != "" {
-		ht, e := g.get("rev-parse", head+"^{tree}")
-		if e != nil {
-			return r, e
+		ht, treeErr := g.get("rev-parse", head+"^{tree}")
+		if treeErr != nil {
+			return r, treeErr
 		}
-		r.Base, e = stage.get("commit-tree", ht, "-m", "Source base v1")
-		if e != nil {
-			return r, e
+		r.Base, treeErr = stage.get("commit-tree", ht, "-m", "Source base v1")
+		if treeErr != nil {
+			return r, treeErr
 		}
 	}
 	args := []string{"commit-tree", tree, "-m", "Source snapshot v1"}
@@ -357,7 +356,7 @@ func snapCapture(ctx context.Context, repo, store, tmp, history string, isGit bo
 	if e != nil {
 		return r, e
 	}
-	defer l.Close()
+	defer closeBestEffort(l)
 	if _, e = os.Stat(bare); os.IsNotExist(e) {
 		if _, e = g.get("init", "-q", "--bare", "--object-format="+format, bare); e != nil {
 			return r, e
@@ -398,18 +397,18 @@ func Freeze(ctx context.Context, src string, opts FreezeOptions) (SnapshotID, Ma
 		return "", m, e
 	}
 	capture := func() ([]byte, error) {
-		tmp, e := os.MkdirTemp("", "cx-freeze-")
-		if e != nil {
-			return nil, e
+		tmp, freezeErr := os.MkdirTemp("", "cx-freeze-")
+		if freezeErr != nil {
+			return nil, freezeErr
 		}
-		defer os.RemoveAll(tmp)
-		repos, root, w, isGit, e := snapLayout(ctx, src, tmp)
-		if e != nil {
-			return nil, e
+		defer removeTreeBestEffort(tmp)
+		repos, root, w, isGit, freezeErr := snapLayout(ctx, src, tmp)
+		if freezeErr != nil {
+			return nil, freezeErr
 		}
-		main, e := filepath.Rel(root, src)
-		if e != nil {
-			return nil, e
+		main, freezeErr := filepath.Rel(root, src)
+		if freezeErr != nil {
+			return nil, freezeErr
 		}
 		m = Manifest{Version: 1, Main: filepath.ToSlash(main), Workspace: w}
 		for i, p := range repos {
@@ -423,26 +422,26 @@ func Freeze(ctx context.Context, src string, opts FreezeOptions) (SnapshotID, Ma
 				}
 			}
 			d := filepath.Join(tmp, fmt.Sprint(i))
-			if e = os.Mkdir(d, 0700); e != nil {
-				return nil, e
+			if freezeErr = os.Mkdir(d, 0700); freezeErr != nil {
+				return nil, freezeErr
 			}
 			h := opts.History
 			if h != "" && h != "HEAD" && !snapWithin(p, src) {
 				h = "HEAD..HEAD"
 			}
-			r, e := snapCapture(ctx, p, store, d, h, isGit)
-			if e != nil {
-				return nil, e
+			r, repoErr := snapCapture(ctx, p, store, d, h, isGit)
+			if repoErr != nil {
+				return nil, repoErr
 			}
-			rel, e := filepath.Rel(root, p)
-			if e != nil {
-				return nil, e
+			rel, repoErr := filepath.Rel(root, p)
+			if repoErr != nil {
+				return nil, repoErr
 			}
 			r.Path = filepath.ToSlash(rel)
 			m.Repositories = append(m.Repositories, r)
 		}
-		if e = m.validate(); e != nil {
-			return nil, e
+		if freezeErr = m.validate(); freezeErr != nil {
+			return nil, freezeErr
 		}
 		return snapJSON(m)
 	}
@@ -462,11 +461,11 @@ func Freeze(ctx context.Context, src string, opts FreezeOptions) (SnapshotID, Ma
 }
 
 func snapMatches(raw []byte, oid string) bool {
-	var h hash.Hash = sha1.New()
+	h := sha1.New()
 	if len(oid) == 64 {
 		h = sha256.New()
 	}
-	fmt.Fprintf(h, "blob %d\x00", len(raw))
+	_, _ = fmt.Fprintf(h, "blob %d\x00", len(raw))
 	h.Write(raw)
 	return hex.EncodeToString(h.Sum(nil)) == oid
 }

@@ -14,12 +14,12 @@ import (
 )
 
 type submissionOrigin struct {
-	CleanBase    bool
 	History      string
 	Source       string
 	Snapshot     SnapshotID
-	JobOptions   []string
 	Role, Parent string
+	JobOptions   []string
+	CleanBase    bool
 	Command      bool
 }
 
@@ -267,7 +267,7 @@ func installPlans(plans []applyPlan, record func() error) (err error) {
 	var locks []string
 	defer func() {
 		for _, path := range locks {
-			os.Remove(path)
+			_ = os.Remove(path)
 		}
 	}()
 	var undo []func() error
@@ -283,7 +283,7 @@ func installPlans(plans []applyPlan, record func() error) (err error) {
 		if e != nil {
 			return e
 		}
-		f.Close()
+		_ = f.Close()
 		locks = append(locks, p.index+".lock")
 		current, e := os.ReadFile(p.index)
 		if e != nil && !os.IsNotExist(e) {
@@ -378,7 +378,7 @@ func applyTurn(ctx context.Context, dir, id, host string, o ctlOptions, m turnRe
 	if e != nil {
 		return e
 	}
-	defer os.RemoveAll(scratch)
+	defer removeTreeBestEffort(scratch)
 	var plans []applyPlan
 	var plain []applyPlan
 	var conflicts []string
@@ -426,15 +426,15 @@ func applyTurn(ctx context.Context, dir, id, host string, o ctlOptions, m turnRe
 				return e
 			}
 		}
-		plan, e := planApply(ctx, store, src, patch, temp, row.SnapshotPatch, *base)
-		if e != nil {
+		plan, planErr := planApply(ctx, store, src, patch, temp, row.SnapshotPatch, *base)
+		if planErr != nil {
 			var conflict mergeConflict
-			if errors.As(e, &conflict) {
+			if errors.As(planErr, &conflict) {
 				for _, name := range conflict {
 					conflicts = append(conflicts, row.Path+"/"+name)
 				}
 			}
-			failures = errors.Join(failures, fmt.Errorf("%s: %w", row.Path, e))
+			failures = errors.Join(failures, fmt.Errorf("%s: %w", row.Path, planErr))
 			continue
 		}
 		plans = append(plans, plan)
@@ -458,24 +458,24 @@ func applyTurn(ctx context.Context, dir, id, host string, o ctlOptions, m turnRe
 	if e != nil {
 		return e
 	}
-	defer lock.Close()
+	defer closeBestEffort(lock)
 	if len(plans) > 0 && len(plain) > 0 {
 		return errors.New("mixed based and unbased patches; select a repository with --repo")
 	}
 	record := func(changes []applyPlan) error {
 		log := filepath.Join(project, "apply-log.jsonl")
-		b, e := os.ReadFile(log)
-		if e != nil && !os.IsNotExist(e) {
-			return e
+		b, readErr := os.ReadFile(log)
+		if readErr != nil && !os.IsNotExist(readErr) {
+			return readErr
 		}
 		for _, plan := range changes {
 			var base any
 			if plan.base != "" {
 				base = plan.base
 			}
-			row, e := json.Marshal(fields{"job": id, "host": host, "base": base, "turn": m.Turn, "repo": plan.repo, "source": plan.src, "patch": plan.patch, "applied_at": time.Now().UTC().Format(time.RFC3339Nano)})
-			if e != nil {
-				return e
+			row, encodeErr := json.Marshal(fields{"job": id, "host": host, "base": base, "turn": m.Turn, "repo": plan.repo, "source": plan.src, "patch": plan.patch, "applied_at": time.Now().UTC().Format(time.RFC3339Nano)})
+			if encodeErr != nil {
+				return encodeErr
 			}
 			b = append(append(b, row...), '\n')
 		}
@@ -538,9 +538,9 @@ func applyOrigin(dir, host, id string) (submissionOrigin, string, Manifest, erro
 		return origin, "", m, err
 	}
 	if os.IsNotExist(e) {
-		route, e := legacyRouteFile(id)
-		if e != nil {
-			return origin, "", m, e
+		route, routeErr := legacyRouteFile(id)
+		if routeErr != nil {
+			return origin, "", m, routeErr
 		}
 		var old struct {
 			Host, Source, Parent, Role string
@@ -548,8 +548,8 @@ func applyOrigin(dir, host, id string) (submissionOrigin, string, Manifest, erro
 			Snapshot                   SnapshotID `json:"snapshot_id"`
 			Command                    bool       `json:"command_job"`
 		}
-		if e = readJSON(route, &old); e != nil {
-			return origin, "", m, e
+		if routeErr = readJSON(route, &old); routeErr != nil {
+			return origin, "", m, routeErr
 		}
 		if old.Host != host {
 			return origin, "", m, errors.New("job route differs from result host")
@@ -571,7 +571,7 @@ func applyOrigin(dir, host, id string) (submissionOrigin, string, Manifest, erro
 		if old.Rerun["no_tools"] != true && old.Rerun["engine"] != "claude" {
 			origin.JobOptions = append(origin.JobOptions, "--job-tools")
 		}
-		if _, e := os.Stat(filepath.Join(store, "manifests", string(old.Snapshot)+".json")); os.IsNotExist(e) {
+		if _, statErr := os.Stat(filepath.Join(store, "manifests", string(old.Snapshot)+".json")); os.IsNotExist(statErr) {
 			store = filepath.Join(os.Getenv("CX_HOME"), "out", "snapshot")
 		}
 	} else if e != nil {

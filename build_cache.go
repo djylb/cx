@@ -77,7 +77,7 @@ func (r *runner) prepareBuildCache() error {
 	if err != nil {
 		return err
 	}
-	defer guard.Close()
+	defer closeBestEffort(guard)
 	if err = ensureCacheDir(path); err != nil {
 		return err
 	}
@@ -99,6 +99,44 @@ func (r *runner) prepareBuildCache() error {
 	return nil
 }
 
+// preparePackageCaches shares downloaded dependencies across projects on this node.
+func (r *runner) preparePackageCaches() error {
+	state, err := filepath.Abs(r.root)
+	if err != nil {
+		return err
+	}
+	root := filepath.Join(state, "cache", "packages")
+	if err := ensureCacheDir(root); err != nil {
+		return err
+	}
+	caches := []struct {
+		dir  string
+		keys []string
+	}{
+		{dir: "npm", keys: []string{"npm_config_cache"}},
+		{dir: "pnpm", keys: []string{"PNPM_STORE_DIR", "npm_config_store_dir"}},
+		{dir: "yarn", keys: []string{"YARN_CACHE_FOLDER"}},
+		{dir: "pip", keys: []string{"PIP_CACHE_DIR"}},
+		{dir: "cargo", keys: []string{"CARGO_HOME"}},
+	}
+	for _, cache := range caches {
+		path := filepath.Join(root, cache.dir)
+		if err := ensureCacheDir(path); err != nil {
+			return err
+		}
+		r.c.Roots = append(r.c.Roots, path)
+		for _, key := range cache.keys {
+			if _, supplied := r.c.Env[key]; !supplied {
+				r.c.localEnv = append(r.c.localEnv, key+"="+path)
+			}
+		}
+	}
+
+	// Cargo also keeps package-cache locks beside registry, so its entire home
+	// is a writable root.
+	return ensureCacheDir(filepath.Join(root, "cargo", "registry"))
+}
+
 func touchCache(path string) error {
 	now := time.Now()
 	return os.Chtimes(path, now, now)
@@ -114,7 +152,7 @@ func maintainBuildCache(ctx context.Context, root string, host *hostConfig) (str
 	if err != nil {
 		return "", err
 	}
-	defer guard.Close()
+	defer closeBestEffort(guard)
 	if err := trimBuildCache(ctx, cargoCachePath(root), host.CacheMaxBytes); err != nil {
 		return "", err
 	}
@@ -124,8 +162,8 @@ func maintainBuildCache(ctx context.Context, root string, host *hostConfig) (str
 
 func trimBuildCache(ctx context.Context, base string, limit uint64) error {
 	type candidate struct {
-		name     string
 		lastUsed time.Time
+		name     string
 		bytes    uint64
 	}
 	var candidates []candidate
@@ -187,7 +225,7 @@ func trimBuildCache(ctx context.Context, base string, limit uint64) error {
 			continue
 		}
 		err = os.RemoveAll(filepath.Join(base, row.name))
-		lease.Close()
+		_ = lease.Close()
 		if err != nil {
 			return err
 		}

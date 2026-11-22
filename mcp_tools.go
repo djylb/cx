@@ -37,10 +37,10 @@ func callTool(ctx context.Context, dir string, params json.RawMessage) (any, err
 		return nil, err
 	}
 	var a struct {
+		Timeout            *float64
 		Question, To, Text string
 		Options            []string
 		Blocking           bool
-		Timeout            *float64
 	}
 	if p.Arguments != nil {
 		if err := json.Unmarshal(p.Arguments, &a); err != nil {
@@ -159,9 +159,9 @@ func serveTools(ctx context.Context, dir string, in io.Reader, out io.Writer) er
 				if err != nil {
 					text = err.Error()
 				} else {
-					b, err := json.Marshal(v)
-					if err != nil {
-						return err
+					b, encodeErr := json.Marshal(v)
+					if encodeErr != nil {
+						return encodeErr
 					}
 					text = string(b)
 				}

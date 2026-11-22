@@ -23,13 +23,14 @@ func TestPreswitchTurnFailures(t *testing.T) {
 			dir := filepath.Join(root, filepath.FromSlash(id))
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			done := make(chan error, 1)
+			done := make(chan struct{})
 			go func() {
-				done <- run(ctx, []string{"start", "--job", id, "--dir", work, "--prompt-file", prompt, "--sandbox", "workspace-write", "--network", "--idle-exit", "3s", "--session", "local_x"})
+				defer close(done)
+				_ = run(ctx, []string{"start", "--job", id, "--dir", work, "--prompt-file", prompt, "--sandbox", "workspace-write", "--network", "--idle-exit", "3s", "--session", "local_x"})
 			}()
 			defer func() {
 				cancel()
-				<-done
+				<-done // CLI assertions check the turn. The runner is canceled during cleanup.
 			}()
 			outcome := "failed"
 			code := 1
@@ -239,11 +240,11 @@ func TestPreswitchDeployWithoutModule(t *testing.T) {
 	if err = os.Remove(path); err != nil {
 		t.Fatal(err)
 	}
-	if err := rememberPlatformVersion(digest, h.Platform, digest); err != nil {
-		t.Fatal(err)
+	if cacheErr := rememberPlatformVersion(digest, h.Platform, digest); cacheErr != nil {
+		t.Fatal(cacheErr)
 	}
-	if err := deploy(ctx, hs, "fixture"); err != nil {
-		t.Fatal(err)
+	if deployErr := deploy(ctx, hs, "fixture"); deployErr != nil {
+		t.Fatal(deployErr)
 	}
 	r, err := submitCommand(ctx, hs, "fixture", []string{"submit-command", "p/no-module", f.home, "--", "echo", "ok"})
 	if err != nil || r.code != 0 || !json.Valid(r.data) {

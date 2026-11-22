@@ -232,8 +232,10 @@ func (f *secretFilter) text(s string) string {
 	return f.pattern.ReplaceAllLiteralString(s, hiddenValue)
 }
 
-func (f *secretFilter) jsonStrings(raw json.RawMessage) (json.RawMessage, error) {
-	if f == nil {
+// jsonOutput filters the captured copy of an app-server payload. Dispatch uses
+// the original frame. Only fields carrying display text are eligible.
+func (f *secretFilter) jsonOutput(raw json.RawMessage) (json.RawMessage, error) {
+	if f == nil || len(raw) == 0 {
 		return raw, nil
 	}
 	var data any
@@ -242,31 +244,78 @@ func (f *secretFilter) jsonStrings(raw json.RawMessage) (json.RawMessage, error)
 	if err := dec.Decode(&data); err != nil {
 		return nil, fmt.Errorf("invalid agent JSON")
 	}
-	var redact func(any) any
-	redact = func(v any) any {
+	var redact func(any, bool, bool) any
+	redact = func(v any, arguments, changePaths bool) any {
 		switch x := v.(type) {
 		case string:
-			return f.text(x)
+			if arguments {
+				return f.text(x)
+			}
 		case map[string]any:
 			for k, child := range x {
-				x[k] = redact(child)
+				if strings.HasSuffix(k, "Id") || strings.HasSuffix(k, "ID") || strings.HasSuffix(k, "_id") {
+					continue
+				}
+				switch strings.ToLower(k) {
+				case "id", "jsonrpc", "method", "type", "status", "state", "permissions":
+					continue
+				case "arguments":
+					x[k] = redact(child, true, changePaths)
+					continue
+				case "changes":
+					x[k] = redact(child, arguments, x["type"] == "fileChange")
+					continue
+				case "path":
+					if path, ok := child.(string); ok && changePaths {
+						x[k] = f.text(path)
+						continue
+					}
+				case "text":
+					if output, ok := child.(string); ok {
+						x[k] = f.reportText(output)
+						continue
+					}
+				case "delta", "content", "output", "aggregatedoutput", "stdin", "stdout", "stderr",
+					"message", "additionaldetails", "explanation", "step", "diff", "command",
+					"patch", "reason", "summary", "question", "header", "description", "detail", "label":
+					if output, ok := child.(string); ok {
+						x[k] = f.text(output)
+						continue
+					}
+				}
+				x[k] = redact(child, arguments, changePaths)
 			}
 		case []any:
 			for i, child := range x {
-				x[i] = redact(child)
+				x[i] = redact(child, arguments, changePaths)
 			}
 		}
 		return v
 	}
-	return json.Marshal(redact(data))
+	return json.Marshal(redact(data, false, false))
+}
+
+// First-line report status is consumed by both the controller and other agents.
+func (f *secretFilter) reportText(text string) string {
+	if f == nil {
+		return text
+	}
+	first, body, multiline := strings.Cut(text, "\n")
+	if reportStatus(first) == "" {
+		return f.text(text)
+	}
+	if multiline {
+		return first + "\n" + f.text(body)
+	}
+	return first
 }
 
 type filteredOutput struct {
-	mu      sync.Mutex
-	closed  bool
 	dst     io.Writer
 	filter  *secretFilter
-	pending []byte
+	pending []byte // under mu
+	mu      sync.Mutex
+	closed  bool // under mu
 }
 
 func (w *filteredOutput) Write(p []byte) (int, error) {

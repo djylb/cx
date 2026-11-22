@@ -50,7 +50,7 @@ func TestControlTargetAndDuplicate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	r := runner{dir: dir, log: f, s: status{Turn: "new", TurnStatus: "inProgress"}}
 	for i, target := range []string{"old", "new", "new"} {
 		id := "key"
@@ -68,8 +68,8 @@ func TestControlTargetAndDuplicate(t *testing.T) {
 }
 func TestRPCWriteDeadlineAndLateReply(t *testing.T) {
 	reader, writer := io.Pipe()
-	defer reader.Close()
-	defer writer.Close()
+	defer func() { _ = reader.Close() }()
+	defer func() { _ = writer.Close() }()
 	s := &server{in: writer, stop: make(chan struct{}), writes: make(chan writeRequest, 1), expired: map[string]bool{"7": true}, writeTimeout: 20 * time.Millisecond}
 	go s.writer()
 	defer close(s.stop)
@@ -83,7 +83,7 @@ func TestRPCWriteDeadlineAndLateReply(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	r := runner{srv: s, log: f, dir: filepath.Dir(f.Name())}
 	m, err := r.read(frame{raw: []byte(`{"id":7,"result":{}}`)})
 	if err != nil || m.Method == "" || s.expired["7"] {
@@ -165,7 +165,7 @@ func TestRegistryAndReapDeadlines(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer g.Close()
+	defer func() { _ = g.Close() }()
 	if _, err = registryLock(ctx, root); !errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
 		t.Fatal(err, ctx.Err())
 	}
@@ -178,7 +178,7 @@ func TestRegistryAndReapDeadlines(t *testing.T) {
 	if err = cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	defer cmd.Process.Kill()
+	defer func() { _ = cmd.Process.Kill() }()
 	if err = waitProcess(cmd, 20*time.Millisecond); !errors.Is(err, errReapDeadline) {
 		t.Fatal(err)
 	}
@@ -250,7 +250,7 @@ func TestStallContinuationRetainsSlot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer slot.Close()
+	defer func() { _ = slot.Close() }()
 	r := runner{slot: slot, dir: root, pending: defaultContinue}
 	if err = r.finish(turn{ID: "t", Status: "interrupted"}); err != nil || r.slot != slot {
 		t.Fatal(err, r.slot)
@@ -262,14 +262,14 @@ func TestRejectedStartReleasesSlot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer slot.Close()
+	defer func() { _ = slot.Close() }()
 	input, output := io.Pipe()
-	defer input.Close()
-	defer output.Close()
+	defer func() { _ = input.Close() }()
+	defer func() { _ = output.Close() }()
 	s := &server{in: output, stop: make(chan struct{}), frames: make(chan frame, 1), writes: make(chan writeRequest, 1), writeTimeout: time.Second}
 	go s.writer()
 	defer close(s.stop)
-	go io.Copy(io.Discard, input)
+	go func() { _, _ = io.Copy(io.Discard, input) }()
 	s.frames <- frame{raw: []byte(`{"id":1,"error":{"code":-1,"message":"rejected"}}`)}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
@@ -281,18 +281,18 @@ func TestRejectedStartReleasesSlot(t *testing.T) {
 
 func TestLateReplyDuringNextCall(t *testing.T) {
 	reader, writer := io.Pipe()
-	defer reader.Close()
-	defer writer.Close()
+	defer func() { _ = reader.Close() }()
+	defer func() { _ = writer.Close() }()
 	s := &server{in: writer, stop: make(chan struct{}), frames: make(chan frame, 2), writes: make(chan writeRequest, 1), expired: map[string]bool{}, writeTimeout: time.Second, responseTimeout: 25 * time.Millisecond}
 	go s.writer()
 	defer close(s.stop)
-	go io.Copy(io.Discard, reader)
+	go func() { _, _ = io.Copy(io.Discard, reader) }()
 	dir := t.TempDir()
 	log, err := os.Create(filepath.Join(dir, "progress.log"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer log.Close()
+	defer func() { _ = log.Close() }()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	r := runner{dir: dir, ctx: ctx, srv: s, log: log}

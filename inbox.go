@@ -23,20 +23,20 @@ func approvalMethod(m string) bool {
 }
 
 type approval struct {
-	Generation uint64 `json:"generation"`
-	Summary    string `json:"summary"`
-	Questions  []struct {
+	Requested time.Time `json:"requested_at"`
+	Deadline  time.Time `json:"deadline"`
+	Summary   string    `json:"summary"`
+	Method    string    `json:"method"`
+	Reason    string    `json:"reason,omitempty"`
+	Questions []struct {
 		ID string `json:"id"`
 	} `json:"questions,omitempty"`
 	ID          json.RawMessage `json:"id"`
-	Method      string          `json:"method"`
-	Requested   time.Time       `json:"requested_at"`
-	Deadline    time.Time       `json:"deadline"`
-	Reason      string          `json:"reason,omitempty"`
 	Permissions json.RawMessage `json:"permissions,omitempty"`
+	Generation  uint64          `json:"generation"`
 }
 
-func (r *runner) request(m message) error {
+func (r *runner) request(m message, capturedParams json.RawMessage) error {
 	provider := m.Method == "item/tool/call" || m.Method == "attestation/generate" || m.Method == "account/chatgptAuthTokens/refresh"
 	switch {
 	case provider || inputMethod(m.Method) || approvalMethod(m.Method):
@@ -48,9 +48,9 @@ func (r *runner) request(m message) error {
 			return err
 		}
 		now := time.Now().UTC()
-		a := approval{ID: m.ID, Method: m.Method, Reason: p.Reason, Requested: now, Deadline: now.Add(r.c.Approval), Permissions: p.Permissions}
+		a := approval{ID: m.ID, Method: m.Method, Reason: r.c.secret.text(p.Reason), Requested: now, Deadline: now.Add(r.c.Approval), Permissions: p.Permissions}
 		a.Generation = r.s.Generation
-		a.Summary = brief(string(m.Params))
+		a.Summary = brief(string(capturedParams))
 		var q struct {
 			Questions []struct {
 				ID string `json:"id"`
@@ -62,7 +62,7 @@ func (r *runner) request(m message) error {
 		a.Questions = q.Questions
 		r.s.Approvals = append(r.s.Approvals, a)
 		r.deriveState()
-		if err := r.note("server/request", fmt.Sprintf("%s id=%s %s", m.Method, m.ID, p.Reason)); err != nil {
+		if err := r.writeProgress("server/request", fmt.Sprintf("%s id=%s %s", m.Method, m.ID, a.Reason)); err != nil {
 			return err
 		}
 		if err := r.save(); err != nil {
@@ -73,7 +73,7 @@ func (r *runner) request(m message) error {
 		}
 		return nil
 	default:
-		if err := r.note("server/request", m.Method+" unsupported"); err != nil {
+		if err := r.writeProgress("server/request", m.Method+" unsupported"); err != nil {
 			return err
 		}
 		return r.srv.send(fields{"id": m.ID, "error": fields{"code": -32601, "message": "unsupported by unattended cxrun"}})
@@ -118,7 +118,7 @@ func (r *runner) decide(a approval, allow bool, reason string) error {
 	if err := r.srv.send(fields{"id": a.ID, "result": result}); err != nil {
 		return err
 	}
-	if err := r.note("approval", fmt.Sprintf("id=%s allow=%t %s", a.ID, allow, reason)); err != nil {
+	if err := r.writeProgress("approval", fmt.Sprintf("id=%s allow=%t %s", a.ID, allow, r.c.secret.text(reason))); err != nil {
 		return err
 	}
 	return r.removeApproval(a.ID)
@@ -233,26 +233,26 @@ func (r *runner) deliver(name string) error {
 	}
 	// A remote publisher retries by republishing the same immutable name and bytes.
 	for _, sub := range []string{"done", "uncertain"} {
-		previous, err := os.ReadFile(r.mail(filepath.Join(sub, name)))
-		if os.IsNotExist(err) {
+		previous, duplicateErr := os.ReadFile(r.mail(filepath.Join(sub, name)))
+		if os.IsNotExist(duplicateErr) {
 			continue
 		}
-		if err != nil {
-			return err
+		if duplicateErr != nil {
+			return duplicateErr
 		}
 		if !bytes.Equal(b, previous) {
 			return fmt.Errorf("message name reused with different contents: %s", name)
 		}
-		if err = r.note("inbox/duplicate", sub+"/"+name); err != nil {
-			return err
+		if duplicateErr = r.note("inbox/duplicate", sub+"/"+name); duplicateErr != nil {
+			return duplicateErr
 		}
 		return os.Remove(path)
 	}
 	// Keep unsent messages in inbox while waiting for admission, including on crash.
 	if !r.active() {
-		ready, err := r.followSlot()
-		if !ready || err != nil {
-			return err
+		ready, slotErr := r.followSlot()
+		if !ready || slotErr != nil {
+			return slotErr
 		}
 	}
 	pending := r.mail(filepath.Join("pending", name))
@@ -307,14 +307,14 @@ func (r *runner) interrupt() error {
 	}
 	if r.claude != nil {
 		r.claude.interrupt()
-		return r.note("turn/interrupt", r.s.Turn)
+		return r.writeProgress("turn/interrupt", r.s.Turn)
 	}
 	err := r.call("turn/interrupt", fields{"threadId": r.s.Thread, "turnId": r.s.Turn}, nil)
 	var rejected *rpcError
-	if err != nil && !(errors.As(err, &rejected) && !r.active()) {
+	if err != nil && (!errors.As(err, &rejected) || r.active()) {
 		return err
 	}
-	return r.note("turn/interrupt", r.s.Turn)
+	return r.writeProgress("turn/interrupt", r.s.Turn)
 }
 func fileExists(path string) (bool, error) {
 	_, err := os.Lstat(path)
@@ -373,8 +373,8 @@ func (r *runner) poll() (bool, error) {
 	if err = r.watchdog(); err != nil {
 		return false, err
 	}
-	if started, err := r.continuePending(); started || err != nil {
-		return false, err
+	if started, continueErr := r.continuePending(); started || continueErr != nil {
+		return false, continueErr
 	}
 	_, exists, err := r.takeMarker("interrupt")
 	if err != nil {

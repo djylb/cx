@@ -6,10 +6,44 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestAgentToolsUseResolvedStateRoot(t *testing.T) {
+	ambient, work, _ := runnerFixture(t)
+	root := t.TempDir()
+	dir := filepath.Join(root, "p", "job")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	r := runner{c: config{Dir: work, Project: "p", JobTools: true}, root: root, dir: dir}
+	s, err := openServer(r.c, r.root, r.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.srv = s
+	t.Cleanup(func() {
+		if shutdownErr := r.shutdown(); shutdownErr != nil {
+			t.Error(shutdownErr)
+		}
+	})
+	for _, arg := range s.cmd.Args {
+		raw, ok := strings.CutPrefix(arg, "mcp_servers.cxrun.args=")
+		if !ok {
+			continue
+		}
+		var argv []string
+		if decodeErr := json.Unmarshal([]byte(raw), &argv); decodeErr != nil ||
+			!slices.Equal(argv, []string{"node", "mcp-tools", "--state", root, "--job", "p/job"}) {
+			t.Fatalf("wrong MCP arguments with ambient root %s: %s (%v)", ambient, raw, decodeErr)
+		}
+		return
+	}
+	t.Fatal("missing MCP arguments")
+}
 
 func TestAgentToolSession(t *testing.T) {
 	h := newRuns(t, "manual")

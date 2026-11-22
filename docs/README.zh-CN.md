@@ -20,7 +20,7 @@ cx 让任何能运行 shell 命令的 AI 会话把代理或命令任务派到本
 | 控制端 | 与操作系统及架构匹配的 `cx`。Git 快照和补丁需要 Git，远端作业需要 OpenSSH 客户端。 |
 | 远端执行机 | Linux、macOS 或 Windows，已启用 OpenSSH Server，并有支持非交互 SSH 的账号。Git 检出需要 Git。 |
 | 执行环境 | 代理作业需要已登录且支持 `app-server` 的 Codex CLI，或与所用模式兼容的 Claude Code CLI。Windows 的命令和代理作业需要登录会话内的 psmux。macOS 和 Linux 的 Go 控制端直接分离后台进程，也可手动在 tmux 中托管节点。 |
-| 源码构建 | Go 1.23 或更新版本。跨平台部署和可选的 rsync 升级路径见[安装指南](agent-install.md)。 |
+| 源码构建 | Go 1.26 或更新版本。跨平台部署和可选的 rsync 升级路径见[安装指南](agent-install.md)。 |
 
 ## 安装提示词
 

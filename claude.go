@@ -16,23 +16,23 @@ import (
 type claudeEvent struct {
 	Type, Result string
 	Session      string `json:"session_id"`
-	Failed       bool   `json:"is_error"`
 	Message      struct {
 		Content []struct{ Type, Text, Name string }
 	}
+	Failed bool `json:"is_error"`
 }
 type claudeFrame struct {
+	err   error
 	event claudeEvent
 	end   bool
-	err   error
 }
 type claudeSession struct {
 	cmd         *exec.Cmd
 	frames      chan claudeFrame
 	stop        chan struct{}
 	done        chan struct{}
-	interrupted bool
 	result      *claudeEvent
+	interrupted bool
 }
 
 func (s *claudeSession) interrupt() {
@@ -104,13 +104,13 @@ func (r *runner) startClaude(input any, id string) error {
 	cmd.Stderr = stderr
 	out, err := cmd.StdoutPipe()
 	if err != nil {
-		log.Close()
+		_ = log.Close()
 		return err
 	}
 	tree, err := startCommand(cmd, r.c.RunID)
 	if err != nil {
-		out.Close()
-		log.Close()
+		_ = out.Close()
+		_ = log.Close()
 		return err
 	}
 	s := r.claude
@@ -134,15 +134,8 @@ func (r *runner) startClaude(input any, id string) error {
 		dec := json.NewDecoder(out)
 		var streamErr error
 		for {
-			var raw json.RawMessage
-			streamErr = dec.Decode(&raw)
-			if streamErr == nil {
-				raw, streamErr = r.c.secret.jsonStrings(raw)
-			}
 			var ev claudeEvent
-			if streamErr == nil {
-				streamErr = json.Unmarshal(raw, &ev)
-			}
+			streamErr = dec.Decode(&ev)
 			if streamErr != nil {
 				break
 			}
@@ -223,12 +216,13 @@ func (r *runner) consumeClaude(f claudeFrame) error {
 	switch e.Type {
 	case "assistant":
 		for _, block := range e.Message.Content {
-			if block.Type == "text" {
+			switch block.Type {
+			case "text":
 				if err := r.claudeEvent("item/completed", fields{"item": fields{"type": "agentMessage", "text": block.Text}}); err != nil {
 					return err
 				}
-			} else if block.Type == "tool_use" {
-				if err := r.localEvent("claude/tool", block.Name); err != nil {
+			case "tool_use":
+				if err := r.localEvent("claude/tool", r.c.secret.text(block.Name)); err != nil {
 					return err
 				}
 			}

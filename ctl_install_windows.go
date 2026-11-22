@@ -1,11 +1,11 @@
 package main
 
 import (
+	"context"
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
-	"time"
+	"strings"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -13,23 +13,58 @@ import (
 
 // Request POSIX replacement semantics so existing handles may continue
 // referring to the old executable after its directory entry is replaced.
-func publishBinary(from, to string) error {
-	// Old images left aside by earlier upgrades are removable once their processes exit.
-	if olds, _ := filepath.Glob(to + ".old.*"); len(olds) > 0 {
-		for _, old := range olds {
-			_ = os.Remove(old)
+func publishBinary(ctx context.Context, from, to string) error {
+	to, err := filepath.Abs(to)
+	if err != nil {
+		return err
+	}
+	// Serialize publishers and cleanup for this destination across controllers.
+	lock, err := lockUntil(ctx, to+".install.lock")
+	if err != nil {
+		return err
+	}
+	defer closeBestEffort(lock)
+	err = publishWithRollback(from, to, replaceBinary, moveBinary, func(replaceErr error) bool {
+		return errors.Is(replaceErr, windows.ERROR_ACCESS_DENIED) || errors.Is(replaceErr, windows.ERROR_SHARING_VIOLATION)
+	})
+	if err != nil {
+		return err
+	}
+	// Once publication succeeds, images left aside by earlier upgrades can be
+	// removed as their processes exit. Keep a failed rollback's image intact.
+	dir, prefix := filepath.Dir(to), filepath.Base(to)+".old."
+	entries, _ := os.ReadDir(dir)
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.HasPrefix(entry.Name(), prefix) {
+			_ = os.Remove(filepath.Join(dir, entry.Name()))
 		}
 	}
-	e := replaceBinary(from, to)
-	if errors.Is(e, windows.ERROR_ACCESS_DENIED) || errors.Is(e, windows.ERROR_SHARING_VIOLATION) {
-		// A running image cannot be replaced, but it can be renamed: move it aside, then publish.
-		aside := fmt.Sprintf("%s.old.%d", to, time.Now().UnixNano())
-		if re := os.Rename(to, aside); re != nil {
-			return fmt.Errorf("replace running %s: %w (rename aside: %v)", to, e, re)
-		}
-		return replaceBinary(from, to)
+	return nil
+}
+
+func moveBinary(from, to string) error {
+	src, err := windows.UTF16PtrFromString(extendedBinaryPath(from))
+	if err != nil {
+		return err
 	}
-	return e
+	dst, err := windows.UTF16PtrFromString(extendedBinaryPath(to))
+	if err != nil {
+		return err
+	}
+	// MoveFile fails if the target exists. In particular, rollback cannot
+	// overwrite a target installed by software outside cx's install lock.
+	return windows.MoveFile(src, dst)
+}
+
+func extendedBinaryPath(path string) string {
+	switch {
+	case strings.HasPrefix(path, `\\?\`), strings.HasPrefix(path, `\\.\`):
+		return path
+	case strings.HasPrefix(path, `\\`):
+		return `\\?\UNC\` + path[2:]
+	default:
+		return `\\?\` + path
+	}
 }
 
 func replaceBinary(from, to string) error {
@@ -41,7 +76,7 @@ func replaceBinary(from, to string) error {
 	if e != nil {
 		return e
 	}
-	defer windows.CloseHandle(h)
+	defer func() { _ = windows.CloseHandle(h) }()
 	dest, e := filepath.Abs(to)
 	if e != nil {
 		return e
@@ -51,6 +86,7 @@ func replaceBinary(from, to string) error {
 		return e
 	}
 	name = name[:len(name)-1]
+	// Field order is fixed by the Windows FILE_RENAME_INFO ABI.
 	type renameInfo struct {
 		Flags  uint32
 		Root   windows.Handle

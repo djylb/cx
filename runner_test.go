@@ -98,6 +98,7 @@ func fixtureServer() error {
 			Input                                             []struct{ Text string }
 			SandboxPolicy                                     struct {
 				Type          string
+				WritableRoots []string
 				NetworkAccess bool
 			}
 		}
@@ -207,6 +208,12 @@ func fixtureServer() error {
 			} else if p.Input[0].Text != wantPrompt {
 				return fmt.Errorf("initial prompt: got %q, want %q", p.Input[0].Text, wantPrompt)
 			}
+			if path := os.Getenv("FIXTURE_PACKAGE_CACHE_RECORD"); path != "" {
+				record := packageCacheRecord{Env: packageCacheFixtureEnv(), WritableRoots: p.SandboxPolicy.WritableRoots}
+				if err := writeJSON(path, record); err != nil {
+					return err
+				}
+			}
 			mode := os.Getenv("FIXMODE")
 			if turnID == "second" && (mode == "wait-followup" || mode == "wait-enospc") {
 				if mode == "wait-enospc" && started {
@@ -287,10 +294,10 @@ func fixtureServer() error {
 				itemEvent(fields{"type": "commandExecution", "command": "ok", "exitCode": 0})
 				notify("thread/tokenUsage/updated", fields{"turnId": turnID, "tokenUsage": fields{"total": fields{"totalTokens": 42}}})
 				notify("account/rateLimits/updated", fields{"rateLimits": fields{
-					"limitId": "codex", "primary": fields{"usedPercent": 64, "resetsAt": 4102444800},
+					"limitId": "codex", "primary": fields{"usedPercent": 64, "resetsAt": int64(4102444800)},
 				}})
 				notify("account/rateLimits/updated", fields{"rateLimits": fields{
-					"primary": nil, "secondary": fields{"usedPercent": 0, "resetsAt": 4102448400},
+					"primary": nil, "secondary": fields{"usedPercent": 0, "resetsAt": int64(4102448400)},
 				}})
 				notify("error", fields{"turnId": turnID, "willRetry": true, "error": fields{
 					"message": "provider rejected attempt", "codexErrorInfo": fields{"responseTooManyFailedAttempts": fields{"httpStatusCode": 429}},
@@ -453,9 +460,9 @@ func TestRunnerConversation(t *testing.T) {
 				return s
 			}
 			select {
-			case err := <-done:
+			case runnerErr := <-done:
 				b, _ := os.ReadFile(filepath.Join(dir, "server.stderr.log"))
-				t.Fatalf("runner exited early: %v %s", err, b)
+				t.Fatalf("runner exited early: %v %s", runnerErr, b)
 			case <-ctx.Done():
 				t.Fatal(ctx.Err())
 			case <-time.After(15 * time.Millisecond):
@@ -514,7 +521,7 @@ func TestRunnerConversation(t *testing.T) {
 	}
 	events, err := os.Open(filepath.Join(dir, "events.jsonl"))
 	check(err)
-	defer events.Close()
+	defer func() { _ = events.Close() }()
 	scanner := bufio.NewScanner(events)
 	var count int
 	for scanner.Scan() {
@@ -552,19 +559,19 @@ func TestConcurrentRegistrationAndInterruptedDelivery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer log.Close()
+	defer func() { _ = log.Close() }()
 	r := runner{dir: dir, log: log}
 	for _, name := range []string{"ack.msg", "unknown.msg"} {
-		if err := os.WriteFile(r.mail(filepath.Join("pending", name)), []byte("same"), 0600); err != nil {
-			t.Fatal(err)
+		if writeErr := os.WriteFile(r.mail(filepath.Join("pending", name)), []byte("same"), 0600); writeErr != nil {
+			t.Fatal(writeErr)
 		}
 	}
 	if err = r.recoverInbox(turn{Items: []item{{Type: "userMessage", ClientID: "ack.msg"}}}); err != nil {
 		t.Fatal(err)
 	}
 	for sub, name := range map[string]string{"done": "ack.msg", "uncertain": "unknown.msg"} {
-		if ok, err := fileExists(r.mail(filepath.Join(sub, name))); !ok || err != nil {
-			t.Fatal(sub, name, err)
+		if ok, existsErr := fileExists(r.mail(filepath.Join(sub, name))); !ok || existsErr != nil {
+			t.Fatal(sub, name, existsErr)
 		}
 		if err = os.WriteFile(r.mail(name), []byte("same"), 0600); err != nil {
 			t.Fatal(err)
@@ -706,7 +713,7 @@ func TestDangerFullAccess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	scan := bufio.NewScanner(f)
 	started := 0
 	for scan.Scan() {
@@ -756,7 +763,7 @@ func TestStallAndCrashRecovery(t *testing.T) {
 			if mode == "silent" {
 				want = errStalled
 			}
-			if !errors.Is(err, want) || !(errors.Is(waitErr, want) || mode == "silent" && errors.Is(waitErr, stateFailure("stalled"))) {
+			if !errors.Is(err, want) || (!errors.Is(waitErr, want) && (mode != "silent" || !errors.Is(waitErr, stateFailure("stalled")))) {
 				t.Fatalf("runner=%v wait=%v", err, waitErr)
 			}
 			b, err := os.ReadFile(filepath.Join(h.root, id, "progress.log"))
@@ -783,12 +790,14 @@ func TestFIFOQueuedCloseAndDedup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	g.Close()
+	if closeErr := g.Close(); closeErr != nil {
+		t.Fatal(closeErr)
+	}
 	held, err := lockPath(filepath.Join(h.root, ".admit", "slot-0.lock"), os.O_CREATE)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer held.Close()
+	defer func() { _ = held.Close() }()
 	queued := func(s status) bool { return s.State == "queued" && s.PID != 0 }
 	first := h.start("alpha/j", "--dedup-key", "abc")
 	h.await("alpha/j", queued)
@@ -811,7 +820,9 @@ func TestFIFOQueuedCloseAndDedup(t *testing.T) {
 	if err = <-third; err != nil {
 		t.Fatal(err)
 	}
-	held.Close()
+	if closeErr := held.Close(); closeErr != nil {
+		t.Fatal(closeErr)
+	}
 	h.await("alpha/j", func(s status) bool { return s.Turn == "first" })
 	var s status
 	if err = readJSON(filepath.Join(h.root, "beta/j/status.json"), &s); err != nil || !queued(s) {
@@ -887,7 +898,7 @@ func TestLockedLegacyJob(t *testing.T) {
 	if err != nil || held == nil {
 		t.Fatal(err)
 	}
-	defer held.Close()
+	defer func() { _ = held.Close() }()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	for _, op := range []string{"start", "resume", "status", "close"} {
@@ -967,8 +978,8 @@ func TestLoadGateAndAbandonedTicket(t *testing.T) {
 	}
 	defer func() {
 		if cmd.ProcessState == nil {
-			cmd.Process.Kill()
-			cmd.Wait()
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
 		}
 	}()
 	h.await("p/abandoned", func(s status) bool { return s.State == "queued" && s.PID == cmd.Process.Pid })

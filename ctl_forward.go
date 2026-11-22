@@ -28,7 +28,8 @@ func isThinControl(op string) bool {
 func ctlForward(ctx context.Context, op string, args []string) error {
 	var argv []string
 	var o ctlOptions
-	if op == "outbox" {
+	switch op {
+	case "outbox":
 		var e error
 		o, e = parseCtl(op, args)
 		if e != nil {
@@ -37,11 +38,11 @@ func ctlForward(ctx context.Context, op string, args []string) error {
 		if o.any && len(o.pos) != 0 || !o.any && (len(o.pos) != 1 || o.project != "") {
 			return ctlUsage(op, errors.New("outbox needs JOB or --any [--project P]"))
 		}
-	} else if op == "hosts" {
+	case "hosts":
 		if len(args) > 1 || len(args) == 1 && strings.HasPrefix(args[0], "-") {
 			return ctlUsage(op, errors.New("hosts accepts at most one host"))
 		}
-	} else {
+	default:
 		if len(args) == 0 || strings.HasPrefix(args[0], "-") {
 			return ctlUsage(op, fmt.Errorf("%s requires a job", op))
 		}
@@ -61,19 +62,19 @@ func ctlForward(ctx context.Context, op string, args []string) error {
 			names = args
 		}
 		for _, name := range names {
-			h, e := hs.get(name)
-			if e != nil {
-				return e
+			h, hostErr := hs.get(name)
+			if hostErr != nil {
+				return hostErr
 			}
-			r, e := h.call(ctx, 30*time.Second, "facts")
-			if e != nil {
-				return e
+			r, hostErr := h.call(ctx, 30*time.Second, "facts")
+			if hostErr != nil {
+				return hostErr
 			}
 			if r.code != 0 {
 				return r.output()
 			}
-			if e = emitRows(r.data, "host", name); e != nil {
-				return e
+			if hostErr = emitRows(r.data, "host", name); hostErr != nil {
+				return hostErr
 			}
 		}
 		return nil
@@ -235,8 +236,8 @@ func nodeAction(ctx context.Context, a []string) error {
 			if op != "say" || i+1 >= len(a) {
 				return errors.New("invalid attachment")
 			}
-			if _, e := os.Stat(filepath.Join(dir, "config.json")); e != nil {
-				return e
+			if _, statErr := os.Stat(filepath.Join(dir, "config.json")); statErr != nil {
+				return statErr
 			}
 			folder := filepath.Join(dir, "attachments")
 			if e = os.MkdirAll(folder, 0700); e != nil {
@@ -370,9 +371,9 @@ func nodeOutboxAll(ctx context.Context, a []string) error {
 		}
 		return false, readMail(dir, since, func(m agentMail) error {
 			return json.NewEncoder(os.Stdout).Encode(struct {
-				agentMail
 				Source string `json:"source_job"`
-			}{m, a[0] + ":" + id})
+				agentMail
+			}{Source: a[0] + ":" + id, agentMail: m})
 		})
 	})
 }

@@ -20,8 +20,8 @@ import (
 )
 
 type releaseSource struct {
-	URL    string            `toml:"url"`
 	SHA256 map[string]string `toml:"sha256"`
+	URL    string            `toml:"url"`
 }
 type hostFile struct {
 	Hosts   endpoints     `toml:"hosts"`
@@ -106,7 +106,7 @@ func configRelease(ctx context.Context, name, plat string) (releaseSource, error
 	if e != nil {
 		return cfg.Release, e
 	}
-	defer lock.Close()
+	defer closeBestEffort(lock)
 	if _, e = toml.DecodeFile(path, &cfg); e != nil {
 		return cfg.Release, e
 	}
@@ -212,15 +212,15 @@ func cacheArtifact(ctx context.Context, version, plat string, release releaseSou
 	if e != nil {
 		return "", e
 	}
-	defer lock.Close()
-	if info, e := os.Stat(path); e == nil && info.Mode().IsRegular() {
+	defer closeBestEffort(lock)
+	if info, statErr := os.Stat(path); statErr == nil && info.Mode().IsRegular() {
 		return path, nil
 	}
 	tmp, e := os.CreateTemp(dir, "build-*")
 	if e != nil {
 		return "", e
 	}
-	defer os.Remove(tmp.Name())
+	defer removeBestEffort(tmp.Name())
 	if e = tmp.Close(); e != nil {
 		return "", e
 	}
@@ -261,7 +261,7 @@ func cacheArtifact(ctx context.Context, version, plat string, release releaseSou
 		if err != nil {
 			return "", err
 		}
-		defer resp.Body.Close()
+		defer closeBestEffort(resp.Body)
 		if resp.StatusCode != 200 {
 			return "", fmt.Errorf("release HTTP %d", resp.StatusCode)
 		}
@@ -294,7 +294,7 @@ func copyFile(src, dst string) error {
 	if e != nil {
 		return e
 	}
-	defer f.Close()
+	defer closeBestEffort(f)
 	return writeStream(dst, f)
 }
 func cacheNode(ctx context.Context, a []string) error {
@@ -314,11 +314,11 @@ func cacheNode(ctx context.Context, a []string) error {
 		return json.NewEncoder(os.Stdout).Encode(fields{"path": p, "hash": sum})
 	case "cache-install":
 		if len(a) == 4 {
-			if sum, e := fileHash(p); e == nil && sum == a[3] {
+			if sum, hashErr := fileHash(p); hashErr == nil && sum == a[3] {
 				return nil
 			}
-			sum, e := fileHash(p + ".part")
-			if e != nil || sum != a[3] {
+			sum, stagedHashErr := fileHash(p + ".part")
+			if stagedHashErr != nil || sum != a[3] {
 				return errors.New("relay cache hash mismatch")
 			}
 			return os.Rename(p+".part", p)
@@ -393,9 +393,9 @@ func deployOnce(ctx context.Context, hs endpoints, name string, setup bool) erro
 			if !setup {
 				return nil
 			}
-			r, e := h.call(ctx, 10*time.Second, "init-host")
-			if e != nil {
-				return e
+			r, initErr := h.call(ctx, 10*time.Second, "init-host")
+			if initErr != nil {
+				return initErr
 			}
 			return r.output()
 		}
@@ -410,8 +410,8 @@ func deployOnce(ctx context.Context, hs endpoints, name string, setup bool) erro
 	}
 	if src == "" {
 		if _, moduleErr := moduleDir(); moduleErr == nil {
-			if handled, e := deployFromCenter(ctx, h, plat); handled || e != nil {
-				return e
+			if handled, deployErr := deployFromCenter(ctx, h, plat); handled || deployErr != nil {
+				return deployErr
 			}
 		}
 		src, e = cacheArtifact(ctx, version, plat, release)
@@ -421,9 +421,9 @@ func deployOnce(ctx context.Context, hs endpoints, name string, setup bool) erro
 	}
 	if h.Via == "" {
 		if h.SSH != "" && strings.HasPrefix(plat, "linux/") && os.Getenv("CX_SETUP_BINARY") == "" {
-			digest, e := fileHash(src)
-			if e != nil {
-				return e
+			digest, hashErr := fileHash(src)
+			if hashErr != nil {
+				return hashErr
 			}
 			if got.code == 0 && strings.TrimSpace(string(got.data)) != digest {
 				return deltaInstall(ctx, h, src, digest)

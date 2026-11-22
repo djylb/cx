@@ -48,13 +48,13 @@ func projected(ctx context.Context, dir string, s *status) error {
 	if err != nil {
 		return err
 	}
-	defer g.Close()
+	defer closeBestEffort(g)
 	f, err := lockPath(filepath.Join(dir, "owner.lock"), 0)
 	if err != nil {
 		return err
 	}
 	if f != nil {
-		defer f.Close()
+		defer closeBestEffort(f)
 	}
 	*s = status{}
 	if err = readJSON(path, s); err != nil || f == nil || isTerminal(s.State) {

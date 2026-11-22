@@ -8,10 +8,12 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -19,18 +21,19 @@ import (
 )
 
 type ctlOptions struct {
-	env                                                       map[string]string
-	cleanBase, all, explicitSession                           bool
-	project, session, tag, cwd, dir, host                     string
-	hosts, channels, sets, argv, pos                          []string
-	engine, model, effort, sandbox, role, parent              string
-	batch, snapshot, history, previous, input, image, profile string
-	quiet, timeout, idle, turnLimit, approval, stall, queue   string
-	turn, cursor, since, kind, mention, repo, script, shell   string
-	full, json, watch, any, wait, raw, refresh                bool
-	inplace, interactive, web, hard, network, noNetwork       bool
-	command, reuse, sync, force, noTools                      bool
-	max                                                       int
+	env                                                        map[string]string
+	project, session, tag, cwd, dir, host                      string
+	engine, model, effort, sandbox, role, parent               string
+	batch, snapshot, history, previous, input, image, profile  string
+	quiet, timeout, idle, turnLimit, approval, stall, queue    string
+	turn, cursor, since, kind, mention, repo, script, shell    string
+	hosts, channels, sets, argv, pos                           []string
+	interval                                                   time.Duration
+	max                                                        int
+	cleanBase, all, explicitSession                            bool
+	full, json, log, watch, any, wait, raw, refresh, fromStart bool
+	inplace, interactive, web, hard, network, noNetwork        bool
+	command, reuse, sync, force, noTools                       bool
 }
 
 func ctlFlags(op string, o *ctlOptions) *flag.FlagSet {
@@ -42,8 +45,8 @@ func ctlFlags(op string, o *ctlOptions) *flag.FlagSet {
 		"inplace": &o.inplace, "interactive": &o.interactive, "web-search": &o.web,
 		"hard": &o.hard, "network": &o.network, "no-network": &o.noNetwork,
 		"force": &o.force, "sync": &o.sync, "no-tools": &o.noTools,
-		"full": &o.full, "json": &o.json, "watch": &o.watch,
-		"any": &o.any, "wait": &o.wait, "raw": &o.raw,
+		"full": &o.full, "json": &o.json, "log": &o.log, "watch": &o.watch,
+		"any": &o.any, "wait": &o.wait, "raw": &o.raw, "from-start": &o.fromStart,
 	}
 	stringsByName := map[string]*string{
 		"type": &o.kind, "mention": &o.mention, "repo": &o.repo,
@@ -72,6 +75,19 @@ func ctlFlags(op string, o *ctlOptions) *flag.FlagSet {
 		switch k {
 		case "max-bytes":
 			f.IntVar(&o.max, k, defaultPreviewBytes, "preview budget in bytes")
+		case "all-hosts":
+			f.Bool(k, false, ctlFlagHelp(op, k))
+		case "interval":
+			o.interval = time.Second
+			f.Func(k, ctlFlagHelp(op, k), func(v string) error {
+				seconds, err := strconv.ParseFloat(v, 64)
+				nanos := seconds * float64(time.Second)
+				if err != nil || !(nanos >= 1 && nanos < float64(math.MaxInt64)) {
+					return errors.New("interval must be positive and fit in a duration")
+				}
+				o.interval = time.Duration(nanos)
+				return nil
+			})
 		case "host":
 			if op == "agent" {
 				f.StringVar(&o.host, k, "auto", "execution host (auto uses CX_DEFAULT_HOST, project configuration, or local)")
@@ -124,9 +140,15 @@ func parseCtl(op string, args []string) (ctlOptions, error) {
 		if opt == nil {
 			return o, fmt.Errorf("unknown flag %s", v)
 		}
-		if key == "with-history" && !assigned && (i+1 == len(args) || strings.HasPrefix(args[i+1], "-")) {
-			flags = append(flags, "--with-history=HEAD")
-			continue
+		if key == "with-history" && !assigned {
+			next := ""
+			if i+1 < len(args) {
+				next = args[i+1]
+			}
+			if next != "HEAD" && (strings.HasPrefix(next, "-") || !strings.HasSuffix(next, "..HEAD")) {
+				flags = append(flags, "--with-history=HEAD")
+				continue
+			}
 		}
 		flags = append(flags, v)
 		if _, ok := opt.Value.(interface{ IsBoolFlag() bool }); !ok && !assigned {
@@ -135,7 +157,7 @@ func parseCtl(op string, args []string) (ctlOptions, error) {
 				return o, fmt.Errorf("%s needs a value", v)
 			}
 			flags = append(flags, args[i])
-			if key == "chat" || key == "env" {
+			if key == "chat" || key == "env" || key == "host" && op == "wait" {
 				for i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
 					i++
 					flags = append(flags, "--"+key, args[i])
@@ -154,6 +176,12 @@ func parseCtl(op string, args []string) (ctlOptions, error) {
 	})
 	if o.all && o.explicitSession {
 		return o, errors.New("--all and --session are mutually exclusive")
+	}
+	if o.fromStart && o.since != "" {
+		return o, errors.New("--from-start and --since are mutually exclusive")
+	}
+	if op == "result" && (o.json && o.log || o.full && (o.json || o.log)) {
+		return o, errors.New("--full, --json and --log are mutually exclusive")
 	}
 	if o.max < 0 {
 		return o, errors.New("negative output budget")
@@ -339,8 +367,8 @@ func controller(ctx context.Context, a []string) error {
 			}
 		}
 		started := time.Now()
-		if handled, e := observeSubmission(ctx, name, id, op, d); handled || e != nil {
-			return e
+		if handled, observeErr := observeSubmission(ctx, name, id, op, d); handled || observeErr != nil {
+			return observeErr
 		}
 		if op == "wait" || op == "tail" {
 			remaining := d - time.Since(started)
@@ -358,9 +386,9 @@ func controller(ctx context.Context, a []string) error {
 	case "setup":
 		return retryTransfer(ctx, func() error { return deployOnce(ctx, hs, name, true) })
 	case "host":
-		r, e := h.call(ctx, 30*time.Second, append([]string{"host-config"}, o.sets...)...)
-		if e != nil {
-			return e
+		r, callErr := h.call(ctx, 30*time.Second, append([]string{"host-config"}, o.sets...)...)
+		if callErr != nil {
+			return callErr
 		}
 		return r.output()
 	case "exec":
@@ -395,9 +423,9 @@ func controller(ctx context.Context, a []string) error {
 					return e
 				}
 			}
-			found, e := lookupReuse(ctx, h, q)
-			if e != nil || found {
-				return e
+			found, reuseErr := lookupReuse(ctx, h, q)
+			if reuseErr != nil || found {
+				return reuseErr
 			}
 		}
 		args := []string{"submit-command", id, o.cwd}
@@ -441,7 +469,9 @@ func controller(ctx context.Context, a []string) error {
 		if e = rememberRoute(id, name); e != nil {
 			return e
 		}
-		fmt.Fprintln(dst, id)
+		if _, e = fmt.Fprintln(dst, id); e != nil {
+			return e
+		}
 		if !o.wait {
 			return nil
 		}

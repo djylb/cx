@@ -36,7 +36,7 @@ func hostSettings(ctx context.Context, root string, sets []string, init bool) er
 	if e != nil {
 		return e
 	}
-	defer lock.Close()
+	defer closeBestEffort(lock)
 	dst := filepath.Join(root, hostConfigName)
 	h, e := readHostConfig(root)
 	if e != nil {
@@ -78,9 +78,9 @@ func hostSettings(ctx context.Context, root string, sets []string, init bool) er
 		case k == "load_cmd" || k == "psmux" || k == "mux_socket" || k == "env_file" || k == "default_profile":
 			obj[k] = v
 		case k == "cache_max_bytes" || k == "min_free_bytes":
-			n, e := strconv.ParseUint(v, 10, 64)
-			if e != nil {
-				return fmt.Errorf("invalid %s: %w", k, e)
+			n, parseErr := strconv.ParseUint(v, 10, 64)
+			if parseErr != nil {
+				return fmt.Errorf("invalid %s: %w", k, parseErr)
 			}
 			obj[k] = n
 		case k == "slots":
@@ -90,9 +90,9 @@ func hostSettings(ctx context.Context, root string, sets []string, init bool) er
 			}
 			obj[k] = slots
 		case strings.HasPrefix(k, "slots."):
-			n, e := strconv.Atoi(v)
-			if e != nil {
-				return e
+			n, parseErr := strconv.Atoi(v)
+			if parseErr != nil {
+				return parseErr
 			}
 			slots[k[6:]] = n
 			obj["slots"] = slots
@@ -122,8 +122,9 @@ func doctorNode(ctx context.Context, root string) error {
 	f := hostFacts(ctx, root)
 	mux := "tmux"
 	if runtime.GOOS == "windows" {
-		mux = psmuxProgram()
-		f["psmux_session"] = probe(ctx, psmuxProgram(), "-L", muxSocket(), "list-sessions") != ""
+		var socket string
+		mux, socket = psmuxSettings(root)
+		f["psmux_session"] = probe(ctx, mux, "-L", socket, "list-sessions") != ""
 	}
 	for _, tool := range []string{"git", "ssh", mux, "codex", "claude"} {
 		p, _ := exec.LookPath(tool)
@@ -202,9 +203,9 @@ func nodeControl(ctx context.Context, a []string) error {
 			if e != nil {
 				return e
 			}
-			ctx, stop := context.WithTimeout(ctx, limit)
+			streamCtx, stop := context.WithTimeout(ctx, limit)
 			defer stop()
-			return streamLog(ctx, dir, pos)
+			return streamLog(streamCtx, dir, pos)
 		}
 	case "observe-one":
 		if len(a) == 3 {
@@ -216,9 +217,9 @@ func nodeControl(ctx context.Context, a []string) error {
 			if e != nil {
 				return e
 			}
-			ctx, stop := context.WithTimeout(ctx, limit)
+			waitCtx, stop := context.WithTimeout(ctx, limit)
 			defer stop()
-			s, err := waitJob(ctx, dir)
+			s, err := waitJob(waitCtx, dir)
 			if err == nil || errors.As(err, new(stateFailure)) || errors.Is(err, errStalled) {
 				if e = json.NewEncoder(os.Stdout).Encode(s); e != nil {
 					return e
@@ -280,7 +281,7 @@ func nodeControl(ctx context.Context, a []string) error {
 			if e != nil {
 				return e
 			}
-			defer lock.Close()
+			defer closeBestEffort(lock)
 			return submitNodeCommand(ctx, root, a)
 		}
 	case "wait-poll":
@@ -293,15 +294,15 @@ func nodeControl(ctx context.Context, a []string) error {
 			if e != nil {
 				return e
 			}
-			defer os.Remove(tmp.Name())
+			defer removeBestEffort(tmp.Name())
 			_, e = tmp.WriteString(a[3])
 			if e = errors.Join(e, tmp.Close()); e != nil {
 				return e
 			}
-			ctx, cancel := context.WithTimeout(ctx, limit)
+			callCtx, cancel := context.WithTimeout(ctx, limit)
 			defer cancel()
 			var b bytes.Buffer
-			e = waitAny(ctx, root, a[1], a[2], tmp.Name(), &b)
+			e = waitAny(callCtx, root, a[1], a[2], tmp.Name(), &b)
 			if e != nil && !errors.Is(e, errQuestion) {
 				return e
 			}
@@ -329,13 +330,6 @@ func checkSubmission(dir string, want config, profile string, args []string) err
 	}
 	return nil
 }
-func muxSocket() string {
-	if v := os.Getenv("CXRUN_TMUX_SOCKET"); v != "" {
-		return v
-	}
-	return "cx"
-}
-
 func launchMuxCommand(ctx context.Context, root, p, j, runID string) error {
 	exe, e := os.Executable()
 	if e != nil {
@@ -343,7 +337,8 @@ func launchMuxCommand(ctx context.Context, root, p, j, runID string) error {
 	}
 	ctx, cancel := context.WithTimeout(ctx, 8*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, psmuxProgram(), "-L", muxSocket(), "new-session", "-d", "-s", "cx-"+runID, "--", exe, "_command", "--state", root, "--project", p, "--job", j)
+	program, socket := psmuxSettings(root)
+	cmd := exec.CommandContext(ctx, program, "-L", socket, "new-session", "-d", "-s", "cx-"+runID, "--", exe, "_command", "--state", root, "--project", p, "--job", j)
 	cmd.Stderr = os.Stderr
 	err := cmd.Run()
 	return errors.Join(err, ctx.Err())

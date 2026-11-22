@@ -20,9 +20,9 @@ import (
 )
 
 type turnPatch struct {
-	SnapshotPatch
-	Source string `json:"source,omitempty"`
 	*ResultBase
+	Source string `json:"source,omitempty"`
+	SnapshotPatch
 }
 
 type ResultBase struct {
@@ -31,12 +31,13 @@ type ResultBase struct {
 }
 
 type turnResult struct {
-	Repositories []turnPatch           `json:"repositories"`
-	Artifacts    []SnapshotArtifact    `json:"artifacts"`
+	*ResultDetails
 	Bases        map[string]ResultBase `json:"bases"`
-	Turn         int64                 `json:"turn"`
 	TurnID       string                `json:"turn_id"`
 	Outcome      string                `json:"outcome,omitempty"`
+	Repositories []turnPatch           `json:"repositories"`
+	Artifacts    []SnapshotArtifact    `json:"artifacts"`
+	Turn         int64                 `json:"turn"`
 }
 
 func readyResult(s status) bool {
@@ -62,7 +63,7 @@ func sealTurn(ctx context.Context, dir string, s status, n int64) (string, error
 	if e != nil {
 		return "", e
 	}
-	defer lock.Close()
+	defer closeBestEffort(lock)
 	if _, e = os.Stat(filepath.Join(folder, "result.json")); e == nil {
 		return folder, nil
 	} else if !os.IsNotExist(e) {
@@ -83,7 +84,7 @@ func sealTurn(ctx context.Context, dir string, s status, n int64) (string, error
 	} else if os.IsNotExist(e) {
 		result.Dir, e = os.MkdirTemp(work, ".seal-")
 		if e == nil {
-			defer os.RemoveAll(result.Dir)
+			defer removeTreeBestEffort(result.Dir)
 			var c config
 			if e = readJSON(filepath.Join(dir, "config.json"), &c); e == nil && c.Dir != "" {
 				e = copySnapshotArtifacts(filepath.Join(c.Dir, "artifacts"), &result)
@@ -95,7 +96,7 @@ func sealTurn(ctx context.Context, dir string, s status, n int64) (string, error
 	if e != nil {
 		return "", e
 	}
-	defer os.RemoveAll(result.Dir)
+	defer removeTreeBestEffort(result.Dir)
 	if e = copyFile(filepath.Join(dir, "last.md"), filepath.Join(result.Dir, "last.md")); e != nil {
 		if !os.IsNotExist(e) || s.Finished > 0 {
 			return "", e
@@ -125,7 +126,7 @@ func sealTurn(ctx context.Context, dir string, s status, n int64) (string, error
 				if v, ok := meta.Bases[r.Path]; ok {
 					provenance = &v
 				}
-				meta.Repositories = append(meta.Repositories, turnPatch{r, req.Sources[r.Path], provenance})
+				meta.Repositories = append(meta.Repositories, turnPatch{SnapshotPatch: r, Source: req.Sources[r.Path], ResultBase: provenance})
 			}
 		} else if !os.IsNotExist(err) {
 			return "", err
@@ -147,7 +148,7 @@ func sealTurn(ctx context.Context, dir string, s status, n int64) (string, error
 		return "", e
 	}
 	currentReport, e := os.ReadFile(filepath.Join(dir, "last.md"))
-	if e != nil && !(os.IsNotExist(e) && s.Finished == 0) {
+	if e != nil && (!os.IsNotExist(e) || s.Finished != 0) {
 		return "", e
 	}
 	if !bytes.Equal(beforeReport, currentReport) {
@@ -162,19 +163,36 @@ func sealTurn(ctx context.Context, dir string, s status, n int64) (string, error
 	return folder, nil
 }
 
-func resultArchive(folder string) (string, error) {
-	path := folder + ".tar.gz"
+func resultArchive(ctx context.Context, folder, dir string, s status, details bool) (string, error) {
+	path := resultVariant(folder, details) + ".tar.gz"
 	if _, e := os.Stat(path); e == nil {
 		return path, nil
+	}
+	var extra string
+	var progress receiveProgress
+	if details {
+		var e error
+		extra, e = os.MkdirTemp(filepath.Dir(folder), ".result-details-")
+		if e != nil {
+			return "", e
+		}
+		defer removeTreeBestEffort(extra)
+		if e = stageResultDetails(ctx, dir, folder, extra, s, &progress); e != nil {
+			return "", e
+		}
 	}
 	f, e := os.CreateTemp(filepath.Dir(path), ".archive-")
 	if e != nil {
 		return "", e
 	}
-	defer os.Remove(f.Name())
+	defer removeBestEffort(f.Name())
 	z := gzip.NewWriter(f)
 	w := tar.NewWriter(z)
-	e = filepath.WalkDir(folder, func(p string, d fs.DirEntry, e error) error {
+	var payload io.Writer = w
+	if details {
+		payload = io.MultiWriter(w, &progress)
+	}
+	add := func(root, p string, d fs.DirEntry, e error) error {
 		if e != nil || d.IsDir() {
 			return e
 		}
@@ -185,7 +203,7 @@ func resultArchive(folder string) (string, error) {
 		if e != nil {
 			return e
 		}
-		rel, e := filepath.Rel(folder, p)
+		rel, e := filepath.Rel(root, p)
 		if e != nil {
 			return e
 		}
@@ -196,10 +214,22 @@ func resultArchive(folder string) (string, error) {
 		if e != nil {
 			return e
 		}
-		defer in.Close()
-		_, e = io.Copy(w, in)
+		defer closeBestEffort(in)
+		_, e = io.Copy(payload, in)
 		return e
+	}
+	manifestPath := filepath.Join(folder, "result.json")
+	e = filepath.WalkDir(folder, func(p string, d fs.DirEntry, walkErr error) error {
+		if details && p == manifestPath {
+			return walkErr
+		}
+		return add(folder, p, d, walkErr)
 	})
+	if e == nil && details {
+		e = filepath.WalkDir(extra, func(p string, d fs.DirEntry, walkErr error) error {
+			return add(extra, p, d, walkErr)
+		})
+	}
 	if e = errors.Join(e, w.Close(), z.Close(), f.Close()); e != nil {
 		return "", e
 	}
@@ -209,8 +239,9 @@ func resultArchive(folder string) (string, error) {
 	return path, nil
 }
 func nodeResult(ctx context.Context, a []string) error {
-	if len(a) != 4 {
-		return errors.New("result-download JOB GENERATION TURN OFFSET")
+	details, e := resultDetailsArg(a)
+	if e != nil {
+		return e
 	}
 	n, e := strconv.ParseInt(a[2], 10, 64)
 	if e != nil || n < 0 {
@@ -239,7 +270,7 @@ func nodeResult(ctx context.Context, a []string) error {
 	if e != nil {
 		return e
 	}
-	archive, e := resultArchive(folder)
+	archive, e := resultArchive(ctx, folder, dir, s, details)
 	if e != nil {
 		return e
 	}
@@ -247,7 +278,7 @@ func nodeResult(ctx context.Context, a []string) error {
 	if e != nil {
 		return e
 	}
-	defer f.Close()
+	defer closeBestEffort(f)
 	st, e := f.Stat()
 	if e != nil {
 		return e
@@ -259,7 +290,9 @@ func nodeResult(ctx context.Context, a []string) error {
 	if e != nil {
 		return e
 	}
-	fmt.Fprintln(os.Stdout, st.Size())
+	if _, e = fmt.Fprintln(os.Stdout, st.Size()); e != nil {
+		return e
+	}
 	_, e = io.Copy(os.Stdout, f)
 	return e
 }
@@ -268,40 +301,40 @@ func unpackTurn(archive, dest string) error {
 	if e != nil {
 		return e
 	}
-	defer f.Close()
+	defer closeBestEffort(f)
 	z, e := gzip.NewReader(f)
 	if e != nil {
 		return e
 	}
-	defer z.Close()
+	defer closeBestEffort(z)
 	r := tar.NewReader(z)
 	tmp, e := os.MkdirTemp(filepath.Dir(dest), ".unpack-")
 	if e != nil {
 		return e
 	}
-	defer os.RemoveAll(tmp)
+	defer removeTreeBestEffort(tmp)
 	for {
-		h, e := r.Next()
-		if e == io.EOF {
+		h, unpackErr := r.Next()
+		if unpackErr == io.EOF {
 			break
 		}
-		if e != nil {
-			return e
+		if unpackErr != nil {
+			return unpackErr
 		}
 		if h.Typeflag != tar.TypeReg || !snapPath(h.Name) {
 			return errors.New("invalid result archive entry")
 		}
 		p := filepath.Join(tmp, h.Name)
-		if e = os.MkdirAll(filepath.Dir(p), 0700); e != nil {
-			return e
+		if unpackErr = os.MkdirAll(filepath.Dir(p), 0700); unpackErr != nil {
+			return unpackErr
 		}
-		out, e := os.OpenFile(p, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
-		if e != nil {
-			return e
+		out, unpackErr := os.OpenFile(p, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+		if unpackErr != nil {
+			return unpackErr
 		}
-		_, e = io.Copy(out, r)
-		if e = errors.Join(e, out.Close()); e != nil {
-			return e
+		_, unpackErr = io.Copy(out, r)
+		if unpackErr = errors.Join(unpackErr, out.Close()); unpackErr != nil {
+			return unpackErr
 		}
 	}
 	if _, e = io.Copy(io.Discard, z); e != nil {
@@ -324,14 +357,14 @@ func unpackTurn(archive, dest string) error {
 	return os.Rename(tmp, dest)
 }
 
-func fetchTurn(ctx context.Context, h endpoint, id, gen, turn, dest string) error {
+func fetchTurn(ctx context.Context, h endpoint, id, gen, turn, dest string, details bool) error {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Minute)
 	defer cancel()
 	lock, e := transferLock(ctx, dest+".lock")
 	if e != nil {
 		return e
 	}
-	defer lock.Close()
+	defer closeBestEffort(lock)
 	if _, e = os.Stat(filepath.Join(dest, "result.json")); e == nil {
 		return nil
 	}
@@ -340,7 +373,7 @@ func fetchTurn(ctx context.Context, h endpoint, id, gen, turn, dest string) erro
 	if e != nil {
 		return e
 	}
-	defer f.Close()
+	defer closeBestEffort(f)
 	st, e := f.Stat()
 	if e != nil {
 		return e
@@ -351,7 +384,11 @@ func fetchTurn(ctx context.Context, h endpoint, id, gen, turn, dest string) erro
 	}
 	attempt, stop := context.WithCancel(ctx)
 	defer stop()
-	cmd, e := h.command(attempt, []string{"result-download", id, gen, turn, strconv.FormatInt(st.Size(), 10)})
+	args := []string{"result-download", id, gen, turn, strconv.FormatInt(st.Size(), 10)}
+	if details {
+		args = append(args, "details")
+	}
+	cmd, e := h.command(attempt, args)
 	if e != nil {
 		return e
 	}
@@ -375,7 +412,7 @@ func fetchTurn(ctx context.Context, h endpoint, id, gen, turn, dest string) erro
 		return e
 	}
 	if e = unpackTurn(partial, dest); e != nil {
-		os.Remove(partial)
+		_ = os.Remove(partial)
 		return e
 	}
 	return os.Remove(partial)
@@ -411,9 +448,10 @@ func resultDest(host, id, gen, turn string) (string, error) {
 	return filepath.Join(p, "turn-"+turn), nil
 }
 func ctlResult(ctx context.Context, host, id, op string, o ctlOptions) error {
+	details := o.json || o.log
 	if op == "result" || op == "patch" {
 		if !o.refresh {
-			cached, e := cachedResultDir(host, id, o.turn)
+			cached, e := cachedResultDir(host, id, o.turn, details)
 			if e != nil {
 				return e
 			}
@@ -454,32 +492,33 @@ func ctlResult(ctx context.Context, host, id, op string, o ctlOptions) error {
 	if e != nil {
 		return e
 	}
+	dest = resultVariant(dest, details)
 	if op == "result" || op == "agent" || op == "patch" {
-		marker, e := resultMarker(host, id)
-		if e != nil {
-			return e
+		marker, markerErr := resultMarker(host, id)
+		if markerErr != nil {
+			return markerErr
 		}
-		if e = writeJSON(marker, resultReference{s.RunID, s.Finished}); e != nil {
-			return e
+		if markerErr = writeJSON(marker, resultReference{s.RunID, s.Finished}); markerErr != nil {
+			return markerErr
 		}
 	}
 	if _, e = os.Stat(filepath.Join(dest, "result.json")); os.IsNotExist(e) {
 		if n > s.Finished || (n == s.Finished && !readyResult(s) && n == 0) {
 			return ctlExit(44)
 		}
-		if op == "result" && !o.wait && s.CompletedStatus != "failed" {
+		if op == "result" && !o.wait && (details || s.CompletedStatus != "failed") {
 			if !o.refresh {
 				var failure fetchFailure
-				if e = readJSON(dest+".error", &failure); e == nil && failure.Code != 9 && !(failure.Code == 44 && readyResult(s)) {
+				if e = readJSON(dest+".error", &failure); e == nil && failure.Code != 9 && (failure.Code != 44 || !readyResult(s)) {
 					fmt.Fprintln(os.Stderr, failure.Message)
 					return ctlExit(failure.Code)
 				}
 			}
-			return backgroundFetch(ctx, host, id, s.RunID, turn, dest)
+			return backgroundFetch(host, id, s.RunID, turn, dest, details)
 		}
-		if e = fetchTurn(ctx, h, id, s.RunID, turn, dest); e != nil {
+		if e = fetchTurn(ctx, h, id, s.RunID, turn, dest, details); e != nil {
 			if op == "agent" && errors.Is(e, ctlExit(9)) {
-				return backgroundFetch(ctx, host, id, s.RunID, turn, dest)
+				return backgroundFetch(host, id, s.RunID, turn, dest, false)
 			}
 			return e
 		}
@@ -499,8 +538,9 @@ func ctlResult(ctx context.Context, host, id, op string, o ctlOptions) error {
 	return displayTurn(ctx, dest, id, op, o)
 }
 func workerFetch(ctx context.Context, a []string) error {
-	if len(a) != 4 {
-		return errors.New("invalid fetch arguments")
+	details, e := resultDetailsArg(a)
+	if e != nil {
+		return e
 	}
 	n, e := strconv.ParseUint(a[3], 10, 63)
 	if e != nil {
@@ -511,6 +551,7 @@ func workerFetch(ctx context.Context, a []string) error {
 	if e != nil {
 		return e
 	}
+	dest = resultVariant(dest, details)
 	hs, e := loadEndpoints()
 	if e != nil {
 		return e
@@ -525,12 +566,12 @@ func workerFetch(ctx context.Context, a []string) error {
 	if e != nil || l == nil {
 		return e
 	}
-	defer l.Close()
-	e = retryTransfer(ctx, func() error { return fetchTurn(ctx, h, a[1], a[2], t, dest) })
+	defer closeBestEffort(l)
+	e = retryTransfer(ctx, func() error { return fetchTurn(ctx, h, a[1], a[2], t, dest, details) })
 	if e != nil {
 		code := ctlExit(1)
 		errors.As(e, &code)
-		return errors.Join(e, writeJSON(dest+".error", fetchFailure{int(code), e.Error()}))
+		return errors.Join(e, writeJSON(dest+".error", fetchFailure{Code: int(code), Message: e.Error()}))
 	}
 	if err := os.Remove(dest + ".error"); err != nil && !os.IsNotExist(err) {
 		return err
@@ -538,6 +579,9 @@ func workerFetch(ctx context.Context, a []string) error {
 	return nil
 }
 func displayTurn(ctx context.Context, dir, id, op string, o ctlOptions) error {
+	if o.json || o.log {
+		return displayResultDetails(os.Stdout, dir, id, o.log)
+	}
 	if op == "result" || op == "patch" && !o.full {
 		var b bytes.Buffer
 		e := writeTurn(ctx, &b, dir, id, op, o)
@@ -566,7 +610,9 @@ func writeTurn(ctx context.Context, out io.Writer, dir, id, op string, o ctlOpti
 		for _, row := range rows {
 			p := filepath.Join(dir, row.Patch)
 			if o.repo == "" {
-				fmt.Fprintf(out, "# repo: %s\n", row.Path)
+				if _, e := fmt.Fprintf(out, "# repo: %s\n", row.Path); e != nil {
+					return e
+				}
 			}
 			if o.full {
 				b, e := os.ReadFile(p)
@@ -619,14 +665,14 @@ func writeTurn(ctx context.Context, out io.Writer, dir, id, op string, o ctlOpti
 		}
 	}
 	if op != "agent" {
-		fmt.Fprintln(out, p)
+		_, _ = fmt.Fprintln(out, p)
 	}
-	fmt.Fprintln(out, strings.TrimSuffix(report, "\n"))
+	_, _ = fmt.Fprintln(out, strings.TrimSuffix(report, "\n"))
 	if op == "agent" {
-		fmt.Fprintln(out, p)
+		_, _ = fmt.Fprintln(out, p)
 	}
 	for _, a := range m.Artifacts {
-		fmt.Fprintf(out, "%s (%d bytes)\n", filepath.Join(dir, a.Path), a.Bytes)
+		_, _ = fmt.Fprintf(out, "%s (%d bytes)\n", filepath.Join(dir, a.Path), a.Bytes)
 	}
 	if op == "agent" {
 		patch := "none"
@@ -634,18 +680,16 @@ func writeTurn(ctx context.Context, out io.Writer, dir, id, op string, o ctlOpti
 			patch = filepath.Join(dir, "result.json")
 		}
 		first, _, _ := strings.Cut(report, "\n")
-		state := "UNKNOWN"
-		for _, value := range []string{"DONE", "PARTIAL", "BLOCKED", "QUESTION", "FAILED"} {
-			if first == "STATUS: "+value {
-				state = value
-			}
+		state := reportStatus(first)
+		if state == "" {
+			state = "UNKNOWN"
 		}
-		fmt.Fprintf(out, "JOB=%s STATUS=%s patch=%s repos=%d\n", id, state, patch, len(m.Repositories))
+		_, _ = fmt.Fprintf(out, "JOB=%s STATUS=%s patch=%s repos=%d\n", id, state, patch, len(m.Repositories))
 	} else if o.full {
-		fmt.Fprintln(out, filepath.Join(dir, "result.json"))
-		fmt.Fprintf(out, "%d changed repositories\n", len(m.Repositories))
+		_, _ = fmt.Fprintln(out, filepath.Join(dir, "result.json"))
+		_, _ = fmt.Fprintf(out, "%d changed repositories\n", len(m.Repositories))
 		for _, r := range m.Repositories {
-			fmt.Fprintf(out, "%s: %d files changed, %d bytes (%s)\n", r.Path, r.Files, r.Bytes, r.Patch)
+			_, _ = fmt.Fprintf(out, "%s: %d files changed, %d bytes (%s)\n", r.Path, r.Files, r.Bytes, r.Patch)
 		}
 	}
 	if op == "result" && m.Outcome == "failed" {
@@ -663,21 +707,21 @@ func agentReport(ctx context.Context, host string, h endpoint, id string, full b
 		return e
 	}
 	if r.code == 6 {
-		snapshot, e := h.call(ctx, 30*time.Second, "status", "--job", id)
-		if e != nil {
-			return e
+		snapshot, statusErr := h.call(ctx, 30*time.Second, "status", "--job", id)
+		if statusErr != nil {
+			return statusErr
 		}
 		if snapshot.code != 0 {
 			return snapshot.output()
 		}
 		var s status
-		if e = json.Unmarshal(snapshot.data, &s); e != nil {
-			return e
+		if statusErr = json.Unmarshal(snapshot.data, &s); statusErr != nil {
+			return statusErr
 		}
 		if s.InputKind == "server_request" {
 			fmt.Println("STATUS: QUESTION")
-			if e = json.NewEncoder(os.Stdout).Encode(s.Approvals); e != nil {
-				return e
+			if statusErr = json.NewEncoder(os.Stdout).Encode(s.Approvals); statusErr != nil {
+				return statusErr
 			}
 			fmt.Printf("JOB=%s STATUS=QUESTION patch=none repos=0\n", id)
 			return ctlExit(6)
@@ -696,11 +740,11 @@ func agentReport(ctx context.Context, host string, h endpoint, id string, full b
 }
 
 type fetchFailure struct {
-	Code    int
 	Message string
+	Code    int
 }
 
-func backgroundFetch(ctx context.Context, host, id, gen, turn, dest string) error {
+func backgroundFetch(host, id, gen, turn, dest string, details bool) error {
 	lock, e := lockPath(dest+".worker", os.O_CREATE)
 	if e != nil {
 		return e
@@ -708,16 +752,20 @@ func backgroundFetch(ctx context.Context, host, id, gen, turn, dest string) erro
 	if lock != nil {
 		exe, e := os.Executable()
 		if e != nil {
-			lock.Close()
+			_ = lock.Close()
 			return e
 		}
-		cmd := exec.Command(exe, "node", "fetch-turn", host, id, gen, turn)
+		args := []string{"node", "fetch-turn", host, id, gen, turn}
+		if details {
+			args = append(args, "details")
+		}
+		cmd := exec.Command(exe, args...)
 		detachWorker(cmd)
-		lock.Close()
+		_ = lock.Close()
 		if e = cmd.Start(); e != nil {
 			return e
 		}
-		go cmd.Wait()
+		go func() { _ = cmd.Wait() }()
 	}
 	count := int64(0)
 	if st, e := os.Stat(dest + ".part"); e == nil {
@@ -728,7 +776,11 @@ func backgroundFetch(ctx context.Context, host, id, gen, turn, dest string) erro
 	if readJSON(dest+".total", &total) == nil {
 		size = strconv.FormatInt(total, 10)
 	}
-	fmt.Printf("collecting turn=%s bytes=%d/%s\n", turn, count, size)
+	if details {
+		fmt.Fprintf(os.Stderr, "collecting turn=%s bytes=%d/%s\n", turn, count, size)
+	} else {
+		fmt.Printf("collecting turn=%s bytes=%d/%s\n", turn, count, size)
+	}
 	return ctlExit(12)
 }
 
@@ -755,7 +807,7 @@ func forgetResult(host, id string) error {
 	}
 	return e
 }
-func cachedResultDir(host, id, turn string) (string, error) {
+func cachedResultDir(host, id, turn string, details bool) (string, error) {
 	p, e := resultMarker(host, id)
 	if e != nil {
 		return "", e
@@ -777,6 +829,7 @@ func cachedResultDir(host, id, turn string) (string, error) {
 	if e != nil {
 		return "", e
 	}
+	d = resultVariant(d, details)
 	if _, e = os.Stat(filepath.Join(d, "result.json")); os.IsNotExist(e) {
 		return "", nil
 	} else if e != nil {
@@ -789,9 +842,9 @@ func cachedResultDir(host, id, turn string) (string, error) {
 // even when SSH returns an error; the next attempt advertises that exact offset.
 type resultStream struct {
 	file          *os.File
-	offset, total int64
-	header        []byte
 	progress      string
+	header        []byte
+	offset, total int64
 }
 
 func (s *resultStream) Write(b []byte) (int, error) {

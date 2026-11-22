@@ -13,6 +13,10 @@ import (
 )
 
 // The worker has no handles to the submitter's terminal or SSH pipes.
+// processWait carries the outcome for normal exit. After a forced stop,
+// receivers only need to know that the process has been reaped.
+type processWait struct{ err error }
+
 func launchCommand(root, project, job string) (<-chan error, error) {
 	exe, err := os.Executable()
 	if err != nil {
@@ -72,12 +76,12 @@ func (r *runner) serveCommand() (err error) {
 	if err != nil {
 		return err
 	}
-	defer r.log.Close()
+	defer closeBestEffort(r.log)
 	out, err := os.OpenFile(filepath.Join(r.dir, "output.log"), os.O_RDWR|os.O_APPEND, 0600)
 	if err != nil {
 		return err
 	}
-	defer out.Close()
+	defer closeBestEffort(out)
 	defer func() { err = errors.Join(err, saveOutputTail(r.dir, out)) }()
 	if r.c.Shell {
 		cmd = shellCommand(r.c.Argv[0])
@@ -95,8 +99,8 @@ func (r *runner) serveCommand() (err error) {
 	}
 	stopRuntime := r.startRuntime()
 	defer stopRuntime()
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
+	done := make(chan processWait, 1)
+	go func() { done <- processWait{cmd.Wait()} }()
 	var exited bool
 	defer func() {
 		if !exited {
@@ -127,7 +131,8 @@ func (r *runner) serveCommand() (err error) {
 	for {
 		var reason string
 		select {
-		case err = <-done:
+		case waited := <-done:
+			err = waited.err
 			exited = true
 			if cmd.ProcessState == nil {
 				return err

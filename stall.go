@@ -104,10 +104,13 @@ func (r *runner) restartServer() error {
 	old := r.srv
 	_ = old.cmd.Process.Kill()
 	close(old.stop)
-	old.in.Close()
+	_ = old.in.Close()
 	old.tree.cleanup()
-	done := make(chan error, 1)
-	go func() { done <- old.wait() }()
+	done := make(chan struct{})
+	go func() {
+		_ = old.wait() // The old server was killed. Only reap completion matters.
+		close(done)
+	}()
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
@@ -117,7 +120,7 @@ func (r *runner) restartServer() error {
 	r.srv = nil
 	r.s.Approvals = nil
 	r.cmdOpen = map[string]time.Time{}
-	srv, err := openServer(r.c, r.dir)
+	srv, err := openServer(r.c, r.root, r.dir)
 	if err != nil {
 		return err
 	}

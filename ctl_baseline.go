@@ -157,23 +157,23 @@ func rebaseTurn(ctx context.Context, dir, host, id, text string, m turnResult) e
 	if e != nil {
 		return e
 	}
-	defer lock.Close()
+	defer closeBestEffort(lock)
 	var child string
 	for n := 1; ; n++ {
 		suffix := fmt.Sprintf("-r%d", n)
 		child = p + "/" + j[:min(len(j), 96-len(suffix))] + suffix
-		queued, e := submissionDir(host, child)
-		if e != nil {
-			return e
+		queued, queueErr := submissionDir(host, child)
+		if queueErr != nil {
+			return queueErr
 		}
-		if _, e = os.Stat(filepath.Join(queued, "input.json")); e == nil {
+		if _, queueErr = os.Stat(filepath.Join(queued, "input.json")); queueErr == nil {
 			continue
-		} else if !os.IsNotExist(e) {
-			return e
+		} else if !os.IsNotExist(queueErr) {
+			return queueErr
 		}
-		r, e := h.call(ctx, 15*time.Second, "status", "--job", child)
-		if e != nil {
-			return e
+		r, queueErr := h.call(ctx, 15*time.Second, "status", "--job", child)
+		if queueErr != nil {
+			return queueErr
 		}
 		if r.code == 11 {
 			break
@@ -186,10 +186,10 @@ func rebaseTurn(ctx context.Context, dir, host, id, text string, m turnResult) e
 	if e != nil {
 		return e
 	}
-	defer os.Remove(prompt.Name())
+	defer removeBestEffort(prompt.Name())
 	var conflicts []string
 	if e = readJSON(dir+".conflicts.json", &conflicts); e != nil && !os.IsNotExist(e) {
-		prompt.Close()
+		_ = prompt.Close()
 		return e
 	}
 	_, e = fmt.Fprintln(prompt, text+"\n")

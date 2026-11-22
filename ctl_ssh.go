@@ -84,8 +84,8 @@ type progressWriter struct {
 	dst      io.Writer
 	activity chan<- struct{}
 	active   *atomic.Bool
-	stderr   bool
 	tail     string
+	stderr   bool
 }
 
 func (w *progressWriter) Write(p []byte) (int, error) {
@@ -120,14 +120,14 @@ func runActive(cmd *exec.Cmd, cancel context.CancelFunc, connect, idle time.Dura
 	if e := cmd.Start(); e != nil {
 		return e
 	}
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
+	done := make(chan processWait, 1)
+	go func() { done <- processWait{cmd.Wait()} }()
 	timer := time.NewTimer(connect)
 	defer timer.Stop()
 	for {
 		select {
-		case e := <-done:
-			return e
+		case waited := <-done:
+			return waited.err
 		case <-activity:
 			timer.Reset(idle)
 		case <-timer.C:

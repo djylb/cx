@@ -18,8 +18,8 @@ type queuedJob struct {
 	Origin  submissionOrigin
 }
 type submissionProgress struct {
+	Code    *int   `json:"rc"`
 	Phase   string `json:"phase,omitempty"`
-	Bytes   int64  `json:"uploaded_bytes,omitempty"`
 	State   string `json:"status"`
 	Job     string `json:"job"`
 	Project string `json:"project"`
@@ -27,17 +27,21 @@ type submissionProgress struct {
 	Role    string `json:"role"`
 	Host    string `json:"host"`
 	Reason  string `json:"reason"`
-	Code    *int   `json:"rc"`
-	PID     int    `json:"pid"`
 	Log     string `json:"log"`
+	Bytes   int64  `json:"uploaded_bytes,omitempty"`
+	PID     int    `json:"pid"`
 }
 
-func submissionDir(host, id string) (string, error) {
+func submissionRoot(host string) (string, error) {
 	home, e := os.UserHomeDir()
 	if e != nil {
 		return "", e
 	}
-	root, e := jobPath(filepath.Join(home, ".cache", "cx", "submissions"), host)
+	return jobPath(filepath.Join(home, ".cache", "cx", "submissions"), host)
+}
+
+func submissionDir(host, id string) (string, error) {
+	root, e := submissionRoot(host)
 	if e != nil {
 		return "", e
 	}
@@ -113,7 +117,7 @@ func queueJob(ctx context.Context, q queuedJob, sync bool) error {
 	if e != nil {
 		return e
 	}
-	defer l.Close()
+	defer closeBestEffort(l)
 	input := filepath.Join(dir, "input.json")
 	data, e := json.Marshal(q)
 	if e != nil {
@@ -130,44 +134,44 @@ func queueJob(ctx context.Context, q queuedJob, sync bool) error {
 		return e
 	}
 	if worker != nil {
-		worker.Close()
-		exe, e := os.Executable()
-		if e != nil {
-			return e
+		_ = worker.Close()
+		exe, launchErr := os.Executable()
+		if launchErr != nil {
+			return launchErr
 		}
 		logPath := filepath.Join(dir, "submit.log")
-		log, e := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
-		if e != nil {
-			return e
+		log, launchErr := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+		if launchErr != nil {
+			return launchErr
 		}
-		defer log.Close()
+		defer closeBestEffort(log)
 		cmd := exec.Command(exe, "node", "submit-worker", req.Host, req.ID)
 		detachWorker(cmd)
 		cmd.Stderr = log
-		rd, wr, e := os.Pipe()
-		if e != nil {
-			return e
+		rd, wr, launchErr := os.Pipe()
+		if launchErr != nil {
+			return launchErr
 		}
-		defer rd.Close()
+		defer closeBestEffort(rd)
 		cmd.Stdout = wr
-		if e = cmd.Start(); e != nil {
-			wr.Close()
-			return e
+		if launchErr = cmd.Start(); launchErr != nil {
+			_ = wr.Close()
+			return launchErr
 		}
-		wr.Close()
-		go cmd.Wait()
+		_ = wr.Close()
+		go func() { _ = cmd.Wait() }()
 		ack := make(chan error, 1)
 		go func() {
-			line, e := bufio.NewReader(rd).ReadString('\n')
-			if e == nil && line != "ready\n" {
-				e = errors.New("unexpected submission acknowledgement")
+			line, ackErr := bufio.NewReader(rd).ReadString('\n')
+			if ackErr == nil && line != "ready\n" {
+				ackErr = errors.New("unexpected submission acknowledgement")
 			}
-			ack <- e
+			ack <- ackErr
 		}()
 		select {
-		case e = <-ack:
-			if e != nil {
-				return e
+		case launchErr = <-ack:
+			if launchErr != nil {
+				return launchErr
 			}
 		case <-ctx.Done():
 			return ctx.Err()
@@ -190,7 +194,7 @@ func submissionWorker(ctx context.Context, host, id string) (err error) {
 	if e != nil {
 		return e
 	}
-	defer l.Close()
+	defer closeBestEffort(l)
 	var q queuedJob
 	if e = readJSON(filepath.Join(dir, "input.json"), &q); e != nil {
 		return e
@@ -240,6 +244,26 @@ func submissionWorker(ctx context.Context, host, id string) (err error) {
 	}
 	return deployJob(ctx, h, q, func(phase string, n int64) { s.Phase = phase; s.Bytes = n; _ = writeJSON(path, s) })
 }
+func readSubmissionProgress(dir string) (submissionProgress, error) {
+	var s submissionProgress
+	path := filepath.Join(dir, "submission.json")
+	if err := readJSON(path, &s); err != nil || s.State != "submitting" {
+		return s, err
+	}
+	l, err := lockPath(filepath.Join(dir, "worker.lock"), os.O_CREATE)
+	if err != nil || l == nil {
+		return s, err
+	}
+	_ = l.Close()
+	if err = readJSON(path, &s); err == nil && s.State == "submitting" {
+		s.State = "submit_failed"
+		s.Reason = "submission worker stopped before registration"
+		code := 125
+		s.Code = &code
+	}
+	return s, err
+}
+
 func observeSubmission(ctx context.Context, host, id, op string, limit time.Duration) (bool, error) {
 	dir, e := submissionDir(host, id)
 	if e != nil {
@@ -247,8 +271,7 @@ func observeSubmission(ctx context.Context, host, id, op string, limit time.Dura
 	}
 	end := time.Now().Add(limit)
 	for {
-		var s submissionProgress
-		e = readJSON(filepath.Join(dir, "submission.json"), &s)
+		s, e := readSubmissionProgress(dir)
 		if os.IsNotExist(e) {
 			if op == "show" || op == "status" {
 				return legacySubmissionView(host, id)
@@ -260,27 +283,6 @@ func observeSubmission(ctx context.Context, host, id, op string, limit time.Dura
 		}
 		if s.State == "submitted" {
 			return false, nil
-		}
-		if s.State == "submitting" {
-			l, e := lockPath(filepath.Join(dir, "worker.lock"), os.O_CREATE)
-			if e != nil {
-				return false, e
-			}
-			if l != nil {
-				l.Close()
-				if e = readJSON(filepath.Join(dir, "submission.json"), &s); e != nil {
-					return false, e
-				}
-				if s.State == "submitted" {
-					return false, nil
-				}
-				if s.State == "submitting" {
-					s.State = "submit_failed"
-					s.Reason = "submission worker stopped before registration"
-					code := 125
-					s.Code = &code
-				}
-			}
 		}
 		if op == "status" || op == "show" {
 			return true, json.NewEncoder(os.Stdout).Encode(s)
@@ -311,13 +313,13 @@ func legacySubmissionView(host, id string) (bool, error) {
 		return false, e
 	}
 	var row struct {
+		Code                              *int `json:"submit_rc"`
 		Host, Project, Tag, Session, Role string
 		State                             string `json:"submit_status"`
 		Reason                            string `json:"submit_reason"`
-		Code                              *int   `json:"submit_rc"`
-		PID                               int    `json:"submit_pid"`
 		Log                               string `json:"submit_log"`
 		Token                             string `json:"submit_token"`
+		PID                               int    `json:"submit_pid"`
 	}
 	if e = readJSON(path, &row); os.IsNotExist(e) {
 		return false, nil

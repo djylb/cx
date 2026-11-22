@@ -8,6 +8,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -46,33 +47,33 @@ const (
 const dangerFullAccess = "danger-full-access"
 
 type config struct {
-	localEnv                            []string
 	secret                              *secretFilter
 	Env                                 map[string]string `json:"env,omitempty"`
-	JobTools                            bool              `json:"job_tools,omitempty"`
 	Engine                              string            `json:"engine,omitempty"`
-	WebSearch                           bool              `json:"web_search,omitempty"`
-	Interactive                         bool              `json:"interactive,omitempty"`
-	Input                               []json.RawMessage `json:"input,omitempty"`
 	ForkThread                          string            `json:"fork_thread,omitempty"`
 	Through                             string            `json:"through,omitempty"`
 	RunID                               string            `json:"run_id,omitempty"`
-	RestartLimit                        int               `json:"restart_limit"`
-	CmdStall                            time.Duration     `json:"cmd_stall"`
-	Argv                                []string          `json:"argv,omitempty"`
-	Shell                               bool              `json:"cmd_shell,omitempty"`
 	SlotClass                           string            `json:"slot_class,omitempty"`
-	QueueTimeout                        time.Duration     `json:"queue_timeout,omitempty"`
-	Timeout                             time.Duration     `json:"timeout,omitempty"`
-	Quiet                               time.Duration     `json:"quiet_timeout,omitempty"`
 	Project                             string            `json:"project,omitempty"`
 	Session                             string            `json:"session,omitempty"`
 	DedupKey                            string            `json:"dedup_key,omitempty"`
 	StallNudge                          string            `json:"stall_nudge,omitempty"`
 	Dir, Model, Effort, Sandbox, Prompt string
-	Network                             bool
-	Roots                               []string `json:"roots,omitempty"` // extra writable roots (workspace-write), e.g. a Go build cache
+	localEnv                            []string
+	Input                               []json.RawMessage `json:"input,omitempty"`
+	Argv                                []string          `json:"argv,omitempty"`
+	Roots                               []string          `json:"roots,omitempty"` // extra writable roots (workspace-write), e.g. a Go build cache
+	RestartLimit                        int               `json:"restart_limit"`
+	CmdStall                            time.Duration     `json:"cmd_stall"`
+	QueueTimeout                        time.Duration     `json:"queue_timeout,omitempty"`
+	Timeout                             time.Duration     `json:"timeout,omitempty"`
+	Quiet                               time.Duration     `json:"quiet_timeout,omitempty"`
 	Idle, Approval, TurnLimit, Stall    time.Duration
+	JobTools                            bool `json:"job_tools,omitempty"`
+	WebSearch                           bool `json:"web_search,omitempty"`
+	Interactive                         bool `json:"interactive,omitempty"`
+	Shell                               bool `json:"cmd_shell,omitempty"`
+	Network                             bool
 }
 
 func (c config) privileged() bool {
@@ -80,44 +81,55 @@ func (c config) privileged() bool {
 }
 
 type status struct {
-	Profile         string          `json:"profile,omitempty"`
-	OutboxSeq       uint64          `json:"outbox_seq,omitempty"`
-	Generation      uint64          `json:"generation,omitempty"`
-	InputKind       string          `json:"input_kind,omitempty"`
-	ReviewThread    string          `json:"review_thread_id,omitempty"`
-	ReviewTurn      string          `json:"review_turn_id,omitempty"`
-	CompactOp       string          `json:"compact_op,omitempty"`
-	CompactAfter    int64           `json:"compact_after_seq,omitempty"`
-	CompactSeq      int64           `json:"compact_event_seq,omitempty"`
-	Privileged      bool            `json:"privileged,omitempty"`
-	RunnerStart     uint64          `json:"runner_start,omitempty"`
-	RunID           string          `json:"run_id,omitempty"`
-	Restarts        int             `json:"restarts,omitempty"`
-	Engine          string          `json:"engine,omitempty"`
-	ExitCode        *int64          `json:"exit_code,omitempty"`
-	CommandPID      int             `json:"command_pid,omitempty"`
-	Project         string          `json:"project,omitempty"`
-	Session         string          `json:"session,omitempty"`
-	Job             string          `json:"job"`
-	State           string          `json:"status"`
-	QueueReason     string          `json:"queue_reason,omitempty"`
-	PID             int             `json:"pid,omitempty"`
-	ServerPID       int             `json:"server_pid,omitempty"`
-	Thread          string          `json:"thread_id"`
-	Turn            string          `json:"turn_id"`
-	TurnStatus      string          `json:"turn_status"`
-	Finished        int64           `json:"completed_turns"`
-	LastCompleted   string          `json:"last_completed_turn_id,omitempty"`
-	CompletedStatus string          `json:"last_completed_status,omitempty"`
-	LastEvent       time.Time       `json:"last_event_time"`
-	Usage           json.RawMessage `json:"token_usage"`
-	Approvals       []approval      `json:"pending_requests,omitempty"`
-	Error           string          `json:"error,omitempty"`
-	StallCount      int             `json:"stall_count,omitempty"`
-	LastAction      string          `json:"last_action,omitempty"`
-	turnSummary
+	LastEvent time.Time `json:"last_event_time"`
+	ExitCode  *int64    `json:"exit_code,omitempty"`
 	rateLimitStatus
+	turnSummary
+
+	Project     string `json:"project,omitempty"`
+	Session     string `json:"session,omitempty"`
+	Job         string `json:"job"`
+	State       string `json:"status"`
+	QueueReason string `json:"queue_reason,omitempty"`
+	Profile     string `json:"profile,omitempty"`
+	Engine      string `json:"engine,omitempty"`
+	RunID       string `json:"run_id,omitempty"`
+
+	Thread          string `json:"thread_id"`
+	Turn            string `json:"turn_id"`
+	TurnStatus      string `json:"turn_status"`
+	LastCompleted   string `json:"last_completed_turn_id,omitempty"`
+	CompletedStatus string `json:"last_completed_status,omitempty"`
+	InputKind       string `json:"input_kind,omitempty"`
+	ReviewThread    string `json:"review_thread_id,omitempty"`
+	ReviewTurn      string `json:"review_turn_id,omitempty"`
+	CompactOp       string `json:"compact_op,omitempty"`
+	Error           string `json:"error,omitempty"`
+	LastAction      string `json:"last_action,omitempty"`
+
+	Usage     json.RawMessage `json:"token_usage"`
+	Approvals []approval      `json:"pending_requests,omitempty"`
+
+	OutboxSeq    uint64 `json:"outbox_seq,omitempty"`
+	Generation   uint64 `json:"generation,omitempty"`
+	CompactAfter int64  `json:"compact_after_seq,omitempty"`
+	CompactSeq   int64  `json:"compact_event_seq,omitempty"`
+	RunnerStart  uint64 `json:"runner_start,omitempty"`
+	Restarts     int    `json:"restarts,omitempty"`
+	CommandPID   int    `json:"command_pid,omitempty"`
+	PID          int    `json:"pid,omitempty"`
+	ServerPID    int    `json:"server_pid,omitempty"`
+	Finished     int64  `json:"completed_turns"`
+	StallCount   int    `json:"stall_count,omitempty"`
+	Privileged   bool   `json:"privileged,omitempty"`
 }
+
+// closeBestEffort releases resources whose operation has already completed.
+// Writers that rely on Close to commit data must check its result separately.
+func closeBestEffort(c io.Closer) { _ = c.Close() }
+
+func removeBestEffort(path string)     { _ = os.Remove(path) }
+func removeTreeBestEffort(path string) { _ = os.RemoveAll(path) }
 
 func atomicWrite(path string, b []byte) error {
 	return atomicWriteSync(path, b, (*os.File).Sync)
@@ -127,7 +139,7 @@ func atomicWriteSync(path string, b []byte, syncFile func(*os.File) error) error
 	if err != nil {
 		return err
 	}
-	defer os.Remove(f.Name())
+	defer removeBestEffort(f.Name())
 	_, err = f.Write(b)
 	if err == nil {
 		err = syncFile(f)
@@ -145,7 +157,7 @@ func atomicWriteSync(path string, b []byte, syncFile func(*os.File) error) error
 	if err != nil {
 		return err
 	}
-	defer dir.Close()
+	defer closeBestEffort(dir)
 	return syncFile(dir)
 }
 func writeJSON(path string, v any) error {
@@ -210,7 +222,7 @@ func register(root, dir string, c config, s status) error {
 	if err != nil {
 		return err
 	}
-	defer os.RemoveAll(stage)
+	defer removeTreeBestEffort(stage)
 	for _, p := range []string{"inbox/done", "inbox/pending"} {
 		if err = os.MkdirAll(filepath.Join(stage, p), 0700); err != nil {
 			return err
@@ -253,15 +265,15 @@ func runNode(ctx context.Context, args []string, directSubmit bool) error {
 		return hostInfoCLI(ctx, op, fs, &root, args[1:])
 	}
 	if op == "host" {
-		if err := fs.Parse(args[1:]); err != nil {
-			return err
+		if parseErr := fs.Parse(args[1:]); parseErr != nil {
+			return parseErr
 		}
 		if fs.NArg() != 0 {
 			return errors.New("host: unexpected arguments")
 		}
-		host, err := readHostConfig(root)
-		if err != nil {
-			return err
+		host, hostErr := readHostConfig(root)
+		if hostErr != nil {
+			return hostErr
 		}
 		return json.NewEncoder(os.Stdout).Encode(host)
 	}
@@ -390,12 +402,12 @@ func runNode(ctx context.Context, args []string, directSubmit bool) error {
 		if *job != "" || fs.NArg() != 0 {
 			return errors.New("wait --any accepts filters only")
 		}
-		ctx, cancel, err := monitorContext(ctx, limit)
-		if err != nil {
-			return err
+		waitCtx, cancel, monitorErr := monitorContext(ctx, limit)
+		if monitorErr != nil {
+			return monitorErr
 		}
 		defer cancel()
-		return waitAny(ctx, root, *project, *session, sinceFile, os.Stdout)
+		return waitAny(waitCtx, root, *project, *session, sinceFile, os.Stdout)
 	}
 	if sinceFile != "" {
 		return errors.New("--since-file requires --any")
@@ -431,16 +443,16 @@ func runNode(ctx context.Context, args []string, directSubmit bool) error {
 			}
 			source = name
 		}
-		src, err := jobPath(sourceParent, source)
-		if err != nil {
-			return err
+		src, sourceErr := jobPath(sourceParent, source)
+		if sourceErr != nil {
+			return sourceErr
 		}
-		if err = readJSON(filepath.Join(src, "config.json"), &c); err != nil {
-			return err
+		if sourceErr = readJSON(filepath.Join(src, "config.json"), &c); sourceErr != nil {
+			return sourceErr
 		}
 		var from status
-		if err = readJSON(filepath.Join(src, "status.json"), &from); err != nil {
-			return err
+		if sourceErr = readJSON(filepath.Join(src, "status.json"), &from); sourceErr != nil {
+			return sourceErr
 		}
 		if from.Thread == "" {
 			return errors.New("source has no thread")
@@ -456,8 +468,8 @@ func runNode(ctx context.Context, args []string, directSubmit bool) error {
 		c.DedupKey = ""
 		op = "start"
 	}
-	if handled, err := opts.dispatch(ctx, dir, op, pos); handled {
-		return err
+	if handled, dispatchErr := opts.dispatch(ctx, dir, op, pos); handled {
+		return dispatchErr
 	}
 	if limit > 0 {
 		var cancel context.CancelFunc
@@ -508,7 +520,7 @@ func runNode(ctx context.Context, args []string, directSubmit bool) error {
 	}
 	defer func() {
 		if guard != nil {
-			guard.Close()
+			_ = guard.Close()
 		}
 	}()
 	if *project != "" {
@@ -580,92 +592,92 @@ func runNode(ctx context.Context, args []string, directSubmit bool) error {
 		if err != nil {
 			return err
 		}
-		info, err := os.Stat(c.Dir)
-		if err != nil {
-			return err
+		info, startErr := os.Stat(c.Dir)
+		if startErr != nil {
+			return startErr
 		}
 		if !info.IsDir() {
 			return errors.New("--dir must be a directory")
 		}
 		if len(c.Argv) == 0 {
 			if prompt != "" {
-				c.Prompt, err = readInputText(prompt)
+				c.Prompt, startErr = readInputText(prompt)
 			}
-			if err != nil {
-				return err
+			if startErr != nil {
+				return startErr
 			}
 			if c.ForkThread == "" && opts.input == "" && opts.image == "" && strings.TrimSpace(c.Prompt) == "" {
 				return errors.New("empty prompt")
 			}
 			if preamblePath != "" {
-				prefix, err := readInputText(preamblePath)
-				if err != nil {
-					return err
+				prefix, preambleErr := readInputText(preamblePath)
+				if preambleErr != nil {
+					return preambleErr
 				}
 				if strings.TrimSpace(prefix) != "" {
 					c.Prompt = strings.TrimRight(prefix, "\r\n") + "\n\n" + c.Prompt
 				}
 			}
 			if opts.input != "" || opts.image != "" {
-				c.Input, err = opts.inputs(c.Prompt)
-				if err != nil {
-					return err
+				c.Input, startErr = opts.inputs(c.Prompt)
+				if startErr != nil {
+					return startErr
 				}
 			}
 			if stallNudgePath != "" {
-				if c.StallNudge, err = readInputText(stallNudgePath); err != nil {
-					return err
+				if c.StallNudge, startErr = readInputText(stallNudgePath); startErr != nil {
+					return startErr
 				}
 				if strings.TrimSpace(c.StallNudge) == "" {
 					return errors.New("empty stall nudge")
 				}
 			}
 		}
-		if err = os.MkdirAll(parent, 0700); err != nil {
-			return err
+		if startErr = os.MkdirAll(parent, 0700); startErr != nil {
+			return startErr
 		}
 		if force {
 			c.DedupKey = ""
 		}
 		if c.DedupKey != "" {
-			if err = claimKey(root, c, s); err != nil {
-				return err
+			if startErr = claimKey(root, c, s); startErr != nil {
+				return startErr
 			}
 		}
-		if err = c.newRunID(); err != nil {
-			return err
+		if startErr = c.newRunID(); startErr != nil {
+			return startErr
 		}
-		if err = register(parent, dir, c, s); err != nil {
+		if startErr = register(parent, dir, c, s); startErr != nil {
 			if _, e := os.Stat(dir); e == nil {
 				return printStatus(dir)
 			}
-			return err
+			return startErr
 		}
 		if len(c.Argv) > 0 {
 			var done <-chan error
 			if directSubmit && runtime.GOOS == "windows" {
-				err = launchMuxCommand(ctx, root, *project, *job, c.RunID)
+				startErr = launchMuxCommand(ctx, root, *project, *job, c.RunID)
 			} else {
-				done, err = launchCommand(root, *project, *job)
+				done, startErr = launchCommand(root, *project, *job)
 			}
-			if err != nil {
-				if directSubmit && runtime.GOOS == "windows" && (errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)) {
-					return fmt.Errorf("psmux launch acknowledgement unavailable: %w", err)
+			if startErr != nil {
+				if directSubmit && runtime.GOOS == "windows" && (errors.Is(startErr, context.DeadlineExceeded) || errors.Is(startErr, context.Canceled)) {
+					return fmt.Errorf("psmux launch acknowledgement unavailable: %w", startErr)
 				}
-				return errors.Join(err, os.RemoveAll(dir))
+				return errors.Join(startErr, os.RemoveAll(dir))
 			}
 			ready, cancel := context.WithTimeout(ctx, 10*time.Second)
 			defer cancel()
 			for {
-				if err = readJSON(filepath.Join(dir, "status.json"), &s); err != nil {
-					return err
+				if startErr = readJSON(filepath.Join(dir, "status.json"), &s); startErr != nil {
+					return startErr
 				}
 				if s.PID != 0 || isTerminal(s.State) {
 					return printStatus(dir)
 				}
 				select {
-				case <-done:
-					return errors.New("worker exited before acquiring ownership")
+				case workerErr := <-done:
+					return errors.Join(errors.New("worker exited before acquiring ownership"), workerErr)
 				case <-ready.Done():
 					return fmt.Errorf("worker registration acknowledgement: %w", ready.Err())
 				case <-time.After(20 * time.Millisecond):
@@ -685,13 +697,13 @@ func runNode(ctx context.Context, args []string, directSubmit bool) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer closeBestEffort(f)
 	owned, err := tryLock(f)
 	if err != nil {
 		return err
 	}
 	if !owned && terminalClose {
-		guard.Close()
+		_ = guard.Close()
 		guard = nil
 		// Terminal status is published just before the runner releases ownership.
 		deadline, cancel := context.WithTimeout(ctx, 5*time.Second)
@@ -741,7 +753,7 @@ func runNode(ctx context.Context, args []string, directSubmit bool) error {
 		}
 		// Keep owner.lock throughout the grace period; other jobs can register.
 		if guard != nil {
-			guard.Close()
+			_ = guard.Close()
 			guard = nil
 		}
 		if err = r.reclaim(); err != nil {
@@ -762,13 +774,13 @@ func runNode(ctx context.Context, args []string, directSubmit bool) error {
 		}
 		// Detach the complete directory before recursive deletion, so a
 		// partial filesystem failure cannot leave a half-registered job.
-		trash, err := os.MkdirTemp(parent, ".clean-*")
-		if err != nil {
-			return err
+		trash, tempErr := os.MkdirTemp(parent, ".clean-*")
+		if tempErr != nil {
+			return tempErr
 		}
-		if err = os.Rename(dir, filepath.Join(trash, "job")); err != nil {
-			os.Remove(trash)
-			return err
+		if tempErr = os.Rename(dir, filepath.Join(trash, "job")); tempErr != nil {
+			_ = os.Remove(trash)
+			return tempErr
 		}
 		return os.RemoveAll(trash)
 	}
@@ -799,7 +811,7 @@ func runNode(ctx context.Context, args []string, directSubmit bool) error {
 			return errors.Join(err, r.save())
 		}
 	}
-	guard.Close()
+	_ = guard.Close()
 	guard = nil
 	if ticket != nil {
 		r.s.PID = os.Getpid()
@@ -826,7 +838,10 @@ func runNode(ctx context.Context, args []string, directSubmit bool) error {
 		return errors.Join(err, r.save())
 	}
 	defer r.releaseBuildCache()
-	if err = r.loadCredentials(); err != nil {
+	if err = r.loadCredentials(); err == nil {
+		err = r.preparePackageCaches()
+	}
+	if err != nil {
 		r.s.State = "failed"
 		r.s.PID = 0
 		r.s.Error = err.Error()
@@ -840,7 +855,6 @@ func main() {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	applyHostMux(os.Args[1:])
 	if err := dispatch(ctx, os.Args[1:]); err != nil {
 		var code ctlExit
 		if errors.As(err, &code) {

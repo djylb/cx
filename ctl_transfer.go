@@ -94,23 +94,23 @@ func receiveTask(ctx context.Context, a []string) error {
 	if e != nil {
 		return e
 	}
-	defer lock.Close()
-	if hash, e := fileHash(p); e == nil {
+	defer closeBestEffort(lock)
+	if hash, hashErr := fileHash(p); hashErr == nil {
 		if hash != a[1] {
 			return errors.New("job already bound to another request")
 		}
-		_, e = fmt.Fprintln(os.Stdout, "done")
-		return e
-	} else if !os.IsNotExist(e) {
-		return e
+		_, hashErr = fmt.Fprintln(os.Stdout, "done")
+		return hashErr
+	} else if !os.IsNotExist(hashErr) {
+		return hashErr
 	}
 	if e = os.MkdirAll(filepath.Dir(p), 0700); e != nil {
 		return e
 	}
 	part := filepath.Join(filepath.Dir(p), "."+a[1]+".part")
-	stop := context.AfterFunc(ctx, func() { os.Stdin.Close() })
+	stop := context.AfterFunc(ctx, func() { _ = os.Stdin.Close() })
 	defer stop()
-	timer := time.AfterFunc(idle, func() { os.Stdin.Close() })
+	timer := time.AfterFunc(idle, func() { _ = os.Stdin.Close() })
 	defer timer.Stop()
 	if e = receivePacket(part, a[1], size, snapActiveReader{os.Stdin, timer, idle}, os.Stdout); e != nil {
 		return e

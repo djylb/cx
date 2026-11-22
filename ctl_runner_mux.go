@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,9 +14,9 @@ import (
 )
 
 type muxLaunch struct {
-	Args []string
 	Env  map[string]string
 	Log  string
+	Args []string
 }
 
 func runMuxWorker(ctx context.Context, path string) error {
@@ -30,7 +31,7 @@ func runMuxWorker(ctx context.Context, path string) error {
 	if e != nil {
 		return e
 	}
-	defer f.Close()
+	defer closeBestEffort(f)
 	os.Stdout, os.Stderr = f, f
 	for k, v := range spec.Env {
 		if e = os.Setenv(k, v); e != nil {
@@ -39,7 +40,7 @@ func runMuxWorker(ctx context.Context, path string) error {
 	}
 	return runNode(ctx, spec.Args, true)
 }
-func launchMuxRunner(ctx context.Context, exe, dir, work string, argv []string, env map[string]string, resume bool) error {
+func launchMuxRunner(ctx context.Context, root, exe, dir, work string, argv []string, env map[string]string, resume bool) error {
 	var before status
 	if resume {
 		if e := readJSON(filepath.Join(dir, "status.json"), &before); e != nil {
@@ -52,13 +53,19 @@ func launchMuxRunner(ctx context.Context, exe, dir, work string, argv []string, 
 	}
 	session := fmt.Sprintf("cx-%x", nonce)
 	path := filepath.Join(work, "."+session+".json")
-	spec := muxLaunch{argv, env, filepath.Join(work, "launch.log")}
+	// The session belongs to the existing psmux server, which may have
+	// started with a different CXRUN_STATE than this request.
+	workerEnv := make(map[string]string, len(env)+1)
+	maps.Copy(workerEnv, env)
+	workerEnv["CXRUN_STATE"] = root
+	spec := muxLaunch{Args: argv, Env: workerEnv, Log: filepath.Join(work, "launch.log")}
 	if e := writeJSON(path, spec); e != nil {
 		return e
 	}
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, psmuxProgram(), "-L", muxSocket(), "new-session", "-d", "-s", session, "--", exe, "node", "runner-worker", path)
+	program, socket := psmuxSettings(root)
+	cmd := exec.CommandContext(ctx, program, "-L", socket, "new-session", "-d", "-s", session, "--", exe, "node", "runner-worker", path)
 	cmd.Stderr = os.Stderr
 	if e := cmd.Run(); e != nil {
 		return errors.Join(e, ctx.Err())

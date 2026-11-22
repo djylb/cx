@@ -14,19 +14,19 @@ import (
 )
 
 type waitCursor struct {
-	OutboxSeq uint64 `json:"outbox_seq,omitempty"`
 	Question  string `json:"question,omitempty"`
 	RunID     string `json:"run_id,omitempty"`
-	Finished  int64  `json:"completed_turns"`
 	Terminal  string `json:"terminal,omitempty"`
+	OutboxSeq uint64 `json:"outbox_seq,omitempty"`
+	Finished  int64  `json:"completed_turns"`
 }
 
 type waitReport struct {
-	OutboxSeq uint64 `json:"outbox_seq,omitempty"`
 	Project   string `json:"project"`
 	Job       string `json:"job"`
 	State     string `json:"status"`
 	Outcome   string `json:"outcome"`
+	OutboxSeq uint64 `json:"outbox_seq,omitempty"`
 	Finished  int64  `json:"completed_turns"`
 	Code      int    `json:"code"`
 }
@@ -51,9 +51,9 @@ func waitAny(ctx context.Context, root, project, session, sinceFile string, out 
 	// must not advance that job's persisted cursor.
 	type start struct {
 		runID   string
+		outcome string
 		floor   int64
 		busy    bool
-		outcome string
 	}
 	starts := make(map[string]start)
 	tick := time.NewTicker(time.Second)
@@ -135,7 +135,7 @@ func waitAny(ctx context.Context, root, project, session, sinceFile string, out 
 			if question {
 				code = 6
 			}
-			result = &waitReport{s.OutboxSeq, s.Project, s.Job, s.State, outcome, s.Finished, code}
+			result = &waitReport{OutboxSeq: s.OutboxSeq, Project: s.Project, Job: s.Job, State: s.State, Outcome: outcome, Finished: s.Finished, Code: code}
 			key, cursor = id, now
 			return true, nil
 		})

@@ -267,7 +267,7 @@ func fingerprint(ctx context.Context, dir string) (string, error) {
 		if name == "package.json" {
 			var p map[string]json.RawMessage
 			err = json.NewDecoder(f).Decode(&p)
-			f.Close()
+			_ = f.Close()
 			if err != nil {
 				return "", err
 			}
@@ -282,7 +282,7 @@ func fingerprint(ctx context.Context, dir string) (string, error) {
 		}
 		digest := sha256.New()
 		_, err = io.Copy(digest, f)
-		f.Close()
+		_ = f.Close()
 		if err != nil {
 			return "", err
 		}

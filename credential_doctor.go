@@ -47,14 +47,14 @@ func credentialDoctor(ctx context.Context, root string, h *hostConfig, out field
 		}
 	}
 	type probeResult struct {
-		name string
 		info fields
+		name string
 	}
 	results := make(chan probeResult, len(h.Profiles))
 	for name := range h.Profiles {
 		p, _ := h.profile(name)
 		go func() {
-			results <- probeResult{name, fields{
+			results <- probeResult{name: name, info: fields{
 				"codex_login_status": loginStatus(ctx, p.accountEnv(root)),
 				"claude_available":   claudeErr == nil,
 				"env_file":           envFileDoctor(root, p.EnvFile),
