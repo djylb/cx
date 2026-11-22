@@ -5,8 +5,6 @@ description: Dispatch, monitor, steer, and collect cx agent or command jobs on l
 
 # Manage cx jobs
 
-Read the cx checkout's `docs/agent-guide.md` before dispatch. If the checkout location is unknown, ask the user for it. For setup, follow `docs/agent-install.md`.
+Read `docs/agent-guide.md` in the cx checkout. Use `docs/agent-install.md` to set up cx and `docs/reference.md` for defaults and engine capabilities.
 
-Choose the host, engine (`--engine`), sandbox, and time limits for the task; an option the engine cannot honour fails at submission. Keep the returned job ID and use a background `cx wait` when the session supports it. Use `cx show` and `cx tail` for evidence, `cx say` to steer, and `cx result` to collect. Review `cx patch` before an explicit `cx apply`.
-
-Patches are cumulative from the dispatch snapshot by default; after applying an earlier turn, use `cx apply JOB --since-turn N`. The agent sees only the snapshot of DIR: inline any controller-side files the prompt refers to, and tell it to leave changes uncommitted.
+Choose the execution host, inputs, engine, sandbox, and deadlines. Save the job ID, then use `cx wait` and `cx show` to observe the turn, `cx say` to follow up, and `cx result` to collect it. Review the patch before applying it. For multi-turn changes, follow the guide's instructions for applying only the turns you still need.

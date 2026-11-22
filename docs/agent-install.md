@@ -1,130 +1,83 @@
 # Install cx with a managing AI
 
-Run these steps with the user who will operate cx. Ask for missing deployment information, and get consent before installing system tools or changing system services. Keep authentication in the user's SSH agent, OS credential store, or agent CLI login. Keep connection details and real configuration out of the checkout.
+## Build and install the controller
 
-## 0. Get the source
-
-The project lives at https://github.com/djylb/cx. Clone it into a user-owned directory, or update an existing clone, and keep the checkout: later steps build from it and read its guides.
+Confirm the controller and execution platforms with the user. Get approval before installing system tools or changing services. Keep connection details and credentials in user configuration outside the checkout.
 
 ```sh
 git clone https://github.com/djylb/cx
 cd cx
+go build -o cx .
 ```
 
-All paths in this guide are relative to that checkout.
+On Windows, use `go build -o cx.exe .`. Move the binary to a user-owned directory on PATH and run `cx version` to print its SHA-256. Alternatively, `go install github.com/djylb/cx@latest` installs into `GOBIN` or the Go binary directory. Keep the checkout for cross-platform setup.
 
-## 1. Identify the controller and execution hosts
+## Register and set up execution hosts
 
-- Determine the OS and CPU architecture of the controller and each intended execution host. Ask whether the controller itself should execute jobs. The built-in host `local` uses the controller account directly.
-- Check Git, the system `ssh` client, and access to an OpenSSH server with SFTP on each remote. Check the selected agent CLI under the execution account, including `codex login status` or `claude auth status --json`. A command-only host can skip model login.
-- Check tmux if you plan to host a Unix node in a tmux session. The normal Go Unix launch path detaches workers directly. On Windows, check psmux on PATH and its logged-in session for both command and agent jobs.
-- Check free disk space and writable state and cache directories. If building, check a working Go 1.26+ toolchain. Install missing dependencies with the platform's package manager after the user agrees. Ask the user to complete logins that require credentials or a browser.
-
-## 2. Obtain the controller binary
-
-cx is distributed as source only. Build it with Go and install the binary as `cx` (`cx.exe` on Windows) in a user-owned directory on PATH, then run `cx version` to print the installed binary's SHA-256.
-
-1. **Go install.** Run `go install github.com/djylb/cx@latest`. Go writes `cx` to `GOBIN`, or to the Go binary directory when `GOBIN` is unset.
-2. **Build from a checkout.** In the directory that holds `go.mod`, run `go build -o cx .` on Unix or `go build -o cx.exe .` on Windows, then move the result to the user-owned PATH directory.
-
-Keep the checkout when remote hosts use a different platform: `setup` cross-builds their node binary from it.
-
-## 3. Configure remote hosts
-
-Ask which hosts, accounts and SSH aliases to use. Reuse existing entries in `~/.ssh/config` where possible. If an entry is needed, merge a block like this into the user's file and replace the uppercase placeholders with the values the user provided:
-
-```sshconfig
-Host cx-worker
-    HostName EXECUTION_HOST
-    User EXECUTION_ACCOUNT
-```
-
-Verify the remote host key through a trusted channel on first connection. Once it is trusted and the key is available, test non-interactive authentication with `ssh -o BatchMode=yes -o ConnectTimeout=10 cx-worker git --version`. cx uses OpenSSH in batch mode and relies on the user's host key checking and authentication.
-
-In the controller user's `~/.config/cx/hosts.toml`, add a logical name that refers to the SSH alias:
+Use the built-in `local` target for execution under the controller account. For a remote target, reuse an alias from the user's OpenSSH configuration. Verify the host key and confirm batch-mode SSH and SFTP work under the intended execution account. Add the alias to `~/.config/cx/hosts.toml`; replace both uppercase placeholders.
 
 ```toml
-[hosts.worker]
-ssh = "cx-worker"
+[hosts.TARGET]
+ssh = "SSH_ALIAS"
 ```
 
-Here `worker` is the cx host name and `cx-worker` is the OpenSSH alias. Omit this entry for a local-only deployment. Optional `cx` and `state` override the node binary path and node state root. By default, the node stores state in `~/.local/share/cx/state`. The default remote install location is `.local/bin/cx` under the SSH user's home, with `.exe` on Windows. `setup` records the detected platform in the user config. An optional `via` names a configured relay that resolves the next SSH hop through its own SSH configuration. Start with direct SSH unless the deployment needs a relay.
-
-## 4. Diagnose and deploy
+Set `target=local` as below, or assign the configured target key to `target`.
 
 ```sh
-cx doctor --json
-cx doctor worker --json
-cx setup worker
-cx doctor worker --json
-cx host worker
+target=local
+cx setup "$target"
+cx doctor "$target" --json
+cx host "$target"
 ```
 
-Use `cx setup local` for local execution. `doctor` reports probes such as tool availability, login state, node availability, and writable paths. Some checks may be unknown. A missing node or state directory before first setup is expected. Review the actual fields and resolve prerequisites before the smoke checks.
+Check Git for Git jobs, free space, a writable local state volume, and the selected engine's CLI and login. For Windows, enable OpenSSH Server with SFTP and PowerShell, and keep the execution account signed into the desktop. Start psmux from that session if needed.
 
-`setup` installs or reuses the matching binary and initializes the state directory. An existing `host.json` is preserved. Review the slot and load policy with the user before changing it. For a different target platform, keep a checkout and Go available for cross-building. Set `CX_MODULE` to the `cxrun/` module directory if discovery fails. You can also point `CX_SETUP_BINARY` at a verified, matching target binary for a specific setup invocation.
+```sh
+psmux -L cx new-session -d -s cx-bootstrap
+psmux -L cx list-sessions
+```
 
-SSH and gzip streams carry job and result data. Some Linux upgrade paths use rsync for binary deltas. If rsync is unavailable, point `CX_SETUP_BINARY` at a binary you built for the target.
+Check `psmux_session` in `cx doctor` and verify the engine CLI is on the session's PATH. For binary and state paths, cross-platform setup, and host policy, see the [reference](reference.md#host-configuration).
 
-### Configure credentials on the execution host
+## Configure execution credentials
 
-Use the same OS account that runs the node. Keep credentials and account settings outside the checkout and its snapshots.
+Sign in under the account that runs the node. For a command-only host, skip agent login. Prepare Codex with `CODEX_HOME` or Claude Code with `CLAUDE_CONFIG_DIR` set to the intended account directory. [Codex authentication](https://developers.openai.com/codex/cli/reference#codex-login) · [Claude Code authentication](https://code.claude.com/docs/en/authentication)
 
-**Codex.** Load `OPENAI_API_KEY` into the execution account's local shell from its secret store, then run `printenv OPENAI_API_KEY | codex login --with-api-key`. For ChatGPT sign-in on a headless host, use `codex login --device-auth`. Run the login and `codex login status` with `CODEX_HOME` set to the account directory you intend to use. [Codex CLI authentication](https://developers.openai.com/codex/cli/reference#codex-login)
-
-**Claude Code.** Put `ANTHROPIC_API_KEY` in a private executor `env_file`, or configure a local `apiKeyHelper` in the account's Claude settings. For an account that supports `claude setup-token`, store its returned token locally as `CLAUDE_CODE_OAUTH_TOKEN` in the executor's `env_file`. Set `CLAUDE_CONFIG_DIR` to the desired account directory when preparing its settings or authentication. [Claude Code authentication](https://code.claude.com/docs/en/authentication)
-
-On the execution host, merge credential paths and named profiles into `host.json` under its state root. The example uses paths relative to that root. Absolute executor paths also work.
+To select separate engine accounts or supply credentials from a private environment file, merge a profile into `host.json` on the execution host. The paths below are relative to the state root.
 
 ```json
 {
-  "env_file": "credentials/host.env",
-  "default_profile": "account-a",
+  "default_profile": "review",
   "profiles": {
-    "account-a": {
-      "engine_homes": {"codex": "accounts/a/codex", "claude": "accounts/a/claude"}
-    },
-    "account-b": {
-      "engine_homes": {"codex": "accounts/b/codex", "claude": "accounts/b/claude"},
-      "env_file": "credentials/account-b.env"
+    "review": {
+      "engine_homes": {"codex": "accounts/codex", "claude": "accounts/claude"},
+      "env_file": "credentials/review.env"
     }
   }
 }
 ```
 
-Create the credential files privately on the executor. Use mode `0600` on Unix and restrict access to the executor account on Windows. The UTF-8 format is one `KEY=VALUE` per line. Blank lines and lines beginning with `#` after optional whitespace are ignored. Characters after the first `=`, including quotes, spaces, inline `#` and dollar signs, are literal. A profile's `env_file` replaces the host file selection. A profile with no file uses the host file. Only the child process environment receives the file's values.
+Create the file with access restricted to the execution account (`0600` on Unix). Use one UTF-8 `KEY=VALUE` per line. Leave values unquoted unless the quotes are part of the value. After setup, check `cx doctor "$target" --json` for engine login and profile configuration. For API keys or tokens supplied by the environment file, verify access with the agent smoke check.
 
-`engine_homes` maps each engine to its account directory, exported as that engine's home variable (`CODEX_HOME` for Codex, `CLAUDE_CONFIG_DIR` for Claude Code). Use `cx doctor HOST --json` after setup: `engines` reports each engine's path, version and login state for the host, and each profile's `engines` reports the login state under that profile's account directories. A missing file is skipped. Unix permission warnings are advisory. Login probes do not verify API credentials supplied by an environment file.
+## Run the smoke checks
 
-### Windows execution
-
-- Enable OpenSSH Server and verify SSH and SFTP as the intended Windows account. Keep PowerShell available to the SSH login.
-- Sign in to the Windows desktop with that account. From the logged-in session, start or reuse a psmux server in the `cx` namespace. For example, if it has no sessions, run `psmux -L cx new-session -d -s cx-bootstrap` in the desktop terminal. Check `psmux -L cx list-sessions` and the `psmux_session` field from the controller. Keep the Windows account logged in while jobs run. If you reuse a different psmux namespace, set `CXRUN_TMUX_SOCKET` in the execution account's SSH environment to match it.
-- Verify the agent CLI is visible in the psmux environment. If command execution works but agent startup hangs or fails, check the desktop session and sandbox diagnostics before changing permissions.
-
-## 5. Run two short smoke checks
-
-Replace `worker` with the configured cx host name, or use `local`. Keep the work disposable and use short deadlines. These examples use a POSIX shell on the controller. On Windows, create the temporary directory with PowerShell and pass its path to the same cx options.
+Use the same `target` as above. These examples use a POSIX shell on the controller. From PowerShell, set the equivalent environment variable and use a fresh directory for the agent check.
 
 ```sh
-cx exec worker --project cx-smoke --wait --queue-timeout 15s --timeout 10s -- git --version
+cx exec "$target" --project smoke --wait --queue-timeout 10s --timeout 5s -- git --version
 ```
 
-Check the output and process exit code. The job ID goes to stderr in this mode. Use it to inspect or clean up the command job.
-
-For the agent check, use a fresh empty directory on the controller (`"$demo"` in this example). Run one short, read-only turn with the engine already set up on the execution host.
+The command prints its job ID to stderr. For an agent host, run a short read-only turn using the configured engine. For Claude Code, replace `codex` with `claude` and select a low-cost available model with `--model`.
 
 ```sh
 demo=$(mktemp -d)
-CXRUN_MONITOR_TIMEOUT=1m cx agent --host worker --dir "$demo" --engine codex --sandbox read-only \
-  --queue-timeout 15s --turn-timeout 30s --idle-exit 30s \
-  'Do not use tools. Reply with exactly one line: STATUS: DONE'
+CXRUN_MONITOR_TIMEOUT=20s cx agent --host "$target" --dir "$demo" --engine codex \
+  --sandbox read-only --queue-timeout 10s --turn-timeout 10s \
+  'Reply with exactly one line: STATUS: DONE'
 ```
 
-Use `--engine claude` for Claude Code and select a low-cost available model with `--model`. Check the reported status and the job ID. If the agent check fails, inspect `cx show JOB` and the reported startup error. Close the agent when finished and clean the smoke jobs once their output is no longer needed.
+Use the job IDs to inspect results. Close the agent and clean both jobs after they reach a terminal state. See the [manager guide](agent-guide.md#collect-review-and-clean-up).
 
-## 6. Install the manager instructions
+## Give the manager its instructions
 
-For Claude Code, copy the template [skills/cx/SKILL.md](../skills/cx/SKILL.md) to the user's `~/.claude/skills/cx/SKILL.md`, or to `.claude/skills/cx/SKILL.md` for one project. In the installed copy, provide the local checkout location for `docs/agent-guide.md` and this guide, or pass that location when invoking the skill. For Codex, give the session the same guide or add a reference to it in that project's `AGENTS.md`.
-
-Report the controller version, logical hosts, selected engines, smoke results, and any checks still awaiting the user's action. Hand off to the [daily agent guide](agent-guide.md).
+For Claude Code, copy [SKILL.md](../skills/cx/SKILL.md) to `~/.claude/skills/cx/SKILL.md` or the project's `.claude/skills/cx/SKILL.md`. Tell the manager where the cx checkout is. For Codex, give the session the [manager guide](agent-guide.md) or reference it from the project's `AGENTS.md`. Report the installed version, selected targets and engines, and smoke results.
