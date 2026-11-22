@@ -111,12 +111,24 @@ func TestWindowsStateFileErrorsNamePath(t *testing.T) {
 // The POSIX rename request is the primary replacement path; report exactly how a
 // volume treats it so a fallback is never silently relied upon.
 func TestWindowsPOSIXRenameReplaces(t *testing.T) {
+	t.Run("idle target", func(t *testing.T) { checkPOSIXRename(t, false) })
+	t.Run("open target", func(t *testing.T) { checkPOSIXRename(t, true) })
+}
+
+func checkPOSIXRename(t *testing.T, open bool) {
 	dir := t.TempDir()
 	from, to := filepath.Join(dir, "from"), filepath.Join(dir, "to")
 	for _, f := range []struct{ path, body string }{{from, "new"}, {to, "old"}} {
 		if err := os.WriteFile(f.path, []byte(f.body), 0600); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if open {
+		reader, err := openShared(to)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer closeBestEffort(reader)
 	}
 	err := renameFilePOSIX(from, to)
 	got, readErr := os.ReadFile(to)
@@ -126,6 +138,9 @@ func TestWindowsPOSIXRenameReplaces(t *testing.T) {
 		names = append(names, e.Name())
 	}
 	if err != nil || readErr != nil || string(got) != "new" || len(names) != 1 {
-		t.Fatalf("dir %s: rename error %v, target %q (%v), entries %q", dir, err, got, readErr, names)
+		root, _ := windows.UTF16PtrFromString(filepath.VolumeName(dir) + `\`)
+		fs := make([]uint16, 64)
+		volErr := windows.GetVolumeInformation(root, nil, 0, nil, nil, nil, &fs[0], uint32(len(fs)))
+		t.Fatalf("dir %s (%s %v): rename error %v, target %q (%v), entries %q", dir, windows.UTF16ToString(fs), volErr, err, got, readErr, names)
 	}
 }
