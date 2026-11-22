@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -81,5 +82,75 @@ func TestCodexResultDetailsFromSealedTurn(t *testing.T) {
 		*result.Status != "done" || result.Turn != 2 || result.ExitCode != nil || result.LogPath == nil ||
 		filepath.Base(*result.LogPath) != "progress.log" || result.Artifacts == nil {
 		t.Fatalf("unexpected result metadata: %s (%v)", data, err)
+	}
+}
+
+func TestResultOutputClarity(t *testing.T) {
+	f := newControllerFixture(t)
+	t.Setenv("CLAUDE_CODE_HOST_SESSION_ID", "local_x")
+	const job = "p/report"
+	dir := filepath.Join(os.Getenv("CXRUN_STATE"), filepath.FromSlash(job))
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	state := status{Job: "report", Project: "p", RunID: "fixture", State: "done",
+		Turn: "turn-id", LastCompleted: "turn-id", Finished: 1, CompletedStatus: "completed"}
+	if err := writeJSON(filepath.Join(dir, "status.json"), state); err != nil {
+		t.Fatal(err)
+	}
+	const report = "STATUS: DONE\nSummary.\n\n## Details\nExpanded report.\n"
+	for name, data := range map[string]string{"last.md": report, "progress.log": ""} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(data), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	dest, err := resultDest("local", job, state.RunID, "1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	details := resultVariant(dest, true)
+	lock, err := lockPath(details+".worker", os.O_CREATE)
+	if err != nil || lock == nil {
+		t.Fatal(lock, err)
+	}
+	defer closeBestEffort(lock)
+	if err := os.WriteFile(details+".part", []byte("123"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	checkCollecting := func(total string) {
+		t.Helper()
+		out, diag := cliStreams(t, 12, nil, f.cx, "result", job, "--json")
+		want := `{"bytes":3,"job":"p/report","status":"collecting","total":` + total + `,"turn":1}` + "\n"
+		if string(out) != want || !strings.Contains(diag, "collecting turn=1 bytes=3/") {
+			t.Fatalf("collecting JSON: stdout=%q stderr=%q", out, diag)
+		}
+	}
+	checkCollecting("null")
+	if err := writeJSON(details+".total", 10); err != nil {
+		t.Fatal(err)
+	}
+	checkCollecting("10")
+	if out, diag := cliStreams(t, 12, nil, f.cx, "result", job, "--log"); len(out) != 0 || !strings.Contains(diag, "collecting turn=1 bytes=3/10") {
+		t.Fatalf("collecting log: stdout=%q stderr=%q", out, diag)
+	}
+	out, diag := cliStreams(t, 0, nil, f.cx, "result", job, "--wait")
+	reportPath := filepath.Join(dest, "last.md")
+	if string(out) != reportPath+"\nSTATUS: DONE\nSummary.\n" ||
+		diag != "cx: summary shown; full report: "+reportPath+" (use --full)\n" {
+		t.Fatalf("summary: stdout=%q stderr=%q", out, diag)
+	}
+	out, diag = cliStreams(t, 0, nil, f.cx, "result", job, "--full")
+	if !bytes.Contains(out, []byte(report)) || strings.Contains(diag, "summary shown") {
+		t.Fatalf("full report: stdout=%q stderr=%q", out, diag)
+	}
+	for _, suffix := range []string{".part", ".total"} {
+		if err := os.Remove(details + suffix); err != nil {
+			t.Fatal(err)
+		}
+	}
+	out, diag = cliStreams(t, 0, nil, f.cx, "result", job, "--json", "--wait")
+	if !json.Valid(out) || strings.Contains(diag, "summary shown") {
+		t.Fatalf("report JSON: stdout=%q stderr=%q", out, diag)
 	}
 }

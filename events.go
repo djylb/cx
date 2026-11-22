@@ -564,6 +564,10 @@ func (r *runner) appendEvent(f *os.File, record map[string]json.RawMessage) erro
 		return err
 	}
 	record["seq"] = json.RawMessage(strconv.FormatInt(fi.Size()+1, 10))
+	if string(record["method"]) == `"item/completed"` {
+		record["time"], _ = time.Now().UTC().MarshalJSON()
+		record["turn_number"] = json.RawMessage(strconv.FormatInt(r.s.Finished+1, 10))
+	}
 	if r.c.privileged() {
 		record["privileged"] = json.RawMessage("true")
 	}

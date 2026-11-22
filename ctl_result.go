@@ -514,11 +514,11 @@ func ctlResult(ctx context.Context, host, id, op string, o ctlOptions) error {
 					return ctlExit(failure.Code)
 				}
 			}
-			return backgroundFetch(host, id, s.RunID, turn, dest, details)
+			return backgroundFetch(host, id, s.RunID, turn, dest, o)
 		}
 		if e = fetchTurn(ctx, h, id, s.RunID, turn, dest, details); e != nil {
 			if op == "agent" && errors.Is(e, ctlExit(9)) {
-				return backgroundFetch(host, id, s.RunID, turn, dest, false)
+				return backgroundFetch(host, id, s.RunID, turn, dest, ctlOptions{})
 			}
 			return e
 		}
@@ -588,7 +588,17 @@ func displayTurn(ctx context.Context, dir, id, op string, o ctlOptions) error {
 		if e != nil && !errors.Is(e, ctlExit(1)) {
 			return e
 		}
-		return errors.Join(preview(b.Bytes(), o), e)
+		if previewErr := preview(b.Bytes(), o); previewErr != nil {
+			return errors.Join(previewErr, e)
+		}
+		if op == "result" && !o.full {
+			report, pathErr := filepath.Abs(filepath.Join(dir, "last.md"))
+			if pathErr != nil {
+				return errors.Join(pathErr, e)
+			}
+			fmt.Fprintf(os.Stderr, "cx: summary shown; full report: %s (use --full)\n", report)
+		}
+		return e
 	}
 	return writeTurn(ctx, os.Stdout, dir, id, op, o)
 }
@@ -744,7 +754,8 @@ type fetchFailure struct {
 	Code    int
 }
 
-func backgroundFetch(host, id, gen, turn, dest string, details bool) error {
+func backgroundFetch(host, id, gen, turn, dest string, o ctlOptions) error {
+	details := o.json || o.log
 	lock, e := lockPath(dest+".worker", os.O_CREATE)
 	if e != nil {
 		return e
@@ -771,15 +782,26 @@ func backgroundFetch(host, id, gen, turn, dest string, details bool) error {
 	if st, e := os.Stat(dest + ".part"); e == nil {
 		count = st.Size()
 	}
-	var total int64
+	var total *int64
 	size := "?"
-	if readJSON(dest+".total", &total) == nil {
-		size = strconv.FormatInt(total, 10)
+	if readJSON(dest+".total", &total) == nil && total != nil {
+		size = strconv.FormatInt(*total, 10)
 	}
 	if details {
 		fmt.Fprintf(os.Stderr, "collecting turn=%s bytes=%d/%s\n", turn, count, size)
 	} else {
 		fmt.Printf("collecting turn=%s bytes=%d/%s\n", turn, count, size)
+	}
+	if o.json {
+		n, e := strconv.ParseInt(turn, 10, 64)
+		if e != nil {
+			return e
+		}
+		if e = json.NewEncoder(os.Stdout).Encode(fields{
+			"job": id, "status": "collecting", "turn": n, "bytes": count, "total": total,
+		}); e != nil {
+			return e
+		}
 	}
 	return ctlExit(12)
 }

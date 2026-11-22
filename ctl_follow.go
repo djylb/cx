@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -17,9 +19,12 @@ import (
 )
 
 type tailPosition struct {
-	Mode string `json:"mode"`
-	Next int64  `json:"next"`
-	Raw  bool   `json:"raw"`
+	Mode          string `json:"mode"`
+	Next          int64  `json:"next"`
+	Raw           bool   `json:"raw"`
+	Since         int64  `json:"since,omitempty"`
+	Finished      int64  `json:"finished,omitempty"`
+	LastCompleted string `json:"last_completed,omitempty"`
 }
 type tailFrame struct {
 	Terminal *status      `json:"terminal,omitempty"`
@@ -68,6 +73,9 @@ func (w *frameWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 func streamLog(ctx context.Context, dir string, pos tailPosition) error {
+	if pos.Mode == "messages" {
+		return streamMessages(ctx, dir, pos)
+	}
 	var s status
 	if e := readJSON(filepath.Join(dir, "status.json"), &s); e != nil {
 		return e
@@ -123,13 +131,20 @@ func follow(ctx context.Context, h endpoint, name, id string, o ctlOptions) erro
 			return errors.New("invalid since")
 		}
 	}
+	if o.messages {
+		pos = tailPosition{Mode: "messages", Since: pos.Next}
+	}
 	path := ""
 	if o.cursor != "" {
 		p, j, ok := strings.Cut(id, "/")
 		if !ok {
 			p, j = "flat", p
 		}
-		path, e = cursorFile("tail", name, p, j, strconv.FormatBool(o.raw), o.cursor)
+		mode := strconv.FormatBool(o.raw)
+		if o.messages {
+			mode = "messages"
+		}
+		path, e = cursorFile("tail", name, p, j, mode, o.cursor)
 		if e != nil {
 			return e
 		}
@@ -160,9 +175,17 @@ func follow(ctx context.Context, h endpoint, name, id string, o ctlOptions) erro
 			_ = wr.CloseWithError(err)
 			done <- err
 		}()
-		dec := json.NewDecoder(rd)
+		var input io.Reader = rd
+		var compressed *gzip.Reader
+		if o.messages {
+			compressed, e = gzip.NewReader(rd)
+			if e == nil {
+				input = compressed
+			}
+		}
+		dec := json.NewDecoder(input)
 		var terminal *status
-		for {
+		for e == nil {
 			var frame tailFrame
 			e = dec.Decode(&frame)
 			if e != nil {
@@ -178,6 +201,9 @@ func follow(ctx context.Context, h endpoint, name, id string, o ctlOptions) erro
 			}
 			pos = frame.Position
 			terminal = frame.Terminal
+		}
+		if compressed != nil {
+			closeBestEffort(compressed)
 		}
 		_ = rd.Close()
 		stop()
@@ -211,4 +237,116 @@ func follow(ctx context.Context, h endpoint, name, id string, o ctlOptions) erro
 		}
 	}
 	return ctlExit(9)
+}
+
+// streamMessages follows the same framed, resumable observation protocol as
+// progress tail. Flush each frame so an idle job does not delay delivery.
+func streamMessages(ctx context.Context, dir string, pos tailPosition) (err error) {
+	compressed := gzip.NewWriter(os.Stdout)
+	defer func() { err = errors.Join(err, compressed.Close()) }()
+	enc := json.NewEncoder(compressed)
+	emit := func(frame tailFrame) error {
+		if e := enc.Encode(frame); e != nil {
+			return e
+		}
+		return compressed.Flush()
+	}
+	for ctx.Err() == nil {
+		var s status
+		if e := readJSON(filepath.Join(dir, "status.json"), &s); e != nil {
+			return e
+		}
+		drained, e := readMessageEvents(ctx, dir, &pos, emit)
+		if e != nil {
+			return e
+		}
+		frame := tailFrame{Position: pos}
+		if drained && isTerminal(s.State) {
+			frame.Terminal = &s
+			return emit(frame)
+		}
+		if e = emit(frame); e != nil {
+			return e
+		}
+		_ = pause(ctx, time.Second)
+	}
+	return errObserveTimeout
+}
+
+func readMessageEvents(ctx context.Context, dir string, pos *tailPosition, emit func(tailFrame) error) (bool, error) {
+	f, err := os.Open(filepath.Join(dir, "events.jsonl"))
+	if os.IsNotExist(err) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	defer closeBestEffort(f)
+	if _, err = f.Seek(pos.Next, io.SeekStart); err != nil {
+		return false, err
+	}
+	rd := bufio.NewReader(f)
+	for ctx.Err() == nil {
+		line, e := rd.ReadBytes('\n')
+		if e == io.EOF {
+			return len(line) == 0, nil
+		}
+		if e != nil {
+			return false, e
+		}
+		var record struct {
+			Seq        int64
+			Method     string
+			Time       string
+			TurnNumber int64 `json:"turn_number"`
+			Params     json.RawMessage
+		}
+		if e = json.Unmarshal(line, &record); e != nil {
+			return false, e
+		}
+		start := pos.Next + 1
+		pos.Next += int64(len(line))
+		if record.Seq == 0 {
+			record.Seq = start
+		}
+		switch record.Method {
+		case "turn/completed":
+			var ev event
+			if e = json.Unmarshal(record.Params, &ev); e != nil {
+				return false, e
+			}
+			if ev.Turn.ID != "" && ev.Turn.ID != pos.LastCompleted {
+				pos.Finished++
+				pos.LastCompleted = ev.Turn.ID
+			}
+		case "item/completed":
+			if record.Seq <= pos.Since {
+				continue
+			}
+			var ev event
+			if e = json.Unmarshal(record.Params, &ev); e != nil {
+				return false, e
+			}
+			if ev.Item.Type != "agentMessage" {
+				continue
+			}
+			if record.TurnNumber == 0 {
+				record.TurnNumber = pos.Finished + 1
+				if ev.TurnID != "" && ev.TurnID == pos.LastCompleted {
+					record.TurnNumber = pos.Finished
+				}
+			}
+			if record.Time == "" {
+				record.Time = "unknown"
+			}
+			data := fmt.Appendf(nil, "--- turn %d, %s\n%s", record.TurnNumber, record.Time, ev.Item.Text)
+			if !strings.HasSuffix(ev.Item.Text, "\n") {
+				data = append(data, '\n')
+			}
+			if e = emit(tailFrame{Data: data, Position: *pos}); e != nil {
+				return false, e
+			}
+		}
+	}
+	return false, ctx.Err()
 }

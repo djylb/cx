@@ -33,7 +33,7 @@ type ctlOptions struct {
 	cleanBase, all, explicitSession                            bool
 	full, json, log, watch, any, wait, raw, refresh, fromStart bool
 	inplace, interactive, web, hard, network, noNetwork        bool
-	command, reuse, sync, force, noTools                       bool
+	command, reuse, sync, force, noTools, messages             bool
 }
 
 func ctlFlags(op string, o *ctlOptions) *flag.FlagSet {
@@ -46,7 +46,7 @@ func ctlFlags(op string, o *ctlOptions) *flag.FlagSet {
 		"hard": &o.hard, "network": &o.network, "no-network": &o.noNetwork,
 		"force": &o.force, "sync": &o.sync, "no-tools": &o.noTools,
 		"full": &o.full, "json": &o.json, "log": &o.log, "watch": &o.watch,
-		"any": &o.any, "wait": &o.wait, "raw": &o.raw, "from-start": &o.fromStart,
+		"messages": &o.messages, "any": &o.any, "wait": &o.wait, "raw": &o.raw, "from-start": &o.fromStart,
 	}
 	stringsByName := map[string]*string{
 		"type": &o.kind, "mention": &o.mention, "repo": &o.repo,
@@ -176,6 +176,9 @@ func parseCtl(op string, args []string) (ctlOptions, error) {
 	})
 	if o.all && o.explicitSession {
 		return o, errors.New("--all and --session are mutually exclusive")
+	}
+	if o.raw && o.messages {
+		return o, errors.New("--raw and --messages are mutually exclusive")
 	}
 	if o.fromStart && o.since != "" {
 		return o, errors.New("--from-start and --since are mutually exclusive")

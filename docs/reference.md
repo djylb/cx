@@ -311,6 +311,10 @@ B3 已接入节点分派。`nodeCLI` 的 `snap-receive` 参数交给 `ReceiveSna
 
 `cx run HOST DIR TAG PROMPTFILE` 冻结输入，记录作业号，再由后台进程发布并登记。用 `--sync` 等待登记，用 `cx show JOB --json` 查看提交阶段、已传字节或失败原因。`cx agent --continue JOB TEXT` 接续同一会话。执行端通过 `Materialize` 准备工作树，按轮调用 `Collect` 封存报告、逐仓补丁与 artifacts。`result` 启动后台回收时返回 12，`result --wait` 等到回收完成。失败轮次的 `result` 同步读取报告，输出后返回 1。传输断开后按本地已落盘字节继续下载。
 
+`cx result JOB` 输出摘要时，在 stderr 提示 `last.md` 的绝对路径。加 `--full` 输出完整报告。回收中退出 12 时，`--json` 在 stdout 输出包含 `job`、`status: "collecting"`、`turn`、`bytes` 和 `total` 的 JSON 对象，未知总大小为 `null`。同一退出码下，`--log` 的 stdout 为空，回收进度在 stderr。
+
+`cx tail JOB --messages` 在一次执行端调用内跟随 `events.jsonl`，通过 gzip 流返回完整的 `agentMessage`，每条消息以 `--- turn N, <time>` 开头。旧事件缺少时间戳时显示 `unknown`。`--cursor NAME` 独立保存消息流的字节偏移，重连后续读。`--since N` 跳过序号不大于 N 的事件，`--from-start` 从头重放。消息模式要求控制端和执行端都支持 `--messages`。
+
 `cx close` 先回收作业进程并封存可收集的最新结果。私有检出副本在最后一个使用它的作业关闭后，通过 `git worktree remove` 和 `git worktree prune` 回收。报告、补丁和 artifacts 仍可读取，继续在已回收的快照上工作需要重新提交。终态作业也可直接用 `cx clean` 回收检出副本和私有作业数据。显式指定的工作目录由调用方管理。
 
 任务包与快照发布共用带偏移确认的 gzip 流。环境变量以秒为单位。`CX_TRANSFER_IDLE` 和 `CX_PUBLISH_IDLE` 默认 120 秒，有 I/O 进度就延续期限。`CX_PUBLISH_RETRY_WINDOW` 默认 1800 秒，设为 0 可禁用连接故障重试。发布方按目标和快照保留待确认归档，接收方按内容摘要保留已收前缀。

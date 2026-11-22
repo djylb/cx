@@ -49,6 +49,12 @@ func newControllerFixture(t *testing.T) controllerFixture {
 }
 func cliOutput(t *testing.T, code int, stdin []byte, exe string, args ...string) []byte {
 	t.Helper()
+	stdout, _ := cliStreams(t, code, stdin, exe, args...)
+	return stdout
+}
+
+func cliStreams(t *testing.T, code int, stdin []byte, exe string, args ...string) ([]byte, string) {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, exe, args...)
@@ -70,7 +76,7 @@ func cliOutput(t *testing.T, code int, stdin []byte, exe string, args ...string)
 	if actual != code {
 		t.Fatalf("%s %v: expected %d, got %d: %s %s", exe, args, code, actual, b, diag.Bytes())
 	}
-	return b
+	return b, diag.String()
 }
 func TestB1PythonContract(t *testing.T) {
 	f := newControllerFixture(t)
