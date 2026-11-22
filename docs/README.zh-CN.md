@@ -111,6 +111,6 @@ cx clean "$job"
 
 代理报告首行可以是 `STATUS: DONE`、`STATUS: PARTIAL` 或 `STATUS: BLOCKED`。判断是否交付时，结合报告和实际验证结果。
 
-## 许可
+## 许可证
 
-许可证待选定。
+Apache License 2.0，见 [LICENSE](LICENSE)。

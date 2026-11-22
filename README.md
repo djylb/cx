@@ -113,4 +113,4 @@ An agent's report can begin with `STATUS: DONE`, `STATUS: PARTIAL`, or `STATUS: 
 
 ## License
 
-License selection is pending.
+Apache License 2.0. See [LICENSE](LICENSE).
