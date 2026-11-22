@@ -352,6 +352,8 @@ func shimPath(current string) string {
 	dirs := []struct{ env, base, sub string }{
 		{"MISE_DATA_DIR", ".local/share/mise", "shims"}, {"ASDF_DATA_DIR", ".asdf", "shims"},
 		{"PYENV_ROOT", ".pyenv", "shims"}, {"RBENV_ROOT", ".rbenv", "shims"},
+		// The managers' own executables (e.g. `mise exec ...`): mise installs to ~/.local/bin by default.
+		{"", ".local", "bin"}, {"ASDF_DIR", ".asdf", "bin"}, {"PYENV_ROOT", ".pyenv", "bin"}, {"RBENV_ROOT", ".rbenv", "bin"},
 	}
 	if runtime.GOOS == "windows" {
 		if local := os.Getenv("LOCALAPPDATA"); local != "" {
