@@ -85,8 +85,11 @@ func openTestLogWriter(t *testing.T, dir string) (*stateWriter, func()) {
 func testLogLatest(t *testing.T, dir, kind string, seq, seg uint64) stateCursor {
 	t.Helper()
 	r, c, err := latestStateKind(dir, kind)
-	if err != nil || r.Seq != seq || c.Seq != seq || c.Seg != seg || (seq != 0 && c.Off == 0) {
-		t.Fatalf("latestStateKind(%q) = seq %d, cursor %v, err %v; want seq %d, seg %d", kind, r.Seq, c, err, seq, seg)
+	if err != nil {
+		t.Fatalf("latestStateKind(%q): %v", kind, err)
+	}
+	if r.Seq != seq || c.Seq != seq || c.Seg != seg || (seq != 0 && c.Off == 0) {
+		t.Fatalf("latestStateKind(%q) = seq %d, cursor %v; want seq %d, seg %d", kind, r.Seq, c, seq, seg)
 	}
 	return c
 }

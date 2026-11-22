@@ -170,10 +170,12 @@ func engineDoctorSh() string {
 		if e.loggedIn != "" {
 			in = "*" + shellQuote(e.loggedIn) + "*"
 		}
-		fmt.Fprintf(&b, "p=$(command -v %s); if [ -n \"$p\" ]; then o=$(\"$p\" %s 2>&1); rc=$?; o=$(printf %%s \"$o\" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]'); "+
+		if _, err := fmt.Fprintf(&b, "p=$(command -v %s); if [ -n \"$p\" ]; then o=$(\"$p\" %s 2>&1); rc=$?; o=$(printf %%s \"$o\" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]'); "+
 			"case \"$o\" in %s*) if [ $rc = 0 ]; then case \"$o\" in %s) s=logged_in ;; *) s=logged_out ;; esac; else s=logged_out; fi ;; esac; "+
 			"printf 'engine\\t%%s\\t%%s\\t%%s\\n' %s \"$p\" \"$s\"; fi\n",
-			shellQuote(e.binary), strings.Join(args, " "), out, in, shellQuote(e.name))
+			shellQuote(e.binary), strings.Join(args, " "), out, in, shellQuote(e.name)); err != nil {
+			panic(err) // strings.Builder.Write always returns nil.
+		}
 	}
 	return b.String()
 }
@@ -187,10 +189,12 @@ func engineDoctorPS() string {
 		for i, a := range e.loginArgs {
 			args[i] = psQuote(a)
 		}
-		fmt.Fprintf(&b, "$p=(Get-Command %s -ErrorAction SilentlyContinue).Source;$s=$null;if($p){$o=(((& $p %s 2>&1)|Out-String).ToLower() -replace '\\s','');$rc=$LASTEXITCODE;"+
+		if _, err := fmt.Fprintf(&b, "$p=(Get-Command %s -ErrorAction SilentlyContinue).Source;$s=$null;if($p){$o=(((& $p %s 2>&1)|Out-String).ToLower() -replace '\\s','');$rc=$LASTEXITCODE;"+
 			"if(%s -and $o.Contains(%s)){$s='logged_out'}elseif($rc -eq 0 -and (%s -eq '' -or $o.Contains(%s))){$s='logged_in'}else{$s='logged_out'}};"+
 			"$engines[%s]=@{path=$p;login_status=$s};",
-			psQuote(e.binary), strings.Join(args, " "), psQuote(e.loggedOut), psQuote(e.loggedOut), psQuote(e.loggedIn), psQuote(e.loggedIn), psQuote(e.name))
+			psQuote(e.binary), strings.Join(args, " "), psQuote(e.loggedOut), psQuote(e.loggedOut), psQuote(e.loggedIn), psQuote(e.loggedIn), psQuote(e.name)); err != nil {
+			panic(err) // strings.Builder.Write always returns nil.
+		}
 	}
 	return b.String()
 }

@@ -30,7 +30,7 @@ func openJobFile(path string, mode jobFileMode) (*os.File, error) {
 
 func removeJobSegment(path string) { _ = os.Remove(path) }
 
-func stateHistorySharingConflict(error) bool { return false }
+func stateHistorySharingConflict(_ error) bool { return false }
 
 func syncJobDir(path string) error {
 	f, err := openJobFile(path, jobFileDirectory)

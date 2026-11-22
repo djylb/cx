@@ -648,7 +648,7 @@ func (r *frameReader) line() ([]byte, error) {
 			return line, nil
 		}
 		r.partial = append(r.partial, chunk...)
-		if err != bufio.ErrBufferFull {
+		if !errors.Is(err, bufio.ErrBufferFull) {
 			return nil, err
 		}
 	}
@@ -743,7 +743,7 @@ func openStateTail(dir string, from stateCursor) (*stateTail, error) {
 	return openSegmentedTail(filepath.Join(dir, "state"), from)
 }
 
-// stateCursor returns the position after the last frame delivered by Next.
+// Cursor returns the position after the last frame delivered by Next.
 func (t *stateTail) Cursor() stateCursor { return t.visible }
 
 // Next returns complete, CRC-valid records up to the current end of the log.

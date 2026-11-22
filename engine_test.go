@@ -10,8 +10,11 @@ import (
 
 func TestEngineRegistry(t *testing.T) {
 	e, err := lookupEngine("")
-	if err != nil || e.name != defaultEngine {
-		t.Fatal(e.name, err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e.name != defaultEngine {
+		t.Fatalf("default engine = %q, want %q", e.name, defaultEngine)
 	}
 	for _, name := range engineNames() {
 		e, lookupErr := lookupEngine(name)

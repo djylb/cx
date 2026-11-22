@@ -161,8 +161,16 @@ func archivedDedupStatus(dir string, ref receipt) (status, error) {
 	return s, nil
 }
 
-// The registry, owner and mailbox locks protect the confirmed directory.
-func archiveAndDetachJob(ctx context.Context, root, dir string, owner *os.File, c config, s status, syncArchive func(string, string) error) error {
+// archiveAndDetachJob runs under the registry lock. It releases the owner
+// handle before renaming the directory, while still holding the mailbox locks.
+func archiveAndDetachJob(ctx context.Context, root, dir string, c config, s status, syncArchive func(string, string) error) error {
+	owner, err := openJobOwner(ctx, dir, jobFileLockExisting)
+	if err != nil {
+		return err
+	}
+	if owner == nil {
+		return errJobOwnerBusy
+	}
 	unlock, err := lockJobMailboxes(ctx, dir)
 	if err != nil {
 		return errors.Join(err, owner.Close())

@@ -69,13 +69,13 @@ func commandFixture(args []string) int {
 		return 0
 	case "cache-parent":
 		if err := launchCacheFixture(len(args) > 1); err != nil {
-			fmt.Fprintln(os.Stderr, err)
+			diagnosticf("%v\n", err)
 			return 2
 		}
 		return 0
 	case "cache-child":
 		if err := useCacheFixture(); err != nil {
-			fmt.Fprintln(os.Stderr, err)
+			diagnosticf("%v\n", err)
 			return 2
 		}
 		return 0

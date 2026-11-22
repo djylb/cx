@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"io"
 	"os"
 	"time"
@@ -29,7 +30,7 @@ func readStdin(ctx context.Context, p []byte) (int, error) {
 		fds.Set(unix.Stdin)
 		timeout := unix.NsecToTimeval(wait.Nanoseconds())
 		ready, e := unix.Select(unix.Stdin+1, &fds, nil, nil, &timeout)
-		if e == unix.EINTR || (e == nil && ready == 0) {
+		if errors.Is(e, unix.EINTR) || (e == nil && ready == 0) {
 			continue
 		}
 		if e != nil {
@@ -38,10 +39,10 @@ func readStdin(ctx context.Context, p []byte) (int, error) {
 		// If readiness wins, return the data even if cancellation races
 		// the read. The next read checks its own deadline.
 		n, e := unix.Read(unix.Stdin, p)
-		switch e {
-		case unix.EINTR, unix.EAGAIN:
+		switch {
+		case errors.Is(e, unix.EINTR), errors.Is(e, unix.EAGAIN):
 			continue
-		case nil:
+		case e == nil:
 			if n == 0 {
 				return 0, io.EOF
 			}

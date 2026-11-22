@@ -638,7 +638,7 @@ func runNode(ctx context.Context, args []string, directSubmit bool) error {
 		c.DedupKey = ""
 		op = "start"
 	}
-	if need, ok := commandNeeds[op]; ok && op != "fork" && op != "resume" {
+	if need, ok := commandNeeds[op]; ok && op != "resume" {
 		if err = checkJobCapability(dir, op, need); err != nil {
 			return err
 		}
@@ -1070,14 +1070,7 @@ func runNode(ctx context.Context, args []string, directSubmit bool) error {
 		if !confirmed.final || confirmedCursor != cursor {
 			return errJobReplaced
 		}
-		owner, ownerErr := openJobOwner(ctx, dir, jobFileLockExisting)
-		if ownerErr != nil {
-			return ownerErr
-		}
-		if owner == nil {
-			return errJobOwnerBusy
-		}
-		if detachErr := archiveAndDetachJob(ctx, root, dir, owner, c, r.s, syncJobTree); detachErr != nil {
+		if detachErr := archiveAndDetachJob(ctx, root, dir, c, r.s, syncJobTree); detachErr != nil {
 			return detachErr
 		}
 		_ = guard.Close()

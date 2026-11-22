@@ -165,8 +165,8 @@ func (o *jobStateObserver) read() error {
 		if o.floor != nil && completion.RunID == o.floor.RunID && completion.Number > o.floor.Finished &&
 			completion.TurnID != "" && (o.selected == nil || completion.Number < o.selected.Number ||
 			completion.Number == o.selected.Number && completion.TurnID == o.selected.TurnID) {
-			copy := completion
-			o.selected = &copy
+			selected := completion
+			o.selected = &selected
 		}
 	}
 	o.cursor = cur

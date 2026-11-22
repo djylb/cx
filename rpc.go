@@ -119,24 +119,26 @@ func (r *runner) rpcFiles(repliesOnly bool) error {
 		if err := r.claimInbox(record, "deliver"); err != nil {
 			return err
 		}
-		receipt, err := r.finishRPC(record.ID, env, parseErr)
-		if receipt.Op == "" {
+		receipt, transportErr, err := r.finishRPC(record.ID, env, parseErr)
+		if err != nil {
 			return err
 		}
-		return errors.Join(err, r.ackInbox(record, receipt.inboxResult()))
+		return errors.Join(transportErr, r.ackInbox(record, receipt.inboxResult()))
 	}
 	return nil
 }
 
-func (r *runner) finishRPC(id string, env envelope, parseErr error) (receiptRecord, error) {
-	receipt := receiptRecord{Op: id, Generation: r.s.Generation, Status: "completed"}
+// finishRPC returns a committed receipt when receiptErr is nil. A separate transport
+// error lets the caller acknowledge the receipt before handling a disconnect.
+func (r *runner) finishRPC(id string, env envelope, parseErr error) (receipt receiptRecord, transportErr, receiptErr error) {
+	receipt = receiptRecord{Op: id, Generation: r.s.Generation, Status: "completed"}
 	if parseErr == nil {
 		receipt.Answer, parseErr = r.executeRPC(id, env, &receipt.AgentReply)
 	}
 	if len(receipt.Answer) != 0 {
 		filtered, err := r.c.secret.jsonOutput(receipt.Answer)
 		if err != nil {
-			return receiptRecord{}, err
+			return receiptRecord{}, nil, err
 		}
 		receipt.Answer = filtered
 	}
@@ -154,12 +156,12 @@ func (r *runner) finishRPC(id string, env envelope, parseErr error) (receiptReco
 		}
 	}
 	if err := r.commitReceipt(receipt); err != nil {
-		return receiptRecord{}, err
+		return receiptRecord{}, nil, err
 	}
 	if errors.Is(parseErr, errServerClosed) {
-		return receipt, parseErr
+		return receipt, parseErr, nil
 	}
-	return receipt, nil
+	return receipt, nil, nil
 }
 
 const detachedReview = "cxrun/reviewDetached"
@@ -336,9 +338,13 @@ func (r *runner) fork(params fields, dst any) error {
 		if err = r.claimInbox(stateRecord{ID: initialForkOp}, "deliver"); err != nil {
 			return err
 		}
-		receipt, err = r.finishRPC(initialForkOp, e, nil)
+		var transportErr error
+		receipt, transportErr, err = r.finishRPC(initialForkOp, e, nil)
 		if err != nil {
 			return err
+		}
+		if transportErr != nil {
+			return transportErr
 		}
 	}
 	if receipt.Error != nil {

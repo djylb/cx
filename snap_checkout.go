@@ -137,7 +137,7 @@ func removeUnpublishedWorktree(mirror snapGit, dst string) error {
 	if err != nil {
 		return err
 	}
-	for _, field := range strings.Split(string(paths), "\x00") {
+	for _, field := range strings.Split(paths, "\x00") {
 		path, ok := strings.CutPrefix(field, "worktree ")
 		if ok && (filepath.Clean(path) == filepath.Clean(dst) || filepath.Clean(path) == actual) {
 			return mirror.worktree("remove", "--force", dst)

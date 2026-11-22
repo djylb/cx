@@ -1085,8 +1085,11 @@ func TestIndexedRetryDoesNotReplayOlderMailboxFrames(t *testing.T) {
 		t.Fatal(updateErr)
 	}
 	retry, err := appendJobMailbox(t.Context(), dir, "inbox", nil, request, nil)
-	if err != nil || retry.Seq != published.Seq {
-		t.Fatalf("indexed retry parsed the damaged prefix: %d (%v), want %d", retry.Seq, err, published.Seq)
+	if err != nil {
+		t.Fatalf("indexed retry failed with a damaged prefix: %v", err)
+	}
+	if retry.Seq != published.Seq {
+		t.Fatalf("indexed retry returned sequence %d, want %d", retry.Seq, published.Seq)
 	}
 }
 
@@ -1111,13 +1114,8 @@ func TestArchiveFailureLeavesOriginalJobRegistered(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	owner, err := lockPath(filepath.Join(dir, "owner.lock"), 0)
-	if err != nil || owner == nil {
-		closeBestEffort(guard)
-		t.Fatal(owner, err)
-	}
 	fault := errors.New("archive namespace flush failed after link")
-	err = archiveAndDetachJob(ctx, root, dir, owner, c, s, func(archive, bound string) error {
+	err = archiveAndDetachJob(ctx, root, dir, c, s, func(archive, bound string) error {
 		entries, readErr := os.ReadDir(archive)
 		if readErr != nil || len(entries) != 1 || bound != root {
 			t.Errorf("archive had no link when its barrier ran: %v %v", entries, readErr)

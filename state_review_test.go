@@ -175,8 +175,11 @@ func TestOutboxRetryReusesDeadlineAndRequest(t *testing.T) {
 	}
 	outbox := filepath.Join(dir, "outbox")
 	record, readErr := findMailboxID(outbox, filepath.Join(outbox, ".ids", snapSum([]byte("op/retry"))), "op/retry")
-	if readErr != nil || !strings.HasPrefix(string(record.Value), `{"timeout_ns":1000000000,"deadline":`) {
-		t.Fatalf("outbox retry requires the existing JSON field order: %s (%v)", record.Value, readErr)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if !strings.HasPrefix(string(record.Value), `{"timeout_ns":1000000000,"deadline":`) {
+		t.Fatalf("outbox retry requires the existing JSON field order: %s", record.Value)
 	}
 	if err := os.RemoveAll(filepath.Join(dir, "outbox", ".ids")); err != nil {
 		t.Fatal(err)

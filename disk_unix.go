@@ -11,4 +11,4 @@ func diskSpace(path string) (free, total uint64, err error) {
 }
 
 // Unix volumes have no Windows content-indexing attribute.
-func markStateNotIndexed(string) error { return nil }
+func markStateNotIndexed(_ string) error { return nil }
