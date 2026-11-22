@@ -97,8 +97,10 @@ func replaceFile(from, to string) error {
 	})
 }
 
+// Some volumes and filter drivers reject the POSIX rename request itself, observed as
+// ERROR_INVALID_NAME for an ordinary path; plain MoveFileEx replacement still works there.
 func posixRenameUnavailable(err error) bool {
-	return errors.Is(err, windows.ERROR_NOT_SUPPORTED) || errors.Is(err, windows.ERROR_INVALID_PARAMETER)
+	return errors.Is(err, windows.ERROR_NOT_SUPPORTED) || errors.Is(err, windows.ERROR_INVALID_PARAMETER) || errors.Is(err, windows.ERROR_INVALID_NAME)
 }
 
 func extendedWindowsPath(path string) string {
