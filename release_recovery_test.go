@@ -20,64 +20,64 @@ func TestRecoveryAndRotationAfterFirstSegmentReclaimed(t *testing.T) {
 	startFixtureWriter(t, &r)
 	appendRPC := func(id string) stateRecord {
 		t.Helper()
-		rec, err := newRecord("rpc", fields{"method": "thread/read"})
-		if err != nil {
-			t.Fatal(err)
+		rec, recordErr := newRecord("rpc", fields{"method": "thread/read"})
+		if recordErr != nil {
+			t.Fatal(recordErr)
 		}
 		rec.ID = id
-		msg, err := appendInbox(t.Context(), dir, rec, nil)
-		if err != nil {
-			t.Fatal(err)
+		msg, recordErr := appendInbox(t.Context(), dir, rec, nil)
+		if recordErr != nil {
+			t.Fatal(recordErr)
 		}
 		return msg
 	}
 	delivered, claimed := appendRPC("completed"), appendRPC("claimed")
-	if err := r.refreshInbox(); err != nil {
-		t.Fatal(err)
+	if refreshErr := r.refreshInbox(); refreshErr != nil {
+		t.Fatal(refreshErr)
 	}
-	if err := r.commitReceipt(receiptRecord{Op: delivered.ID, Status: "ok"}); err != nil {
-		t.Fatal(err)
+	if receiptErr := r.commitReceipt(receiptRecord{Op: delivered.ID, Status: "ok"}); receiptErr != nil {
+		t.Fatal(receiptErr)
 	}
-	if err := r.ackInbox(delivered, "delivered"); err != nil {
-		t.Fatal(err)
+	if ackErr := r.ackInbox(delivered, "delivered"); ackErr != nil {
+		t.Fatal(ackErr)
 	}
-	if err := r.claimInbox(claimed, "deliver"); err != nil {
-		t.Fatal(err)
+	if claimErr := r.claimInbox(claimed, "deliver"); claimErr != nil {
+		t.Fatal(claimErr)
 	}
-	if err := r.publishTurnReport("first", []byte("retained report")); err != nil {
-		t.Fatal(err)
+	if reportErr := r.publishTurnReport("first", []byte("retained report")); reportErr != nil {
+		t.Fatal(reportErr)
 	}
 	r.stateLog.SetRotateBytes(1)
 	for range 3 {
-		if err := r.save(); err != nil {
-			t.Fatal(err)
+		if saveErr := r.save(); saveErr != nil {
+			t.Fatal(saveErr)
 		}
 	}
-	if _, err := os.Stat(segmentPath(r.stateLog.dir, 1)); !os.IsNotExist(err) {
-		t.Fatalf("first segment was not reclaimed: %v", err)
+	if _, statErr := os.Stat(segmentPath(r.stateLog.dir, 1)); !os.IsNotExist(statErr) {
+		t.Fatalf("first segment was not reclaimed: %v", statErr)
 	}
-	if err := errors.Join(r.inbox.tail.Close(), r.stateLog.Close()); err != nil {
-		t.Fatal(err)
+	if closeErr := errors.Join(r.inbox.tail.Close(), r.stateLog.Close()); closeErr != nil {
+		t.Fatal(closeErr)
 	}
 	restarted := runner{dir: dir, s: s}
 	startFixtureWriter(t, &restarted)
-	if err := restarted.stateLog.RecoveryError(); err != nil {
-		t.Fatal(err)
+	if recoveryErr := restarted.stateLog.RecoveryError(); recoveryErr != nil {
+		t.Fatal(recoveryErr)
 	}
-	if err := restarted.recoverRPC(); err != nil {
-		t.Fatal(err)
+	if recoverErr := restarted.recoverRPC(); recoverErr != nil {
+		t.Fatal(recoverErr)
 	}
 	defer closeBestEffort(restarted.inbox.tail)
-	if err := restarted.refreshInbox(); err != nil {
-		t.Fatal(err)
+	if refreshErr := restarted.refreshInbox(); refreshErr != nil {
+		t.Fatal(refreshErr)
 	}
 	if len(restarted.inbox.queue) != 0 || restarted.inbox.acks[claimed.Seq].Result != "uncertain" {
 		t.Fatalf("recovery exposed old RPCs for replay: %+v", restarted.inbox.queue)
 	}
 	restarted.stateLog.SetRotateBytes(1)
 	for range 3 {
-		if err := restarted.save(); err != nil {
-			t.Fatal(err)
+		if saveErr := restarted.save(); saveErr != nil {
+			t.Fatal(saveErr)
 		}
 	}
 	in, err := readInboxState(dir)
@@ -163,25 +163,25 @@ func TestQueuedGenerationSurvivesLostReasonFrame(t *testing.T) {
 	startFixtureWriter(t, &r)
 	var durable int64
 	r.stateLog.syncFn = func(f *os.File) error {
-		info, err := f.Stat()
-		if err == nil {
+		info, statErr := f.Stat()
+		if statErr == nil {
 			durable = info.Size()
 		}
-		return errors.Join(err, syncJobFile(f))
+		return errors.Join(statErr, syncJobFile(f))
 	}
-	if err := r.setQueueReason("disk"); err != nil {
-		t.Fatal(err)
+	if queueErr := r.setQueueReason("disk"); queueErr != nil {
+		t.Fatal(queueErr)
 	}
 	observed, _, err := loadJobStatus(dir)
 	if err != nil || observed.QueueReason != "disk" || observed.QueueGeneration == 0 {
 		t.Fatalf("queue reason never became visible: %+v %v", observed, err)
 	}
 	old := segmentPath(r.stateLog.dir, r.stateLog.seg)
-	if err := r.stateLog.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := r.stateLog.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
-	if err := os.Truncate(old, durable); err != nil {
-		t.Fatal(err)
+	if truncateErr := os.Truncate(old, durable); truncateErr != nil {
+		t.Fatal(truncateErr)
 	}
 	s, _, err = loadJobStatus(dir)
 	if err != nil || s.QueueReason != "" || s.QueueGeneration != observed.QueueGeneration {
@@ -210,14 +210,14 @@ func TestOutboxDamageAfterCheckpointBlocksPollAndTerminal(t *testing.T) {
 	addAsk := func(name string) agentMail {
 		t.Helper()
 		m := agentMail{Type: "ask", To: "parent", Question: name, Blocking: true, Timeout: time.Hour}
-		if err := appendMail(t.Context(), dir, id, name, &m); err != nil {
-			t.Fatal(err)
+		if mailErr := appendMail(t.Context(), dir, id, name, &m); mailErr != nil {
+			t.Fatal(mailErr)
 		}
 		return m
 	}
 	addAsk("confirmed")
-	if err := r.pollAgentMail(); err != nil {
-		t.Fatal(err)
+	if pollErr := r.pollAgentMail(); pollErr != nil {
+		t.Fatal(pollErr)
 	}
 	at := r.inbox.outbox
 	addAsk("damaged")
@@ -227,21 +227,21 @@ func TestOutboxDamageAfterCheckpointBlocksPollAndTerminal(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err = f.WriteAt([]byte("!"), int64(at.Off))
-	if err := errors.Join(err, f.Close()); err != nil {
-		t.Fatal(err)
+	if updateErr := errors.Join(err, f.Close()); updateErr != nil {
+		t.Fatal(updateErr)
 	}
 	later := agentMail{Type: "ask", Seq: 3, RunID: s.RunID, Request: "ask-3", Blocking: true}
-	if err := writeJobBytes(segmentPath(path, 2), testLogFrame(t, 3, "ask", later)); err != nil {
-		t.Fatal(err)
+	if writeErr := writeJobBytes(segmentPath(path, 2), testLogFrame(t, 3, "ask", later)); writeErr != nil {
+		t.Fatal(writeErr)
 	}
 	for range 2 {
-		if err := r.pollAgentMail(); !errors.Is(err, errLogDamage) || r.inbox.outbox != at {
-			t.Fatalf("damaged unacknowledged suffix was crossed: %v, %v", r.inbox.outbox, err)
+		if pollErr := r.pollAgentMail(); !errors.Is(pollErr, errLogDamage) || r.inbox.outbox != at {
+			t.Fatalf("damaged unacknowledged suffix was crossed: %v, %v", r.inbox.outbox, pollErr)
 		}
 	}
 	r.s.State = "done"
-	if err := r.saveTerminal(); !errors.Is(err, errLogDamage) {
-		t.Fatalf("published success after losing an ask: %v", err)
+	if terminalErr := r.saveTerminal(); !errors.Is(terminalErr, errLogDamage) {
+		t.Fatalf("published success after losing an ask: %v", terminalErr)
 	}
 	terminal, _, err := loadJobStatus(dir)
 	if err != nil || !terminal.final || terminal.State != "failed" {
@@ -397,8 +397,8 @@ func TestNodeRejectsAnOlderUnmarkedStateRootBeforeRegistering(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := errors.Join(w.Append(outboxSeenKind, 3), w.Close()); err != nil {
-		t.Fatal(err)
+	if logErr := errors.Join(w.Append(outboxSeenKind, 3), w.Close()); logErr != nil {
+		t.Fatal(logErr)
 	}
 	t.Setenv("CXRUN_STATE", root)
 	err = run(t.Context(), []string{"start", "--job", "new", "--dir", root, "--cmd", "--", "not-started"})

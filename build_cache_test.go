@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -35,12 +36,12 @@ func TestCacheEvictsOnlyRegisteredTreesOnStateMount(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Rename(replaced, filepath.Join(root, "retired")); err != nil {
-		t.Fatal(err)
+	if renameErr := os.Rename(replaced, filepath.Join(root, "retired")); renameErr != nil {
+		t.Fatal(renameErr)
 	}
 	makeCacheFixture(t, replaced, 1001)
-	if err := os.WriteFile(filepath.Join(replaced, cacheIdentityFile), marker, 0600); err != nil {
-		t.Fatal(err)
+	if writeErr := os.WriteFile(filepath.Join(replaced, cacheIdentityFile), marker, 0600); writeErr != nil {
+		t.Fatal(writeErr)
 	}
 
 	// Inject a mount ID change without a privileged bind mount. The mount
@@ -160,7 +161,7 @@ func cacheFixturePaths() []string {
 	}
 }
 
-func launchCacheFixture(dropTracking bool) error {
+func launchCacheFixture(dropTracking bool) (launchErr error) {
 	child := exec.Command(os.Args[0], "fixture-command", "cache-child")
 	if dropTracking {
 		// Leave the inherited process group as the only link to the run.
@@ -172,7 +173,11 @@ func launchCacheFixture(dropTracking bool) error {
 	if err := child.Start(); err != nil {
 		return err
 	}
-	defer child.Process.Release()
+	defer func() {
+		if releaseErr := child.Process.Release(); releaseErr != nil {
+			launchErr = errors.Join(launchErr, releaseErr)
+		}
+	}()
 	for deadline := time.Now().Add(4 * time.Second); time.Now().Before(deadline); {
 		if _, err := os.Stat("cache-child.json"); err == nil {
 			if _, err := os.Stat("cache-parent-finish"); err == nil {

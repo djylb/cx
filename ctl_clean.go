@@ -69,7 +69,7 @@ func bindWorkspace(root, cwd string) (workspaceBinding, error) {
 	parts := strings.Split(filepath.ToSlash(rel), "/")
 	for n := 1; n <= min(2, len(parts)); n++ {
 		id := strings.Join(parts[:n], "/")
-		if _, err := jobDir(base, id); err == nil {
+		if _, pathErr := jobDir(base, id); pathErr == nil {
 			bound.ids = append(bound.ids, id)
 		}
 	}
@@ -162,12 +162,12 @@ func workspaceUser(ctx context.Context, root, work, id string) (string, error) {
 	}
 	var user string
 	err = walkJobDirs(ctx, root, "", func(dir, _, _ string) (bool, bool, error) {
-		s, _, err := loadJobStatus(dir)
-		if errors.Is(err, os.ErrNotExist) {
+		s, _, statusErr := loadJobStatus(dir)
+		if errors.Is(statusErr, os.ErrNotExist) {
 			return false, false, nil
 		}
-		if err != nil {
-			return true, false, err
+		if statusErr != nil {
+			return true, false, statusErr
 		}
 		other := s.Job
 		if s.Project != "" {
@@ -177,16 +177,16 @@ func workspaceUser(ctx context.Context, root, work, id string) (string, error) {
 			return true, false, nil
 		}
 		var c config
-		if err := readJobConfig(dir, &c); err != nil {
-			return true, false, err
+		if configErr := readJobConfig(dir, &c); configErr != nil {
+			return true, false, configErr
 		}
 		if !snapWithin(work, c.Dir) {
-			cwd, err := filepath.EvalSymlinks(c.Dir)
-			if os.IsNotExist(err) {
+			cwd, resolveErr := filepath.EvalSymlinks(c.Dir)
+			if os.IsNotExist(resolveErr) {
 				return true, false, nil
 			}
-			if err != nil {
-				return true, false, err
+			if resolveErr != nil {
+				return true, false, resolveErr
 			}
 			if !snapWithin(work, cwd) {
 				return true, false, nil
@@ -194,17 +194,17 @@ func workspaceUser(ctx context.Context, root, work, id string) (string, error) {
 		}
 		// The workspace operation lock prevents a coordinated restart.
 		// This probe cannot acquire the registry while close holds owner.lock.
-		free, err := probeJobOwner(dir)
-		if os.IsNotExist(err) {
+		free, probeErr := probeJobOwner(dir)
+		if os.IsNotExist(probeErr) {
 			return false, false, nil
 		}
-		if err != nil {
-			return true, false, err
+		if probeErr != nil {
+			return true, false, probeErr
 		}
 		if free {
-			pending, err := commandHandoffPending(dir, s)
-			if err != nil || !pending {
-				return true, false, err
+			pending, handoffErr := commandHandoffPending(dir, s)
+			if handoffErr != nil || !pending {
+				return true, false, handoffErr
 			}
 		}
 		user = other

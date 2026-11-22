@@ -16,17 +16,18 @@ import (
 )
 
 type waitCursor struct {
-	StateCursor  string `json:"state_cursor"`
-	OutboxCursor string `json:"outbox_cursor,omitempty"`
+	StateCursor  string   `json:"state_cursor"`
+	OutboxCursor string   `json:"outbox_cursor,omitempty"`
+	Question     string   `json:"question,omitempty"`
+	RunID        string   `json:"run_id,omitempty"`
+	Terminal     string   `json:"terminal,omitempty"`
+	Withdrawals  []uint64 `json:"withdrawals,omitempty"`
+
 	// Notification acknowledgements can lag the state tail while a job is
 	// busy. OutboxSeq belongs to the independent outbox stream.
-	Question        string   `json:"question,omitempty"`
-	RunID           string   `json:"run_id,omitempty"`
-	Terminal        string   `json:"terminal,omitempty"`
-	OutboxSeq       uint64   `json:"outbox_seq,omitempty"`
-	Finished        int64    `json:"completed_turns"`
-	QueueGeneration uint64   `json:"queue_generation,omitempty"`
-	Withdrawals     []uint64 `json:"withdrawals,omitempty"`
+	OutboxSeq       uint64 `json:"outbox_seq,omitempty"`
+	Finished        int64  `json:"completed_turns"`
+	QueueGeneration uint64 `json:"queue_generation,omitempty"`
 }
 
 type waitReport struct {
@@ -35,11 +36,11 @@ type waitReport struct {
 	State       string `json:"status"`
 	QueueReason string `json:"queue_reason,omitempty"`
 	Outcome     string `json:"outcome"`
+	Event       string `json:"event"`
+	EventID     string `json:"event_id"`
 	OutboxSeq   uint64 `json:"outbox_seq,omitempty"`
 	Finished    int64  `json:"completed_turns"`
 	Code        int    `json:"code"`
-	Event       string `json:"event"`
-	EventID     string `json:"event_id"`
 }
 
 const exitQueued = 13
@@ -123,13 +124,13 @@ func selectWaitAny(ctx context.Context, root, project, session string, baseline 
 	// to another result must retain its original persisted cursor.
 	type observedJob struct {
 		*jobStateObserver
-		key     string
-		seen    uint64
-		started bool
-		floor   waitFloor
-		outbox  uint64
 		mail    *stateTail
+		key     string
+		floor   waitFloor
 		anchor  stateCursor
+		seen    uint64
+		outbox  uint64
+		started bool
 	}
 	jobs := make(map[string]*observedJob)
 	defer func() {
@@ -168,9 +169,9 @@ func selectWaitAny(ctx context.Context, root, project, session string, baseline 
 						return false, false, err
 					}
 				}
-				observer, err := openJobObservation(dir, from, before.RunID)
-				if err != nil {
-					return false, false, err
+				observer, openErr := openJobObservation(dir, from, before.RunID)
+				if openErr != nil {
+					return false, false, openErr
 				}
 				if baseline != nil && (before.RunID == "" || before.RunID == observer.s.RunID) {
 					observer.floor = &status{RunID: observer.s.RunID, Finished: before.Finished}
@@ -181,8 +182,8 @@ func selectWaitAny(ctx context.Context, root, project, session string, baseline 
 				jobs[dir] = job
 			}
 			job.seen = scan
-			if err := job.read(); err != nil {
-				return false, false, err
+			if readErr := job.read(); readErr != nil {
+				return false, false, readErr
 			}
 			if job.s.State == "" {
 				return false, false, nil
@@ -190,19 +191,19 @@ func selectWaitAny(ctx context.Context, root, project, session string, baseline 
 			if (project != "" && p != project) || (session != "" && job.s.Session != session) {
 				return true, false, nil
 			}
-			if err := job.project(ctx); errors.Is(err, os.ErrNotExist) {
+			if projectErr := job.project(ctx); errors.Is(projectErr, os.ErrNotExist) {
 				return false, false, nil
-			} else if err != nil {
-				return true, false, err
+			} else if projectErr != nil {
+				return true, false, projectErr
 			}
 			s := job.s
 			if !job.started || replacedRun(job.floor.runID, s.RunID) {
-				busy, err := waitStart(job.jobStateObserver)
-				if errors.Is(err, os.ErrNotExist) {
+				busy, startErr := waitStart(job.jobStateObserver)
+				if errors.Is(startErr, os.ErrNotExist) {
 					return false, false, nil
 				}
-				if err != nil {
-					return true, false, err
+				if startErr != nil {
+					return true, false, startErr
 				}
 				s = job.s
 				job.floor = waitFloor{s.RunID, s.Finished, busy}
@@ -210,16 +211,18 @@ func selectWaitAny(ctx context.Context, root, project, session string, baseline 
 				job.outbox = 0
 				var from stateCursor
 				if before.RunID == s.RunID && before.OutboxCursor != "" {
-					from, err = parseCursor(before.OutboxCursor)
-					if err != nil {
-						return true, false, err
+					var cursorErr error
+					from, cursorErr = parseCursor(before.OutboxCursor)
+					if cursorErr != nil {
+						return true, false, cursorErr
 					}
 				}
 				if s.Engine != "cmd" {
 					closeBestEffort(job.mail)
-					job.mail, err = openOutboxTail(dir, from)
-					if err != nil {
-						return true, false, err
+					var tailErr error
+					job.mail, tailErr = openOutboxTail(dir, from)
+					if tailErr != nil {
+						return true, false, tailErr
 					}
 				}
 			}
@@ -433,44 +436,44 @@ func deliverNotice(ctx context.Context, dir string, identity jobIdentity, eventI
 	folder := filepath.Join(dir, ".notices")
 	path := filepath.Join(folder, eventID)
 	underInbox := func(fn func() error) error {
-		inbox, err := lockMailbox(ctx, mailboxLockPath(dir, "inbox"))
-		if err != nil {
-			return err
+		inbox, lockErr := lockMailbox(ctx, mailboxLockPath(dir, "inbox"))
+		if lockErr != nil {
+			return lockErr
 		}
 		defer closeBestEffort(inbox)
-		s, _, err := loadJobStatus(dir)
-		if err != nil {
-			return err
+		s, _, statusErr := loadJobStatus(dir)
+		if statusErr != nil {
+			return statusErr
 		}
-		if err = identity.check(dir, s); err != nil {
-			return err
+		if identityErr := identity.check(dir, s); identityErr != nil {
+			return identityErr
 		}
 		return fn()
 	}
 	var exists bool
 	err = underInbox(func() error {
-		_, err := os.Lstat(path)
-		exists = err == nil
-		if os.IsNotExist(err) {
+		_, statErr := os.Lstat(path)
+		exists = statErr == nil
+		if os.IsNotExist(statErr) {
 			return nil
 		}
-		return err
+		return statErr
 	})
 	if err != nil || exists {
 		return false, err
 	}
-	if err := output(); err != nil {
-		return false, err
+	if outputErr := output(); outputErr != nil {
+		return false, outputErr
 	}
 	if !acknowledge {
 		return true, nil
 	}
 	err = underInbox(func() error {
-		if err := os.Mkdir(folder, 0700); err != nil && !os.IsExist(err) {
-			return err
+		if mkdirErr := os.Mkdir(folder, 0700); mkdirErr != nil && !os.IsExist(mkdirErr) {
+			return mkdirErr
 		}
-		if err := writeJobBytes(path, nil); err != nil {
-			return err
+		if writeErr := writeJobBytes(path, nil); writeErr != nil {
+			return writeErr
 		}
 		return syncJobTree(folder, dir)
 	})

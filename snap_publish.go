@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"sort"
 	"strconv"
@@ -141,6 +142,11 @@ func snapArchive(ctx context.Context, store, id, receipts, dst string, full bool
 		g := snapGit{ctx: ctx, dir: r.bare(store)}
 		p := filepath.Join(tmp, name)
 		args := []string{"bundle", "create", p}
+		if runtime.GOOS == "windows" {
+			// Resolving a full object ID loads Git's config before it looks up
+			// the long loose refs. The named refs supply the bundle headers.
+			args = append(args, oids[0]+"^{commit}")
+		}
 		for _, oid := range oids {
 			args = append(args, "refs/snapshots/"+oid)
 		}
@@ -150,7 +156,7 @@ func snapArchive(ctx context.Context, store, id, receipts, dst string, full bool
 				args = append(args, oid, oid+"^{tree}")
 			}
 		}
-		if _, e = g.get(args...); e != nil {
+		if _, e = g.get(append(args, "--")...); e != nil {
 			return e
 		}
 		if len(old) > 0 {
@@ -329,8 +335,8 @@ func initSnapshotBare(g snapGit, r SnapshotRepo, bare string) error {
 			if len(r.OID) == 64 {
 				format = "sha256"
 			}
-			_, err := g.get("init", "-q", "--bare", "--object-format="+format, bare)
-			return err
+			_, initErr := g.get("init", "-q", "--bare", "--object-format="+format, bare)
+			return initErr
 		} else if err != nil {
 			return err
 		}
@@ -354,7 +360,7 @@ func syncSnapshotRepoWith(bare string, syncFile func(*os.File) error, syncDir fu
 	}
 	for _, name := range []string{"HEAD", "config", "shallow", "packed-refs"} {
 		err := syncPath(filepath.Join(bare, name))
-		if err != nil && !(os.IsNotExist(err) && (name == "shallow" || name == "packed-refs")) {
+		if err != nil && (!os.IsNotExist(err) || name != "shallow" && name != "packed-refs") {
 			return err
 		}
 	}

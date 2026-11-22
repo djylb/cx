@@ -77,7 +77,9 @@ func TestCommandInputNamedFIFOEOF(t *testing.T) {
 		if _, e := io.ReadFull(in, p[:]); e != nil || p[0] != 'x' {
 			t.Fatalf("FIFO data: %q, %v", p[:], e)
 		}
-		fmt.Fprintln(os.Stdout, "read")
+		if _, err := fmt.Fprintln(os.Stdout, "read"); err != nil {
+			t.Fatal(err)
+		}
 		if _, e := in.Read(p[:]); e != io.EOF {
 			t.Fatalf("FIFO hangup: %v", e)
 		}
@@ -202,8 +204,8 @@ func TestSnapshotLockDoesNotSpendReadIdleBudget(t *testing.T) {
 	}
 	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestSnapshotLockDoesNotSpendReadIdleBudget$")
 	cmd.Stdin = &wire
-	if out, e := cmd.CombinedOutput(); e != nil {
-		t.Fatalf("snapshot receiver: %v: %s", e, out)
+	if out, runErr := cmd.CombinedOutput(); runErr != nil {
+		t.Fatalf("snapshot receiver: %v: %s", runErr, out)
 	}
 	if _, _, e = snapManifest(target, string(id)); e != nil {
 		t.Fatal(e)

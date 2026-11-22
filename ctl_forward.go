@@ -66,23 +66,23 @@ func ctlForward(ctx context.Context, op string, args []string) error {
 				return err
 			}
 		}
-		ctx, cancel := context.WithCancel(ctx)
+		hostsCtx, cancel := context.WithCancel(ctx)
 		defer cancel()
 		type factsReply struct {
-			index int
-			data  []byte
 			err   error
+			data  []byte
+			index int
 		}
 		replies := make(chan factsReply, len(names))
 		for i, name := range names {
 			go func() {
-				hostCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+				hostCtx, cancel := context.WithTimeout(hostsCtx, 60*time.Second)
 				defer cancel()
 				r, err := hs[name].call(hostCtx, 30*time.Second, "facts")
 				if err == nil && r.code != 0 {
 					err = ctlExit(r.code)
 				}
-				replies <- factsReply{i, r.data, err}
+				replies <- factsReply{index: i, data: r.data, err: err}
 			}()
 		}
 		enc := json.NewEncoder(os.Stdout)

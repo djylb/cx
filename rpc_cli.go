@@ -337,9 +337,9 @@ func (o *options) publish(ctx context.Context, dir string, identity jobIdentity,
 			return nil
 		}
 
-		eng, err := liveAgentEngine(s)
-		if err != nil {
-			return err
+		eng, engineErr := liveAgentEngine(s)
+		if engineErr != nil {
+			return engineErr
 		}
 		if !eng.caps().RPC {
 			return eng.unsupported("engine RPC")

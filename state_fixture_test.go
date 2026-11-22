@@ -18,8 +18,8 @@ func writeFixtureStatus(dir string, s status, report ...string) error {
 	if err = owner.Close(); err != nil {
 		return err
 	}
-	if err := initMailboxLocks(dir); err != nil {
-		return err
+	if mailboxErr := initMailboxLocks(dir); mailboxErr != nil {
+		return mailboxErr
 	}
 	var c config
 	if err = readJobConfig(dir, &c); err != nil && !errors.Is(err, errNotRegistered) {

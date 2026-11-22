@@ -195,25 +195,25 @@ func projectJobStatusWithBarrier(ctx context.Context, dir string, s *status, bar
 	if err != nil || !free {
 		return false, err
 	}
-	if err := checkJobHandle(owner, path); err != nil {
-		return false, err
+	if handleErr := checkJobHandle(owner, path); handleErr != nil {
+		return false, handleErr
 	}
 	if _, err = readJobStatus(dir, s); err != nil {
 		return false, err
 	}
-	if err := identity.check(dir, *s); err != nil {
-		return false, err
+	if identityErr := identity.check(dir, *s); identityErr != nil {
+		return false, identityErr
 	}
 	if s.final {
 		return true, nil
 	}
-	if pending, err := commandHandoffPending(dir, *s); err != nil || pending {
-		return false, err
+	if pending, handoffErr := commandHandoffPending(dir, *s); handoffErr != nil || pending {
+		return false, handoffErr
 	}
 	// The owner and pinned directory protect recovery from reassignment.
 	// Filesystem barriers and mailbox recovery do not require the registry.
-	if err := guard.Close(); err != nil {
-		return false, err
+	if closeErr := guard.Close(); closeErr != nil {
+		return false, closeErr
 	}
 	r := runner{dir: dir, s: *s, root: root, ctx: ctx}
 	if err = readJobConfig(dir, &r.c); err != nil {

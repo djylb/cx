@@ -54,12 +54,12 @@ func TestFinalDirectoryBarrierCanBeRetriedOnSameTail(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := w.Final("done", receipt); !errors.Is(err, fault) {
-		t.Fatalf("final did not report post-link error: %v", err)
+	if finalErr := w.Final("done", receipt); !errors.Is(finalErr, fault) {
+		t.Fatalf("final did not report post-link error: %v", finalErr)
 	}
 	tail.syncDir = func(string) error { return fault }
-	if records, err := tail.Next(); !errors.Is(err, fault) || len(records) != 0 || tail.Cursor() != start {
-		t.Fatalf("unconfirmed batch escaped: %v %v %v", records, tail.Cursor(), err)
+	if records, tailErr := tail.Next(); !errors.Is(tailErr, fault) || len(records) != 0 || tail.Cursor() != start {
+		t.Fatalf("unconfirmed batch escaped: %v %v %v", records, tail.Cursor(), tailErr)
 	}
 	tail.syncDir = syncJobDir
 	records, err := tail.Next()
@@ -161,18 +161,18 @@ func TestCloseWaitUsesLatestPastDamageAfterPublication(t *testing.T) {
 	}
 	done := make(chan answer, 1)
 	go func() {
-		got, err := deliverClose(ctx, dir, markerOptions{ID: "close-with-damage"}, nil)
-		done <- answer{got, err}
+		got, closeErr := deliverClose(ctx, dir, markerOptions{ID: "close-with-damage"}, nil)
+		done <- answer{got, closeErr}
 	}()
 	for {
-		record, err := findMailboxID(filepath.Join(dir, "inbox"), filepath.Join(dir, "inbox", ".ids", snapSum([]byte("close-with-damage"))), "close-with-damage")
-		if err != nil {
-			t.Fatal(err)
+		record, mailboxErr := findMailboxID(filepath.Join(dir, "inbox"), filepath.Join(dir, "inbox", ".ids", snapSum([]byte("close-with-damage"))), "close-with-damage")
+		if mailboxErr != nil {
+			t.Fatal(mailboxErr)
 		}
 		if record.Seq != 0 {
 			break
 		}
-		if err := pause(ctx, 5*time.Millisecond); err != nil {
+		if pauseErr := pause(ctx, 5*time.Millisecond); pauseErr != nil {
 			t.Fatal("close did not publish its request")
 		}
 	}
@@ -180,8 +180,8 @@ func TestCloseWaitUsesLatestPastDamageAfterPublication(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := fmt.Fprintln(f, "damaged frame"); err != nil {
-		t.Fatal(err)
+	if _, writeErr := fmt.Fprintln(f, "damaged frame"); writeErr != nil {
+		t.Fatal(writeErr)
 	}
 	final, err := newRecord("status", status{Job: "j", Engine: "codex", State: "done"})
 	if err != nil {
@@ -251,8 +251,8 @@ func testWaitAnyWithdrawalAndCompletion(t *testing.T, saved bool) {
 	}
 	done := make(chan answer, 1)
 	go func() {
-		row, err := pollWaitAnyTicks(ctx, root, "", "", baseline, ticks)
-		done <- answer{row, err}
+		row, pollErr := pollWaitAnyTicks(ctx, root, "", "", baseline, ticks)
+		done <- answer{row, pollErr}
 	}()
 	tick := func() {
 		t.Helper()
@@ -265,8 +265,8 @@ func testWaitAnyWithdrawalAndCompletion(t *testing.T, saved bool) {
 		}
 	}
 	tick()
-	if err := r.stateLog.Append("inbox_ack", inboxAck{Seq: msg.Seq, ID: "wrong-id", Result: "withdrawn"}); err != nil {
-		t.Fatal(err)
+	if appendErr := r.stateLog.Append("inbox_ack", inboxAck{Seq: msg.Seq, ID: "wrong-id", Result: "withdrawn"}); appendErr != nil {
+		t.Fatal(appendErr)
 	}
 	tick()
 	tick() // the observer processed the wrong ID and returned to the clock.
@@ -280,8 +280,8 @@ func testWaitAnyWithdrawalAndCompletion(t *testing.T, saved bool) {
 		t.Fatal(err)
 	}
 	// Publish the ACK and unrelated completion as a single visible batch.
-	if err := r.stateLog.commit(ack, finished); err != nil {
-		t.Fatal(err)
+	if commitErr := r.stateLog.commit(ack, finished); commitErr != nil {
+		t.Fatal(commitErr)
 	}
 	var got answer
 	select {
@@ -315,8 +315,8 @@ func TestCloseFailureIsUncertainInTerminalReceipt(t *testing.T) {
 	startFixtureWriter(t, &r)
 	fault := errors.New("injected process reclaim failure")
 	err = r.serveAgent(func() error {
-		if _, ok, err := r.takeMarker("close"); err != nil || !ok {
-			t.Fatalf("close intent not acquired: %v %v", ok, err)
+		if _, ok, takeErr := r.takeMarker("close"); takeErr != nil || !ok {
+			t.Fatalf("close intent not acquired: %v %v", ok, takeErr)
 		}
 		return fault
 	})
@@ -346,8 +346,8 @@ func TestWorkspaceUserIgnoresLostOwnerWithoutTakingRegistry(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer closeBestEffort(registry)
-	if got, err := workspaceUser(ctx, root, work, ""); err != nil || got != "" {
-		t.Fatalf("lost owner blocked cleanup: %q %v", got, err)
+	if got, lookupErr := workspaceUser(ctx, root, work, ""); lookupErr != nil || got != "" {
+		t.Fatalf("lost owner blocked cleanup: %q %v", got, lookupErr)
 	}
 	owner, err := lockPath(filepath.Join(dir, "owner.lock"), 0)
 	if err != nil || owner == nil {
@@ -513,19 +513,19 @@ func TestTerminalScansOnlyOutboxSuffixAfterRestart(t *testing.T) {
 	}
 	defer closeBestEffort(r.log)
 	ask := agentMail{Type: "ask", To: "parent", Question: "pending?", Blocking: true, Timeout: time.Hour}
-	if err := appendMail(t.Context(), dir, id, "ask", &ask); err != nil {
-		t.Fatal(err)
+	if mailErr := appendMail(t.Context(), dir, id, "ask", &ask); mailErr != nil {
+		t.Fatal(mailErr)
 	}
-	if err := r.pollAgentMail(); err != nil {
-		t.Fatal(err)
+	if pollErr := r.pollAgentMail(); pollErr != nil {
+		t.Fatal(pollErr)
 	}
-	if err := r.stateLog.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := r.stateLog.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
 	closeBestEffort(r.inbox.outboxTail)
 	late := agentMail{Type: "ask", To: "parent", Question: "late?", Blocking: true, Timeout: time.Hour}
-	if err := appendMail(t.Context(), dir, id, "late", &late); err != nil {
-		t.Fatal(err)
+	if mailErr := appendMail(t.Context(), dir, id, "late", &late); mailErr != nil {
+		t.Fatal(mailErr)
 	}
 	// Force a full-history reader to stop at the prefix. The persisted
 	// cursor, pending question and later CRC-valid frame remain intact.
@@ -535,14 +535,14 @@ func TestTerminalScansOnlyOutboxSuffixAfterRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err = f.WriteAt([]byte("!"), 0)
-	if err := errors.Join(err, f.Close()); err != nil {
-		t.Fatal(err)
+	if updateErr := errors.Join(err, f.Close()); updateErr != nil {
+		t.Fatal(updateErr)
 	}
 	restarted := runner{dir: dir, s: s}
 	restarted.s.State = "done"
 	startFixtureWriter(t, &restarted)
-	if err := restarted.saveTerminal(); err != nil {
-		t.Fatal(err)
+	if terminalErr := restarted.saveTerminal(); terminalErr != nil {
+		t.Fatal(terminalErr)
 	}
 	in, err := readInboxState(dir)
 	if err != nil {
@@ -592,8 +592,8 @@ func TestOrphanPublicationBarriersCoverOlderReportReference(t *testing.T) {
 	if err != nil || current.final {
 		t.Fatalf("orphan was confirmed despite I/O failure: %+v (%v)", current, err)
 	}
-	if changed, err := projectJobStatus(t.Context(), dir, &current); err != nil || !changed || !current.final {
-		t.Fatalf("orphan did not recover: %+v (%v)", current, err)
+	if changed, projectErr := projectJobStatus(t.Context(), dir, &current); projectErr != nil || !changed || !current.final {
+		t.Fatalf("orphan did not recover: %+v (%v)", current, projectErr)
 	}
 	b, err := readTurnReport(t.Context(), dir, current.LastCompleted)
 	if err != nil || string(b) != "retained report" {
@@ -640,8 +640,8 @@ func TestPreparedReferenceWaitsForCheckoutAndLinkedMetadata(t *testing.T) {
 		}
 		return syncJobFile(f)
 	}
-	if err := w.commit(record); !errors.Is(err, fault) {
-		t.Fatalf("prepared reference ignored checkout durability failure: %v", err)
+	if commitErr := w.commit(record); !errors.Is(commitErr, fault) {
+		t.Fatalf("prepared reference ignored checkout durability failure: %v", commitErr)
 	}
 	r, _, err := latestStateKind(dir, "blob")
 	if err != nil || r.Seq != 0 {
@@ -684,12 +684,12 @@ func TestWaitSelectsCorrectedTurnFromRetainedCheckpoint(t *testing.T) {
 	startFixtureWriter(t, &r)
 	r.stateLog.SetRotateBytes(1)
 	for _, turn := range []struct {
-		n       int64
 		id, end string
-	}{{2, "target", "completed"}, {2, "target", "failed"}, {3, "later", "completed"}, {4, "latest", "completed"}} {
+		n       int64
+	}{{"target", "completed", 2}, {"target", "failed", 2}, {"later", "completed", 3}, {"latest", "completed", 4}} {
 		r.s.Finished, r.s.LastCompleted, r.s.CompletedStatus = turn.n, turn.id, turn.end
-		if err := r.save(); err != nil {
-			t.Fatal(err)
+		if saveErr := r.save(); saveErr != nil {
+			t.Fatal(saveErr)
 		}
 	}
 	segments, err := logSegments(r.stateLog.dir)
@@ -713,8 +713,8 @@ func TestWorkerWaitsForOwnerProbeGate(t *testing.T) {
 	}
 	c := config{RunID: "fixture-probe", Engine: "cmd", Argv: []string{exe, "fixture-command", "argv", "check", "stderr"}}
 	s := status{Job: "worker", Engine: c.Engine, State: "queued"}
-	if err := register(root, dir, c, s); err != nil {
-		t.Fatal(err)
+	if registerErr := register(root, dir, c, s); registerErr != nil {
+		t.Fatal(registerErr)
 	}
 	gate, err := lockPath(ownerProbePath(dir), 0)
 	if err != nil || gate == nil {
@@ -733,8 +733,8 @@ func TestWorkerWaitsForOwnerProbeGate(t *testing.T) {
 	defer closeBestEffort(f)
 	canceled, stop := context.WithCancel(t.Context())
 	stop()
-	if _, err := tryAcquireJobOwner(canceled, dir, f); !errors.Is(err, context.Canceled) {
-		t.Fatalf("worker reported owner busy while only the probe held it: %v", err)
+	if _, acquireErr := tryAcquireJobOwner(canceled, dir, f); !errors.Is(acquireErr, context.Canceled) {
+		t.Fatalf("worker reported owner busy while only the probe held it: %v", acquireErr)
 	}
 	key, err := jobDirectoryKey(dir)
 	if err != nil {
@@ -748,32 +748,32 @@ func TestWorkerWaitsForOwnerProbeGate(t *testing.T) {
 			"--expect-run", c.RunID, "--expect-dir", key})
 	}()
 	for {
-		guard, err := lockPath(filepath.Join(root, ".admit", "registry.lock"), 0)
-		if err != nil && !os.IsNotExist(err) {
-			t.Fatal(err)
+		guard, lockErr := lockPath(filepath.Join(root, ".admit", "registry.lock"), 0)
+		if lockErr != nil && !os.IsNotExist(lockErr) {
+			t.Fatal(lockErr)
 		}
-		if err == nil && guard == nil {
+		if lockErr == nil && guard == nil {
 			break
 		}
 		if guard != nil {
 			closeBestEffort(guard)
 		}
 		select {
-		case err := <-done:
-			t.Fatalf("worker exited during ownership probe: %v", err)
+		case runErr := <-done:
+			t.Fatalf("worker exited during ownership probe: %v", runErr)
 		default:
 		}
-		if err := pause(ctx, time.Millisecond); err != nil {
-			t.Fatal(err)
+		if pauseErr := pause(ctx, time.Millisecond); pauseErr != nil {
+			t.Fatal(pauseErr)
 		}
 	}
-	if err := errors.Join(probe.Close(), gate.Close()); err != nil {
-		t.Fatal(err)
+	if closeErr := errors.Join(probe.Close(), gate.Close()); closeErr != nil {
+		t.Fatal(closeErr)
 	}
 	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatal(err)
+	case runErr := <-done:
+		if runErr != nil {
+			t.Fatal(runErr)
 		}
 	case <-ctx.Done():
 		t.Fatal(ctx.Err())
@@ -813,36 +813,38 @@ func TestResumeWaitsForTerminalOwner(t *testing.T) {
 	defer func() {
 		closeBestEffort(gate)
 		closeBestEffort(owner)
-		<-result
+		if resumeErr := <-result; resumeErr != nil {
+			t.Error(resumeErr)
+		}
 	}()
 
 	// Force the first ownership attempt while the predecessor still holds
 	// its lock. The resume worker holds the registry while blocked at the gate.
 	for {
-		registry, err := lockPath(filepath.Join(h.root, ".admit", "registry.lock"), 0)
-		if err != nil {
-			t.Fatal(err)
+		registry, lockErr := lockPath(filepath.Join(h.root, ".admit", "registry.lock"), 0)
+		if lockErr != nil {
+			t.Fatal(lockErr)
 		}
 		if registry == nil {
 			break
 		}
 		closeBestEffort(registry)
-		if err := pause(h.ctx, time.Millisecond); err != nil {
-			t.Fatal(err)
+		if pauseErr := pause(h.ctx, time.Millisecond); pauseErr != nil {
+			t.Fatal(pauseErr)
 		}
 	}
-	if err := gate.Close(); err != nil {
-		t.Fatal(err)
+	if gateErr := gate.Close(); gateErr != nil {
+		t.Fatal(gateErr)
 	}
 	registry, err := registryLock(h.ctx, h.root)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := errors.Join(owner.Close(), registry.Close()); err != nil {
-		t.Fatal(err)
+	if closeErr := errors.Join(owner.Close(), registry.Close()); closeErr != nil {
+		t.Fatal(closeErr)
 	}
-	if err := <-result; err != nil {
-		t.Fatal(err)
+	if resumeErr := <-result; resumeErr != nil {
+		t.Fatal(resumeErr)
 	}
 	after, _, err := loadJobStatus(dir)
 	if err != nil || !after.final || after.Generation != before.Generation+1 || after.LaunchID != "terminal-handoff" {
@@ -915,9 +917,9 @@ func TestDedupClaimRetiresSupersededAttempts(t *testing.T) {
 		if err := claimKey(root, c, s); err != nil {
 			t.Fatal(err)
 		}
-		dir, receipt, err := dedupReceipt(root, c.DedupKey)
-		if err != nil || receipt.RunID != c.RunID {
-			t.Fatalf("claim %d: %+v %v", i, receipt, err)
+		dir, claim, err := dedupReceipt(root, c.DedupKey)
+		if err != nil || claim.RunID != c.RunID {
+			t.Fatalf("claim %d: %+v %v", i, claim, err)
 		}
 		segments, err := logSegments(filepath.Join(dir, "state"))
 		if err != nil || len(segments) != 1 || segments[0] != uint64(i+1) {
@@ -1009,8 +1011,8 @@ func TestMaterializeRetriesUnpublishedRegisteredWorktree(t *testing.T) {
 		t.Fatal(err)
 	}
 	snapWriteTest(t, filepath.Join(prepared.Source, "unpublished.txt"), "partial attempt")
-	if err := os.RemoveAll(filepath.Join(dir, "state")); err != nil {
-		t.Fatal(err)
+	if removeErr := os.RemoveAll(filepath.Join(dir, "state")); removeErr != nil {
+		t.Fatal(removeErr)
 	}
 	trace := filepath.Join(t.TempDir(), "git-trace.json")
 	t.Setenv("GIT_TRACE2_EVENT", trace)
@@ -1030,10 +1032,10 @@ func TestMaterializeRetriesUnpublishedRegisteredWorktree(t *testing.T) {
 			Event string
 			Argv  []string
 		}
-		if err := dec.Decode(&event); err == io.EOF {
+		if decodeErr := dec.Decode(&event); decodeErr == io.EOF {
 			break
-		} else if err != nil {
-			t.Fatal(err)
+		} else if decodeErr != nil {
+			t.Fatal(decodeErr)
 		}
 		at := slices.Index(event.Argv, "worktree")
 		if event.Event == "start" && at >= 0 && len(event.Argv) > at+1 && event.Argv[at+1] == "remove" {
@@ -1044,8 +1046,8 @@ func TestMaterializeRetriesUnpublishedRegisteredWorktree(t *testing.T) {
 	if !removal {
 		t.Fatal("retry skipped removal of the unpublished Git registration")
 	}
-	if _, err := os.Stat(filepath.Join(recovered.Source, "unpublished.txt")); !os.IsNotExist(err) {
-		t.Fatalf("retried checkout reused unpublished bytes: %v", err)
+	if _, statErr := os.Stat(filepath.Join(recovered.Source, "unpublished.txt")); !os.IsNotExist(statErr) {
+		t.Fatalf("retried checkout reused unpublished bytes: %v", statErr)
 	}
 	git := snapGit{ctx: ctx, dir: recovered.Source}
 	head, err := git.get("rev-parse", "HEAD")
@@ -1061,8 +1063,8 @@ func TestIndexedRetryDoesNotReplayOlderMailboxFrames(t *testing.T) {
 		t.Fatal(err)
 	}
 	first.ID = "earlier"
-	if _, err := appendJobMailbox(t.Context(), dir, "inbox", nil, first, nil); err != nil {
-		t.Fatal(err)
+	if _, appendErr := appendJobMailbox(t.Context(), dir, "inbox", nil, first, nil); appendErr != nil {
+		t.Fatal(appendErr)
 	}
 	request, err := newRecord("msg", inboxMessage{Text: "same"})
 	if err != nil {
@@ -1079,8 +1081,8 @@ func TestIndexedRetryDoesNotReplayOlderMailboxFrames(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err = f.WriteAt([]byte("!"), 0)
-	if err := errors.Join(err, f.Close()); err != nil {
-		t.Fatal(err)
+	if updateErr := errors.Join(err, f.Close()); updateErr != nil {
+		t.Fatal(updateErr)
 	}
 	retry, err := appendJobMailbox(t.Context(), dir, "inbox", nil, request, nil)
 	if err != nil || retry.Seq != published.Seq {
@@ -1116,12 +1118,12 @@ func TestArchiveFailureLeavesOriginalJobRegistered(t *testing.T) {
 	}
 	fault := errors.New("archive namespace flush failed after link")
 	err = archiveAndDetachJob(ctx, root, dir, owner, c, s, func(archive, bound string) error {
-		entries, err := os.ReadDir(archive)
-		if err != nil || len(entries) != 1 || bound != root {
-			t.Errorf("archive had no link when its barrier ran: %v %v", entries, err)
+		entries, readErr := os.ReadDir(archive)
+		if readErr != nil || len(entries) != 1 || bound != root {
+			t.Errorf("archive had no link when its barrier ran: %v %v", entries, readErr)
 		}
-		if _, err := os.Stat(dir); err != nil {
-			t.Errorf("job was detached before the archive barrier: %v", err)
+		if _, statErr := os.Stat(dir); statErr != nil {
+			t.Errorf("job was detached before the archive barrier: %v", statErr)
 		}
 		return fault
 	})
@@ -1153,8 +1155,8 @@ func TestWaitStartBindsMessageWithDifferentExistingACKID(t *testing.T) {
 	}
 	r := runner{dir: dir}
 	startFixtureWriter(t, &r)
-	if err := r.stateLog.Append("inbox_ack", inboxAck{Seq: msg.Seq, ID: "wrong", Result: "withdrawn"}); err != nil {
-		t.Fatal(err)
+	if appendErr := r.stateLog.Append("inbox_ack", inboxAck{Seq: msg.Seq, ID: "wrong", Result: "withdrawn"}); appendErr != nil {
+		t.Fatal(appendErr)
 	}
 	o, err := openJobObservation(dir, stateCursor{}, "")
 	if err != nil {
@@ -1176,13 +1178,13 @@ func TestInboxClaimDoesNotOutliveMissingMessageSegment(t *testing.T) {
 		t.Fatal(err)
 	}
 	msg.ID = "durable"
-	if _, err := appendJobMailbox(t.Context(), dir, "inbox", nil, msg, nil); err != nil {
-		t.Fatal(err)
+	if _, appendErr := appendJobMailbox(t.Context(), dir, "inbox", nil, msg, nil); appendErr != nil {
+		t.Fatal(appendErr)
 	}
 	r := runner{dir: dir}
 	startFixtureWriter(t, &r)
-	if err := r.refreshInbox(); err != nil {
-		t.Fatal(err)
+	if refreshErr := r.refreshInbox(); refreshErr != nil {
+		t.Fatal(refreshErr)
 	}
 	defer closeBestEffort(r.inbox.tail)
 	if len(r.inbox.queue) != 1 {
@@ -1192,10 +1194,10 @@ func TestInboxClaimDoesNotOutliveMissingMessageSegment(t *testing.T) {
 	// Renaming the fixture models loss of the source namespace while the
 	// runner still has its Open handle and has parsed the message.
 	path := segmentPath(filepath.Join(dir, "inbox"), item.position.Seg)
-	if err := os.Rename(path, path+".lost"); err != nil {
-		t.Fatal(err)
+	if renameErr := os.Rename(path, path+".lost"); renameErr != nil {
+		t.Fatal(renameErr)
 	}
-	if err := r.claimInbox(item, "deliver"); err == nil {
+	if claimErr := r.claimInbox(item, "deliver"); claimErr == nil {
 		t.Fatal("runner persisted a claim without its input frame")
 	}
 	in, err := readInboxState(dir)

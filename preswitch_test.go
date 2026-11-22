@@ -112,19 +112,19 @@ func TestPreswitchCacheAndDiskAdmission(t *testing.T) {
 		t.Helper()
 		got := cliOutput(t, exitQueued, nil, f.cx, args...)
 		var s status
-		if err := json.Unmarshal(got, &s); err != nil || s.State != "queued" || !strings.Contains(s.QueueReason, reason) {
-			t.Fatalf("queue notice = %s, %v", got, err)
+		if decodeErr := json.Unmarshal(got, &s); decodeErr != nil || s.State != "queued" || !strings.Contains(s.QueueReason, reason) {
+			t.Fatalf("queue notice = %s, %v", got, decodeErr)
 		}
 	}
 	assertQueued("min_free_bytes", append(one, "--timeout", "4s")...)
 	assertQueued("min_free_bytes", append(anyJob, "--timeout", "4s")...)
 	for deadline := time.Now().Add(3 * time.Second); ; {
-		_, err := os.Stat(cache)
-		if os.IsNotExist(err) {
+		_, statErr := os.Stat(cache)
+		if os.IsNotExist(statErr) {
 			break
 		}
-		if err != nil || time.Now().After(deadline) {
-			t.Fatalf("cache should be reclaimed under disk pressure with the slot occupied: %v", err)
+		if statErr != nil || time.Now().After(deadline) {
+			t.Fatalf("cache should be reclaimed under disk pressure with the slot occupied: %v", statErr)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
@@ -143,8 +143,8 @@ func TestPreswitchCacheAndDiskAdmission(t *testing.T) {
 	assertQueued("min_free_bytes", append(one, "--timeout", "4s")...)
 	assertQueued("min_free_bytes", append(anyJob, "--timeout", "4s")...)
 	src := filepath.Join(f.home, "agent-src")
-	if err := os.Mkdir(src, 0700); err != nil {
-		t.Fatal(err)
+	if mkdirErr := os.Mkdir(src, 0700); mkdirErr != nil {
+		t.Fatal(mkdirErr)
 	}
 	t.Setenv("CXRUN_MONITOR_TIMEOUT", "4s")
 	assertQueued("min_free_bytes", "agent", "--host", "local", "--dir", src, "--tag", "disk-agent", "--queue-timeout", "20s", "fixture")
@@ -308,17 +308,17 @@ func TestCachePressureRechecksDiskAndLeavesWorkspace(t *testing.T) {
 	makeCacheFixture(t, old, 1000)
 	makeCacheFixture(t, recent, 1001)
 	makeCacheFixture(t, work, 999)
-	if err := os.Symlink(work, filepath.Join(old, "workspace")); err != nil && runtime.GOOS != "windows" {
-		t.Fatal(err)
+	if linkErr := os.Symlink(work, filepath.Join(old, "workspace")); linkErr != nil && runtime.GOOS != "windows" {
+		t.Fatal(linkErr)
 	}
 	stamp := time.Unix(1000, 0)
-	if err := os.Chtimes(old, stamp, stamp); err != nil {
-		t.Fatal(err)
+	if timesErr := os.Chtimes(old, stamp, stamp); timesErr != nil {
+		t.Fatal(timesErr)
 	}
 	probes := 0
 	disk, err := trimCaches(ctx, root, 100, func() diskStatus {
 		probes++
-		if _, err := os.Stat(old); os.IsNotExist(err) {
+		if _, statErr := os.Stat(old); os.IsNotExist(statErr) {
 			return diskStatus{free: 2, minimum: 2}
 		}
 		return diskStatus{free: 1, minimum: 2}

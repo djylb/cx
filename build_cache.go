@@ -17,13 +17,14 @@ import (
 )
 
 type diskStatus struct {
-	free, minimum uint64
-	err           error
+	err     error
+	free    uint64
+	minimum uint64
 }
 
 func (h *hostConfig) diskStatus(path string) diskStatus {
 	free, total, err := diskSpace(path)
-	return diskStatus{free, h.minFreeBytes(total), err}
+	return diskStatus{free: free, minimum: h.minFreeBytes(total), err: err}
 }
 
 func (d diskStatus) belowMinimum() bool {
@@ -165,8 +166,8 @@ func (r *runner) prepareCaches() error {
 		}
 		// A resume may share its run ID with surviving children. Keep the
 		// still-live process groups recorded by its previous runner.
-		if err := readJSON(use.path, &use.pin); err != nil && !os.IsNotExist(err) {
-			return err
+		if readErr := readJSON(use.path, &use.pin); readErr != nil && !os.IsNotExist(readErr) {
+			return readErr
 		}
 		use.pin.Target, use.pin.PID, use.pin.Started = project, r.s.PID, r.s.RunnerStart
 		// Register before launching a child. Unlike a runner handle, this
@@ -261,9 +262,9 @@ func prepareCacheEntry(root, rel string) error {
 
 type cachePin struct {
 	Target  string `json:"target"`
+	Groups  []int  `json:"groups,omitempty"`
 	PID     int    `json:"pid"`
 	Started uint64 `json:"started"`
-	Groups  []int  `json:"groups,omitempty"`
 }
 
 type cacheUse struct {
@@ -479,7 +480,7 @@ func cacheCandidates(cache *os.Root, root string) ([]cacheCandidate, error) {
 		if !ent.IsDir() {
 			continue
 		}
-		if _, err := jobPath("", strings.TrimPrefix(name, ".job-")); err != nil {
+		if _, pathErr := jobPath("", strings.TrimPrefix(name, ".job-")); pathErr != nil {
 			continue
 		}
 		if err = add(filepath.Join("cargo-target", name), filepath.Join(targets, ".leases", name)); err != nil {
@@ -531,8 +532,8 @@ func trimCacheTrees(ctx context.Context, root string, limit uint64, probe func()
 	if err != nil {
 		return diskStatus{}, err
 	}
-	if id, err := rootedMount(cache, ".", mountID); err != nil || mount != id {
-		return probe(), err
+	if id, mountErr := rootedMount(cache, ".", mountID); mountErr != nil || mount != id {
+		return probe(), mountErr
 	}
 	candidates, err := cacheCandidates(cache, root)
 	if err != nil {
@@ -541,12 +542,12 @@ func trimCacheTrees(ctx context.Context, root string, limit uint64, probe func()
 	var total uint64
 	for i := range candidates {
 		row := &candidates[i]
-		if err := sizeCacheTree(ctx, cache, row, mount, mountID); err != nil {
-			if errors.Is(err, errUnsafeCacheTree) || os.IsNotExist(err) {
+		if sizeErr := sizeCacheTree(ctx, cache, row, mount, mountID); sizeErr != nil {
+			if errors.Is(sizeErr, errUnsafeCacheTree) || os.IsNotExist(sizeErr) {
 				row.lease = ""
 				continue
 			}
-			return diskStatus{}, err
+			return diskStatus{}, sizeErr
 		}
 		total += row.bytes
 	}
@@ -632,8 +633,8 @@ func sizeCacheTree(ctx context.Context, cache *os.Root, row *cacheCandidate, mou
 		if err != nil {
 			return err
 		}
-		if err := ctx.Err(); err != nil {
-			return err
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
 		}
 		if path == row.path+"/"+cacheIdentityFile || (!d.IsDir() && !d.Type().IsRegular()) {
 			return nil
@@ -719,9 +720,9 @@ func emptyCacheTree(ctx context.Context, dir *os.Root, expected string, mount ui
 		return errUnsafeCacheTree
 	}
 	if expected != "" {
-		key, err := jobDirectoryFileKey(f)
-		if err != nil {
-			return err
+		key, keyErr := jobDirectoryFileKey(f)
+		if keyErr != nil {
+			return keyErr
 		}
 		if key != expected {
 			return errUnsafeCacheTree

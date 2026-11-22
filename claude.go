@@ -129,9 +129,9 @@ type claudeFrame struct {
 // arbitrary time waiting for the runner to consume already buffered events.
 type claudeOutput struct {
 	file    *os.File
+	timer   *time.Timer
 	grace   time.Duration
 	mu      sync.Mutex
-	timer   *time.Timer
 	reading bool
 	exited  bool
 	expired bool
@@ -454,10 +454,10 @@ func (r *runner) startClaude(input any, id string) error {
 	exited := make(chan struct{})
 	s.exited = exited
 	go func() {
-		err := cmd.Wait()
+		waitErr := cmd.Wait()
 		close(exited)
 		output.childExited()
-		waited <- err
+		waited <- waitErr
 	}()
 	go func() {
 		defer close(done)

@@ -44,14 +44,14 @@ var (
 
 // stateRecord is a verified log frame. Value is the original JSON payload.
 type stateRecord struct {
-	Seq        uint64          `json:"seq"`
 	Time       time.Time       `json:"t"`
 	Kind       string          `json:"k"`
-	Value      json.RawMessage `json:"v"`
 	ID         string          `json:"id,omitempty"`
-	Final      bool            `json:"final,omitempty"`
+	Value      json.RawMessage `json:"v"`
 	position   stateCursor
+	Seq        uint64 `json:"seq"`
 	frameBytes uint64
+	Final      bool `json:"final,omitempty"`
 }
 
 // stateCursor points just after a delivered record. The zero value starts at
@@ -83,7 +83,21 @@ func encodeFrame(r stateRecord) ([]byte, error) {
 	if r.Seq == 0 || r.Kind == "" {
 		return nil, errors.New("log record requires a sequence number and kind")
 	}
-	line, err := json.Marshal(r)
+	// Keep the checksummed frame encoding independent of the in-memory layout.
+	type recordFields stateRecord
+	wire := struct {
+		Seq *uint64 `json:"seq"`
+		*recordFields
+		ID    *string `json:"id,omitempty"`
+		Final *bool   `json:"final,omitempty"`
+	}{Seq: &r.Seq, recordFields: (*recordFields)(&r)}
+	if r.ID != "" {
+		wire.ID = &r.ID
+	}
+	if r.Final {
+		wire.Final = &r.Final
+	}
+	line, err := json.Marshal(wire)
 	if err != nil {
 		return nil, err
 	}
@@ -155,18 +169,18 @@ func logSegments(dir string) ([]uint64, error) {
 // stateWriter publishes one job's state log. Under I1, the caller must hold
 // owner.lock from Open through Close and serialize all calls to the stateWriter.
 type stateWriter struct {
-	dir          string
-	file         *os.File
-	seg, seq     uint64
-	size         uint64
-	snapshotSize uint64
-	rotateBytes  uint64
 	recoveryErr  error
 	failed       error
+	file         *os.File
 	appendFn     func(*os.File, []byte) (int, error)
 	syncFn       func(*os.File) error
 	closeFn      func(*os.File) error
 	syncDirFn    func(string) error
+	dir          string
+	seg, seq     uint64
+	size         uint64
+	snapshotSize uint64
+	rotateBytes  uint64
 }
 
 // Open creates a fresh segment, even when the previous segment has no records.
@@ -448,9 +462,9 @@ func (w *stateWriter) Rotate(config, status any, checkpoints ...stateRecord) err
 		}
 		r.Seq = seal.Seq + uint64(i) + 1
 		r.Time = seal.Time
-		line, err := encodeFrame(r)
-		if err != nil {
-			return err
+		line, encodeErr := encodeFrame(r)
+		if encodeErr != nil {
+			return encodeErr
 		}
 		lines = append(lines, line)
 		size += uint64(len(line))
@@ -461,8 +475,8 @@ func (w *stateWriter) Rotate(config, status any, checkpoints ...stateRecord) err
 	}
 	// Once the checkpoint can survive a crash, its predecessor must also
 	// survive through the sequence immediately before the reserved seal.
-	if err := w.sync(); err != nil {
-		return err
+	if syncErr := w.sync(); syncErr != nil {
+		return syncErr
 	}
 	next, err := createJobTemp(w.dir, ".rotate-")
 	if err != nil {
@@ -703,23 +717,23 @@ func validateSegments(dir string, mailbox bool) error {
 
 // stateTail follows a log from a cursor. The caller serializes Next, stateCursor and Close.
 type stateTail struct {
-	dir      string
+	nextScan time.Time
+	damage   error
 	file     *os.File
+	syncDir  func(string) error
+	segments func(string) ([]uint64, error)
+	dir      string
 	frames   frameReader
+	batch    []stateRecord
+	pending  []byte
 	seg      uint64
 	off      uint64
 	cursor   stateCursor
 	visible  stateCursor
-	batch    []stateRecord
-	damage   error
 	seal     uint64
 	stop     bool
 	mailbox  bool
 	closed   bool
-	nextScan time.Time
-	pending  []byte
-	syncDir  func(string) error
-	segments func(string) ([]uint64, error)
 }
 
 // openStateTail starts following a job's segmented log. A supplied cursor is a
@@ -1080,8 +1094,8 @@ func appendSegmented(dir string, r stateRecord, prepare func(*stateRecord, state
 	}
 	if previous.Seq != 0 {
 		if prepare != nil {
-			if err := prepare(&r, previous); err != nil {
-				return stateRecord{}, err
+			if prepareErr := prepare(&r, previous); prepareErr != nil {
+				return stateRecord{}, prepareErr
 			}
 		}
 		if previous.Kind != r.Kind || !bytes.Equal(previous.Value, r.Value) {
@@ -1104,9 +1118,9 @@ func appendSegmented(dir string, r stateRecord, prepare func(*stateRecord, state
 			}
 		}
 		if cursor.Seg == seg && cursor.Off < defaultRotateBytes {
-			info, err := os.Stat(segmentPath(dir, seg))
-			if err != nil {
-				return stateRecord{}, err
+			info, statErr := os.Stat(segmentPath(dir, seg))
+			if statErr != nil {
+				return stateRecord{}, statErr
 			}
 			if uint64(info.Size()) == cursor.Off {
 				mode = jobFileAppend

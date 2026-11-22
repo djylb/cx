@@ -165,16 +165,16 @@ func TestStateLogFrame(t *testing.T) {
 
 func TestStateLogPrefixAndRecovery(t *testing.T) {
 	for _, tc := range []struct {
-		name string
 		bad  func(*testing.T) []byte
+		name string
 	}{
-		{"checksum", func(t *testing.T) []byte {
+		{name: "checksum", bad: func(t *testing.T) []byte {
 			f := testLogFrame(t, 2, "status", "bad")
 			f[bytes.Index(f, []byte("bad"))] = 'p'
 			return f
 		}},
-		{"sequence gap", func(t *testing.T) []byte { return testLogFrame(t, 3, "status", nil) }},
-		{"duplicate sequence", func(t *testing.T) []byte { return testLogFrame(t, 1, "status", nil) }},
+		{name: "sequence gap", bad: func(t *testing.T) []byte { return testLogFrame(t, 3, "status", nil) }},
+		{name: "duplicate sequence", bad: func(t *testing.T) []byte { return testLogFrame(t, 1, "status", nil) }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
@@ -190,15 +190,15 @@ func TestStateLogPrefixAndRecovery(t *testing.T) {
 			defer closeBestEffort(tail)
 			testLogNext(t, tail, 1)
 			testLogNext(t, tail)
-			if err := seg.Close(); err != nil {
-				t.Fatal(err)
+			if closeErr := seg.Close(); closeErr != nil {
+				t.Fatal(closeErr)
 			}
 			w, _ := openTestLogWriter(t, dir)
 			if w.RecoveryError() == nil {
 				t.Fatal("mid-segment corruption was not reported")
 			}
-			if err := w.Append("status", "after damage"); err != nil {
-				t.Fatal(err)
+			if appendErr := w.Append("status", "after damage"); appendErr != nil {
+				t.Fatal(appendErr)
 			}
 			testLogLatest(t, dir, "status", 5, 2)
 			testLogNext(t, tail, 5)
@@ -279,8 +279,8 @@ func TestStateLogRotateAndRestart(t *testing.T) {
 	}
 	defer closeBestEffort(tail)
 	w.SetRotateBytes(1)
-	if err := w.Rotate("first", "first", stateRecord{Kind: "inbox_ack", Value: json.RawMessage(`{"seq":8}`)}); err != nil {
-		t.Fatal(err)
+	if rotateErr := w.Rotate("first", "first", stateRecord{Kind: "inbox_ack", Value: json.RawMessage(`{"seq":8}`)}); rotateErr != nil {
+		t.Fatal(rotateErr)
 	}
 	got := testLogNext(t, tail, 3, 4, 5, 6)
 	if got[0].Kind != "seal" || string(got[0].Value) != `{"next":2}` || got[1].Kind != "config" ||
@@ -290,11 +290,11 @@ func TestStateLogRotateAndRestart(t *testing.T) {
 	if w.NeedsRotate() {
 		t.Fatal("checkpoint snapshot alone triggered another rotation")
 	}
-	if err := w.Append("status", "second"); err != nil {
-		t.Fatal(err)
+	if appendErr := w.Append("status", "second"); appendErr != nil {
+		t.Fatal(appendErr)
 	}
-	if err := w.Rotate("second", "second"); err != nil {
-		t.Fatal(err)
+	if rotateErr := w.Rotate("second", "second"); rotateErr != nil {
+		t.Fatal(rotateErr)
 	}
 	testLogNext(t, tail, 7, 8, 9, 10)
 	segments, err := logSegments(filepath.Join(dir, "state"))
@@ -554,7 +554,7 @@ func TestMailboxConcurrentAppend(t *testing.T) {
 	if err != nil || r.Seq != 1 {
 		t.Fatalf("idempotent retry: %+v, %v", r, err)
 	}
-	if _, err := appendJobMailbox(t.Context(), dir, "inbox", nil, stateRecord{ID: r.ID, Kind: "msg", Value: json.RawMessage(`"different"`)}, nil); err == nil {
+	if _, appendErr := appendJobMailbox(t.Context(), dir, "inbox", nil, stateRecord{ID: r.ID, Kind: "msg", Value: json.RawMessage(`"different"`)}, nil); appendErr == nil {
 		t.Fatal("conflicting duplicate was accepted")
 	}
 
@@ -563,8 +563,8 @@ func TestMailboxConcurrentAppend(t *testing.T) {
 		t.Fatal(err)
 	}
 	testLogWrite(t, f, []byte(`{"seq":`))
-	if err := f.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := f.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
 	r, err = appendJobMailbox(t.Context(), dir, "inbox", nil, stateRecord{ID: "new", Kind: "msg", Value: json.RawMessage(`{}`)}, nil)
 	if err != nil || r.Seq != count+1 {

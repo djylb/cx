@@ -223,8 +223,8 @@ func (r *runner) takeMarker(op string) (controlMarker, bool, error) {
 		}
 		if op == "close" && (valid || r.inbox.claims[record.Seq].Action == "close") {
 			if r.closeRequest == 0 {
-				if err := r.claimInbox(record, "close"); err != nil {
-					return m, false, err
+				if claimErr := r.claimInbox(record, "close"); claimErr != nil {
+					return m, false, claimErr
 				}
 				r.closeRequest = record.Seq
 			}

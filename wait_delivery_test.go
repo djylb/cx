@@ -66,7 +66,7 @@ func TestWaitAnyWithdrawalBetweenCallsAndTurnsBeforeTerminal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = r.stateLog.Append("inbox_ack", inboxAck{message.Seq, message.ID, "withdrawn"}); err != nil {
+	if err = r.stateLog.Append("inbox_ack", inboxAck{Seq: message.Seq, ID: message.ID, Result: "withdrawn"}); err != nil {
 		t.Fatal(err)
 	}
 	// The withdrawal has no selected completion when it is delivered.
@@ -109,8 +109,8 @@ func TestWaitAnyReportsTerminalFailureWithDamagedOutbox(t *testing.T) {
 		t.Fatal(err)
 	}
 	mail := agentMail{Type: "send", To: "parent", Text: "unconfirmed notification"}
-	if err := appendMail(ctx, r.dir, id, "before-damage", &mail); err != nil {
-		t.Fatal(err)
+	if mailErr := appendMail(ctx, r.dir, id, "before-damage", &mail); mailErr != nil {
+		t.Fatal(mailErr)
 	}
 	f, err := openJobFile(segmentPath(filepath.Join(r.dir, "outbox"), 1), jobFileAppend)
 	if err != nil {
@@ -120,8 +120,8 @@ func TestWaitAnyReportsTerminalFailureWithDamagedOutbox(t *testing.T) {
 		t.Fatal(err)
 	}
 	r.s.State = "failed"
-	if err := r.saveTerminal(); !errors.Is(err, errLogDamage) {
-		t.Fatalf("expected failure diagnostic, got %v", err)
+	if terminalErr := r.saveTerminal(); !errors.Is(terminalErr, errLogDamage) {
+		t.Fatalf("expected failure diagnostic, got %v", terminalErr)
 	}
 	baseline := make(map[string]waitCursor)
 	row, err := pollWaitAny(ctx, root, "", "", baseline)
@@ -242,8 +242,8 @@ func TestWaitNoticeDoesNotMarkReplacementWithSameRun(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err = deliverNotice(t.Context(), dir, identity, queueEventID(s), true, func() error {
-		if err := os.Rename(dir, dir+"-detached"); err != nil {
-			return err
+		if renameErr := os.Rename(dir, dir+"-detached"); renameErr != nil {
+			return renameErr
 		}
 		return register(root, dir, c, s)
 	})

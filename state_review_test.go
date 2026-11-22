@@ -92,16 +92,16 @@ func TestWorkerMailboxAndCloseRejectRecreatedJob(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Rename(dir, filepath.Join(root, "old")); err != nil {
-		t.Fatal(err)
+	if renameErr := os.Rename(dir, filepath.Join(root, "old")); renameErr != nil {
+		t.Fatal(renameErr)
 	}
 	s.State = "queued"
-	if err := register(root, dir, c, s); err != nil {
-		t.Fatal(err)
+	if registerErr := register(root, dir, c, s); registerErr != nil {
+		t.Fatal(registerErr)
 	}
-	if err := run(t.Context(), []string{"_command", "--state", root, "--job", "job",
-		"--expect-run", c.RunID, "--expect-dir", key}); !errors.Is(err, errJobReplaced) {
-		t.Fatalf("stale command worker: %v", err)
+	if runErr := run(t.Context(), []string{"_command", "--state", root, "--job", "job",
+		"--expect-run", c.RunID, "--expect-dir", key}); !errors.Is(runErr, errJobReplaced) {
+		t.Fatalf("stale command worker: %v", runErr)
 	}
 	record, err := newRecord("msg", inboxMessage{Text: "old"})
 	if err != nil {
@@ -113,8 +113,8 @@ func TestWorkerMailboxAndCloseRejectRecreatedJob(t *testing.T) {
 	}
 	oldSnapshot := prior.status
 	oldSnapshot.final = false
-	if _, err := projectJobStatus(t.Context(), dir, &oldSnapshot, prior.id); !errors.Is(err, errJobReplaced) {
-		t.Fatalf("stale observer projected the new job: %v", err)
+	if _, projectErr := projectJobStatus(t.Context(), dir, &oldSnapshot, prior.id); !errors.Is(projectErr, errJobReplaced) {
+		t.Fatalf("stale observer projected the new job: %v", projectErr)
 	}
 	s, cursor, err := loadJobStatus(dir)
 	if err != nil || !errors.Is(prior.check(dir, s, cursor), errJobReplaced) || s.PID != 0 {
@@ -130,31 +130,31 @@ func TestCloseIntentIsAcknowledgedWithTerminalCommit(t *testing.T) {
 	}
 	r := runner{dir: dir, s: status{Engine: "codex", State: "running"}}
 	startFixtureWriter(t, &r)
-	if err := r.recoverInbox(turn{}); err != nil {
-		t.Fatal(err)
+	if recoverErr := r.recoverInbox(turn{}); recoverErr != nil {
+		t.Fatal(recoverErr)
 	}
-	if _, ok, err := r.takeMarker("close"); err != nil || !ok {
-		t.Fatal(ok, err)
+	if _, ok, takeErr := r.takeMarker("close"); takeErr != nil || !ok {
+		t.Fatal(ok, takeErr)
 	}
 	in, err := readInboxState(dir)
 	if err != nil || in.claims[req.Seq].Action != "close" || in.acks[req.Seq].Result != "" {
 		t.Fatal(in, err)
 	}
-	if err := r.stateLog.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := r.stateLog.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
 	restarted := runner{dir: dir, s: r.s}
 	startFixtureWriter(t, &restarted)
-	if err := restarted.recoverInbox(turn{}); err != nil {
-		t.Fatal(err)
+	if recoverErr := restarted.recoverInbox(turn{}); recoverErr != nil {
+		t.Fatal(recoverErr)
 	}
-	if _, ok, err := restarted.takeMarker("close"); err != nil || !ok {
-		t.Fatal(ok, err)
+	if _, ok, takeErr := restarted.takeMarker("close"); takeErr != nil || !ok {
+		t.Fatal(ok, takeErr)
 	}
 	restarted.s.State = "done"
 	restarted.closeCompleted = true
-	if err := restarted.saveTerminal(); err != nil {
-		t.Fatal(err)
+	if terminalErr := restarted.saveTerminal(); terminalErr != nil {
+		t.Fatal(terminalErr)
 	}
 	in, err = readInboxState(dir)
 	if err != nil || in.acks[req.Seq].Result != "delivered" {
@@ -172,6 +172,11 @@ func TestOutboxRetryReusesDeadlineAndRequest(t *testing.T) {
 	second := first
 	if err := appendMail(t.Context(), dir, id, "op/retry", &first); err != nil {
 		t.Fatal(err)
+	}
+	outbox := filepath.Join(dir, "outbox")
+	record, readErr := findMailboxID(outbox, filepath.Join(outbox, ".ids", snapSum([]byte("op/retry"))), "op/retry")
+	if readErr != nil || !strings.HasPrefix(string(record.Value), `{"timeout_ns":1000000000,"deadline":`) {
+		t.Fatalf("outbox retry requires the existing JSON field order: %s (%v)", record.Value, readErr)
 	}
 	if err := os.RemoveAll(filepath.Join(dir, "outbox", ".ids")); err != nil {
 		t.Fatal(err)
@@ -219,8 +224,8 @@ func TestReportRejectsExtraBytes(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err = f.WriteString("trailing")
-	if err := errors.Join(err, f.Close()); err != nil {
-		t.Fatal(err)
+	if writeErr := errors.Join(err, f.Close()); writeErr != nil {
+		t.Fatal(writeErr)
 	}
 	if _, err := readTurnReport(t.Context(), dir, "test"); err == nil {
 		t.Fatal("report reader accepted a trailing byte")
@@ -240,8 +245,8 @@ func TestResumeRefusesOlderDamagedConsumptionCheckpoint(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err = f.WriteString("unreadable consumption checkpoint\n")
-	if err := errors.Join(err, f.Close()); err != nil {
-		t.Fatal(err)
+	if writeErr := errors.Join(err, f.Close()); writeErr != nil {
+		t.Fatal(writeErr)
 	}
 	r := runner{dir: dir, c: c, s: s}
 	startFixtureWriter(t, &r)
@@ -269,8 +274,8 @@ func TestFollowResetsAllPositionsOnDirectoryReplacement(t *testing.T) {
 	root := t.TempDir()
 	next := filepath.Join(root, "next")
 	c := config{RunID: "test", Engine: "codex"}
-	if err := register(root, next, c, status{Job: "next", Engine: c.Engine, State: "running"}); err != nil {
-		t.Fatal(err)
+	if registerErr := register(root, next, c, status{Job: "next", Engine: c.Engine, State: "running"}); registerErr != nil {
+		t.Fatal(registerErr)
 	}
 	obs, err := pos.openObservation(next)
 	if err != nil {
@@ -287,23 +292,23 @@ func TestFollowResetsAllPositionsOnDirectoryReplacement(t *testing.T) {
 	updated := status{Job: "next", RunID: "test", Engine: "codex", State: "waiting", Finished: 1, LastCompleted: "new"}
 	w := runner{dir: next, s: updated, c: c}
 	startFixtureWriter(t, &w)
-	if err := w.save(); err != nil {
-		t.Fatal(err)
+	if saveErr := w.save(); saveErr != nil {
+		t.Fatal(saveErr)
 	}
-	if err := pos.readState(obs); err != nil || obs.s.LastCompleted != "new" {
-		t.Fatalf("new directory's status was skipped: %+v (%v)", obs.s, err)
+	if readErr := pos.readState(obs); readErr != nil || obs.s.LastCompleted != "new" {
+		t.Fatalf("new directory's status was skipped: %+v (%v)", obs.s, readErr)
 	}
 	f, err := openJobFile(filepath.Join(next, "progress.log"), jobFileAppend)
 	if err != nil {
 		t.Fatal(err)
 	}
 	_, err = fmt.Fprintln(f, "1\t2026-11-22T00:00:00Z\tturn/completed\tnew checkout output")
-	if err := errors.Join(err, f.Close()); err != nil {
-		t.Fatal(err)
+	if writeErr := errors.Join(err, f.Close()); writeErr != nil {
+		t.Fatal(writeErr)
 	}
 	w.s.State = "done"
-	if err := w.saveTerminal(); err != nil {
-		t.Fatal(err)
+	if terminalErr := w.saveTerminal(); terminalErr != nil {
+		t.Fatal(terminalErr)
 	}
 	old := tailPosition{RunID: "test", DirectoryID: key, Next: 600, Mode: "seq", Raw: true,
 		StateCursor: (stateCursor{Seg: 1, Off: 1 << 20, Seq: 20}).String()}

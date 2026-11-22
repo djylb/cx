@@ -490,10 +490,10 @@ func ctlWaitAny(ctx context.Context, hs endpoints, o ctlOptions) error {
 			row := struct {
 				Channel string `json:"channel"`
 				Project string `json:"project"`
-				channelRow
-				Code    int    `json:"code"`
 				Event   string `json:"event"`
 				EventID string `json:"event_id"`
+				channelRow
+				Code int `json:"code"`
 			}{channelRow: rows[0], Channel: channel, Project: p, Event: "chat",
 				EventID: waitEventID(p, "chat", fmt.Sprintf("%s/%d", key, rows[0].Seq))}
 			b, channelErr := json.Marshal(fields{"row": row, "cursor": rows[0].Seq})

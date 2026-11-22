@@ -131,32 +131,32 @@ type inboxMessage struct {
 }
 
 type inboxAck struct {
-	Seq    uint64 `json:"seq"`
 	ID     string `json:"id"`
 	Result string `json:"result"`
+	Seq    uint64 `json:"seq"`
 }
 
 // A claim is written before a side effect so recovery can distinguish a
 // queued message from an operation that may have reached the engine.
 type inboxClaim struct {
-	Seq        uint64 `json:"seq"`
 	ID         string `json:"id"`
 	Action     string `json:"action"`
+	Seq        uint64 `json:"seq"`
 	Generation uint64 `json:"generation"`
 }
 
 type inboxState struct {
 	tail        *stateTail
-	inboxSynced stateCursor
-	outbox      stateCursor
 	outboxTail  *stateTail
 	pendingAsks map[string]pendingAgentAsk
 	answered    map[string]bool
-	queue       []stateRecord
 	first       map[string]uint64
 	acks        map[uint64]inboxAck
 	claims      map[uint64]inboxClaim
 	receipts    map[string]receiptRecord
+	queue       []stateRecord
+	inboxSynced stateCursor
+	outbox      stateCursor
 }
 
 func inboxTail(dir string, from stateCursor) (*stateTail, error) {
@@ -463,9 +463,9 @@ func publishMessage(ctx context.Context, dir, id string, msg inboxMessage) error
 		if previous.Seq != 0 {
 			return nil
 		}
-		eng, err := liveAgentEngine(s)
-		if err != nil || len(msg.Input) == 0 {
-			return err
+		eng, engineErr := liveAgentEngine(s)
+		if engineErr != nil || len(msg.Input) == 0 {
+			return engineErr
 		}
 		return eng.checkInput(msg.Input)
 	})
@@ -621,17 +621,17 @@ func (r *runner) deliver(record stateRecord) error {
 	}
 	claimed, err := func() (bool, error) {
 		defer closeBestEffort(lock)
-		if err := r.refreshInbox(); err != nil {
-			return false, err
+		if refreshErr := r.refreshInbox(); refreshErr != nil {
+			return false, refreshErr
 		}
 		if !r.active() {
 			for _, pending := range r.inbox.queue {
 				if pending.Kind != "interrupt" || pending.Seq <= record.Seq {
 					continue
 				}
-				_, valid, err := r.marker(pending)
-				if err != nil || valid {
-					return false, err
+				_, valid, markerErr := r.marker(pending)
+				if markerErr != nil || valid {
+					return false, markerErr
 				}
 			}
 		}

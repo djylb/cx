@@ -42,18 +42,18 @@ func readSharedFile(path string) ([]byte, error) {
 }
 
 type jobStateObserver struct {
-	dir                  string
-	s                    status
-	cursor               stateCursor
 	tail                 *stateTail
 	pending              map[uint64]string
-	identity             jobIdentity
 	floor                *status
 	selected             *turnCompletion
+	withdrawal           *inboxAck
+	identity             jobIdentity
+	dir                  string
+	deliveredWithdrawals []uint64
+	s                    status
+	cursor               stateCursor
 	withdrawn            bool
 	watchWithdrawals     bool
-	deliveredWithdrawals []uint64
-	withdrawal           *inboxAck
 }
 
 func (o *jobStateObserver) Close() error { return o.tail.Close() }
@@ -287,17 +287,17 @@ func observe(ctx context.Context, op, dir string) error {
 
 type observedResult struct {
 	RunID  string `json:"run_id"`
-	Number int64  `json:"turn"`
 	TurnID string `json:"turn_id"`
+	Number int64  `json:"turn"`
 }
 
 // The status describes the job at the end of the observation. Result identifies
 // the selected completion, which can precede that status's latest completion.
 type waitObservation struct {
-	status
 	Result    *observedResult `json:"result,omitempty"`
 	EventID   string          `json:"event_id,omitempty"`
 	NoticeKey string          `json:"notice_key,omitempty"`
+	status
 }
 
 func waitJob(ctx context.Context, dir string, acknowledge bool) (waitObservation, error) {
@@ -346,11 +346,11 @@ func waitJob(ctx context.Context, dir string, acknowledge bool) (waitObservation
 			if !acknowledge {
 				observation.NoticeKey = observer.identity.key
 			}
-			fresh, err := deliverNotice(ctx, dir, observer.identity, observation.EventID, acknowledge, func() error {
+			fresh, noticeErr := deliverNotice(ctx, dir, observer.identity, observation.EventID, acknowledge, func() error {
 				return json.NewEncoder(os.Stdout).Encode(observation)
 			})
-			if err != nil {
-				return waitObservation{}, err
+			if noticeErr != nil {
+				return waitObservation{}, noticeErr
 			}
 			if fresh {
 				return observation, ctlExit(exitQueued)
@@ -367,8 +367,8 @@ func waitJob(ctx context.Context, dir string, acknowledge bool) (waitObservation
 				if !acknowledge {
 					return json.NewEncoder(os.Stdout).Encode(observation)
 				}
-				_, err := fmt.Printf("job=%s status=waiting_input input_kind=%s\n", s.Job, s.InputKind)
-				return err
+				_, printErr := fmt.Printf("job=%s status=waiting_input input_kind=%s\n", s.Job, s.InputKind)
+				return printErr
 			})
 			if claimErr != nil {
 				return waitObservation{}, claimErr
@@ -415,7 +415,7 @@ func waitResult(initial, s status, busy bool, selected *turnCompletion) waitObse
 		}
 		return waitObservation{status: s}
 	}
-	result := observedResult{s.RunID, s.Finished, s.LastCompleted}
+	result := observedResult{RunID: s.RunID, Number: s.Finished, TurnID: s.LastCompleted}
 	if busy && selected != nil {
 		result = selected.observedResult
 		s.LastCompleted, s.CompletedStatus = selected.TurnID, selected.Outcome

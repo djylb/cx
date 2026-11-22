@@ -637,17 +637,17 @@ func TestConcurrentRegistrationAndInterruptedDelivery(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, name := range []string{"ack.msg", "unknown.msg"} {
-		record, err := newRecord("msg", inboxMessage{Text: "same"})
-		if err != nil {
-			t.Fatal(err)
+		record, recordErr := newRecord("msg", inboxMessage{Text: "same"})
+		if recordErr != nil {
+			t.Fatal(recordErr)
 		}
 		record.ID = name
-		record, err = appendInbox(t.Context(), dir, record, nil)
-		if err != nil {
-			t.Fatal(err)
+		record, recordErr = appendInbox(t.Context(), dir, record, nil)
+		if recordErr != nil {
+			t.Fatal(recordErr)
 		}
-		if err := r.claimInbox(record, "deliver"); err != nil {
-			t.Fatal(err)
+		if claimErr := r.claimInbox(record, "deliver"); claimErr != nil {
+			t.Fatal(claimErr)
 		}
 	}
 	if err = r.recoverInbox(turn{Items: []item{{Type: "userMessage", ClientID: "ack.msg"}}}); err != nil {
@@ -658,8 +658,8 @@ func TestConcurrentRegistrationAndInterruptedDelivery(t *testing.T) {
 		t.Fatal(in, err)
 	}
 	for _, name := range []string{"ack.msg", "unknown.msg"} {
-		if err := publishMessage(t.Context(), dir, name, inboxMessage{Text: "same"}); err != nil {
-			t.Fatal(err)
+		if publishErr := publishMessage(t.Context(), dir, name, inboxMessage{Text: "same"}); publishErr != nil {
+			t.Fatal(publishErr)
 		}
 	}
 	pending, err := pendingInboxMessages(dir)

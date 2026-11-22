@@ -114,9 +114,9 @@ printf 'new connection\n'
 				t.Fatalf("replay got %q, exit %d, error %v", r.data, r.code, e)
 			}
 			for _, host := range []string{"first", "worker"} {
-				b, e := os.ReadFile(filepath.Join(dir, host+".paths"))
-				if e != nil {
-					t.Fatal(e)
+				b, readErr := os.ReadFile(filepath.Join(dir, host+".paths"))
+				if readErr != nil {
+					t.Fatal(readErr)
 				}
 				paths := strings.Fields(string(b))
 				changed := len(paths) == 2 && paths[0] != paths[1]

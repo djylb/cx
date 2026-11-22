@@ -14,9 +14,9 @@ func TestEngineRegistry(t *testing.T) {
 		t.Fatal(e.name, err)
 	}
 	for _, name := range engineNames() {
-		e, err := lookupEngine(name)
-		if err != nil || e.name != name || e.binary == "" || e.homeEnv == "" || len(e.loginArgs) == 0 || e.drv == nil {
-			t.Fatal(name, err)
+		e, lookupErr := lookupEngine(name)
+		if lookupErr != nil || e.name != name || e.binary == "" || e.homeEnv == "" || len(e.loginArgs) == 0 || e.drv == nil {
+			t.Fatal(name, lookupErr)
 		}
 		c := config{Engine: name}
 		if c.driver() != e.drv {

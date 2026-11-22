@@ -55,8 +55,8 @@ const turnReportKind = "turn_report"
 type turnReportRef struct {
 	Turn   string `json:"turn"`
 	Path   string `json:"path"`
-	Size   int64  `json:"size"`
 	SHA256 string `json:"sha256"`
+	Size   int64  `json:"size"`
 }
 
 func turnReportPath(id string) (string, error) {
@@ -179,8 +179,8 @@ func (r *runner) publishTurnReport(id string, report []byte) error {
 		return err
 	}
 	full := filepath.Join(r.dir, filepath.FromSlash(path))
-	if err := os.MkdirAll(filepath.Dir(full), 0700); err != nil {
-		return err
+	if mkdirErr := os.MkdirAll(filepath.Dir(full), 0700); mkdirErr != nil {
+		return mkdirErr
 	}
 	ref := turnReportRef{Turn: id, Path: path, Size: int64(len(report)), SHA256: snapSum(report)}
 	previous, err := findTurnReport(r.dir, id)
@@ -202,8 +202,8 @@ func (r *runner) publishTurnReport(id string, report []byte) error {
 	if err == nil {
 		err = syncJobFile(f)
 	}
-	if err := errors.Join(err, f.Close()); err != nil {
-		return err
+	if writeErr := errors.Join(err, f.Close()); writeErr != nil {
+		return writeErr
 	}
 	if err := syncJobTree(filepath.Dir(full), r.dir); err != nil {
 		return err
@@ -212,8 +212,8 @@ func (r *runner) publishTurnReport(id string, report []byte) error {
 }
 
 type turnCompletion struct {
-	observedResult
 	Outcome string `json:"outcome"`
+	observedResult
 }
 
 func completedTurn(s status) turnCompletion {
@@ -223,7 +223,10 @@ func completedTurn(s status) turnCompletion {
 		// changing the result of the prior turn.
 		outcome = s.TurnStatus
 	}
-	return turnCompletion{observedResult{s.RunID, s.Finished, s.LastCompleted}, outcome}
+	return turnCompletion{
+		Outcome:        outcome,
+		observedResult: observedResult{RunID: s.RunID, Number: s.Finished, TurnID: s.LastCompleted},
+	}
 }
 
 func completionCheckpoints(dir string) ([]stateRecord, error) {

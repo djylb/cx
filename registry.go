@@ -56,7 +56,7 @@ func ensureNodeStateFormat(ctx context.Context, root string) error {
 		record, _, err := latestStateKind(dir, outboxSeenKind)
 		if err == nil && record.Seq != 0 {
 			var at stateCursor
-			if err := json.Unmarshal(record.Value, &at); err != nil || at.Seg == 0 || at.Seq == 0 || at.Off == 0 {
+			if decodeErr := json.Unmarshal(record.Value, &at); decodeErr != nil || at.Seg == 0 || at.Seq == 0 || at.Off == 0 {
 				return true, false, fmt.Errorf("%w: %s has an incompatible outbox checkpoint", errStateFormat, dir)
 			}
 		}
@@ -95,19 +95,19 @@ func claimKey(root string, c config, s status) error {
 		return err
 	}
 	if old.RunID != "" {
-		current, _, err := loadJobStatus(filepath.Join(root, old.Project, old.Job))
-		if err != nil && !errors.Is(err, errNotRegistered) {
-			return err
+		current, _, statusErr := loadJobStatus(filepath.Join(root, old.Project, old.Job))
+		if statusErr != nil && !errors.Is(statusErr, errNotRegistered) {
+			return statusErr
 		}
 		if current.RunID != old.RunID {
-			current, err = archivedDedupStatus(dir, old)
-			if err != nil {
-				return err
+			current, statusErr = archivedDedupStatus(dir, old)
+			if statusErr != nil {
+				return statusErr
 			}
 		}
 		if current.State != "" && (!current.final || (current.State == "done" && current.CompletedStatus == "completed")) {
-			if err = json.NewEncoder(os.Stdout).Encode(current); err != nil {
-				return err
+			if outputErr := json.NewEncoder(os.Stdout).Encode(current); outputErr != nil {
+				return outputErr
 			}
 			return errDuplicate
 		}
@@ -121,8 +121,8 @@ func claimKey(root string, c config, s status) error {
 	if err == nil {
 		err = writer.sync()
 	}
-	if err := errors.Join(err, writer.Close()); err != nil {
-		return err
+	if retireErr := errors.Join(err, writer.Close()); retireErr != nil {
+		return retireErr
 	}
 	if err := syncJobTree(dir, root); err != nil {
 		return err

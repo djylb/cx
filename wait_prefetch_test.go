@@ -51,8 +51,8 @@ func TestWaitPrefetchesSelectedTurn(t *testing.T) {
 	defer cancel()
 	before := status{RunID: "run", Finished: 1, LastCompleted: "first", Turn: "second", TurnStatus: "inProgress"}
 	now := status{RunID: "run", Job: "prefetch", State: "waiting", Finished: 3, LastCompleted: "third", CompletedStatus: "completed"}
-	want := observedResult{"run", 2, "second"}
-	obs := waitResult(before, now, true, &turnCompletion{want, "completed"})
+	want := observedResult{RunID: "run", Number: 2, TurnID: "second"}
+	obs := waitResult(before, now, true, &turnCompletion{observedResult: want, Outcome: "completed"})
 	if obs.Result == nil || *obs.Result != want {
 		t.Fatalf("wait selected %+v, want %+v", obs.Result, want)
 	}
@@ -167,15 +167,15 @@ func TestResultMarkerRejectsLatePublication(t *testing.T) {
 	}
 	publish := func(seen resultReference, gen string, n int64) {
 		t.Helper()
-		if err := publishResultMarker(ctx, marker, seen, gen, n); err != nil {
-			t.Fatal(err)
+		if publishErr := publishResultMarker(ctx, marker, seen, gen, n); publishErr != nil {
+			t.Fatal(publishErr)
 		}
 	}
 	check := func(want resultReference) {
 		t.Helper()
-		got, err := readResultReference(marker)
-		if err != nil || got != want {
-			t.Fatalf("marker = %+v, want %+v (%v)", got, want, err)
+		got, readErr := readResultReference(marker)
+		if readErr != nil || got != want {
+			t.Fatalf("marker = %+v, want %+v (%v)", got, want, readErr)
 		}
 	}
 	publish(before, "old", 3)
@@ -210,7 +210,7 @@ func TestWaitPrefetchKeepsNewerGeneration(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
 	const host, id = "remote", "p/prefetch"
-	target := observedResult{"old", 2, "second"}
+	target := observedResult{RunID: "old", Number: 2, TurnID: "second"}
 	archive := writePrefetchArchive(t, ctx, target)
 	entered, release := filepath.Join(f.home, "entered"), filepath.Join(f.home, "release")
 	setupPrefetchSSH(t, f, `
@@ -278,7 +278,7 @@ esac
 func TestCanceledResultUnpackKeepsDownload(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	target := observedResult{"run", 2, "second"}
+	target := observedResult{RunID: "run", Number: 2, TurnID: "second"}
 	archive := writePrefetchArchive(t, ctx, target)
 	dest := filepath.Join(t.TempDir(), "result")
 	part := dest + ".part"
@@ -294,7 +294,7 @@ func TestCanceledResultUnpackKeepsDownload(t *testing.T) {
 	}
 	installCtx, stop := context.WithCancel(ctx)
 	defer stop()
-	canceled := cancelDuringUnpack{installCtx, filepath.Dir(dest), stop}
+	canceled := cancelDuringUnpack{Context: installCtx, dir: filepath.Dir(dest), cancel: stop}
 	if err = installResultTurn(canceled, part, dest, target); !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled unpack: %v", err)
 	}
@@ -312,8 +312,8 @@ func TestCanceledResultUnpackKeepsDownload(t *testing.T) {
 // Cancel at the first read after extraction has opened its output file.
 type cancelDuringUnpack struct {
 	context.Context
-	dir    string
 	cancel context.CancelFunc
+	dir    string
 }
 
 func (c cancelDuringUnpack) Err() error {

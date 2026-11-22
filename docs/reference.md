@@ -308,7 +308,7 @@ func Collect(ctx context.Context, job string) (SnapshotResult, error)
 
 B3 已接入节点分派。`nodeCLI` 的 `snap-receive` 参数交给 `ReceiveSnapshot(ctx, args[1:])`，`endpoint.command` 将它列为流式命令（含 forward-stream 中转）。正常发布在同一条连接上读取已收偏移、发送剩余归档、等待导入回执。
 
-冻结和发布都沿用 v1 清单、`repos/<store_id>.git` 和 `refs/snapshots/<oid>`。读取原有对象库时可把 `CX_SNAPSHOT_STORE` 指向其根目录。导入先刷盘 Git 对象、引用和目录，再发布清单。已发布的快照复用前校验 Git 引用及可达对象，缺失时重新导入。控制端解析 Go 模块或工作区时调用本机 `go mod edit`、`go work edit`。上下文目录的所有普通文件会随任务包发送。显式请求 Git 历史时，可达历史对象也会发送。测试逐项对照二进制内嵌的敏感名单与 `snapshot/denylist`。
+冻结和发布都沿用 v1 清单、`repos/<store_id>.git` 和 `refs/snapshots/<oid>`。读取原有对象库时可把 `CX_SNAPSHOT_STORE` 指向其根目录。导入先刷盘 Git 对象、引用和目录，再发布清单。已发布的快照复用前校验 Git 引用及可达对象，缺失时重新导入。控制端解析 Go 模块或工作区时调用本机 `go mod edit`、`go work edit`。上下文目录的所有普通文件会随任务包发送。显式请求 Git 历史时，可达历史对象也会发送。Go 快照使用二进制内嵌的敏感文件名单，测试通过冻结流程验证敏感文件会被拒绝。
 
 发布归档留在控制端直到收到导入成功回执；节点按归档 SHA-256 保留已收前缀，按清单 SHA-256 发布。检出使用私有 bare 的 detached worktree。收集补丁使用临时索引和临时对象目录，主工作目录的 `artifacts/` 单独回收。原 Python 路径仍可读写现有清单，保留作迁移回退。
 

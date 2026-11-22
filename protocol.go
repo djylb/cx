@@ -362,6 +362,10 @@ func (r *runner) call(method string, p any, result any) error {
 }
 
 type runner struct {
+	idleSince, turnSince, closing time.Time
+	lastAction                    time.Time
+	lastStateWrite                time.Time
+
 	ctx                       context.Context
 	claude                    *claudeSession
 	budget                    *runtimeBudget
@@ -372,21 +376,18 @@ type runner struct {
 	inbox                     *inboxState
 	srv                       *server
 	turnFailure               *pendingTurnFailure
-	closeRequest              uint64
-	closeCompleted            bool
 	cmdOpen                   map[string]time.Time // command items in progress
 	follow                    *followAdmission
 
-	idleSince, turnSince, closing time.Time
-	lastAction                    time.Time
-	lastStateWrite                time.Time
-	root, dir                     string
-	lastText                      string
-	pending                       string // a turn to start once the current one ended (stall recovery)
+	root, dir string
+	lastText  string
+	pending   string // a turn to start once the current one ended (stall recovery)
 
-	c     config
-	s     status
-	dirty bool
+	c              config
+	s              status
+	closeRequest   uint64
+	closeCompleted bool
+	dirty          bool
 }
 
 const (

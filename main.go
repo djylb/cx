@@ -83,18 +83,15 @@ func (c *config) privileged() bool {
 type status struct {
 	LastEvent time.Time `json:"last_event_time"`
 	ExitCode  *int64    `json:"exit_code,omitempty"`
-	rateLimitStatus
-	turnSummary
 
-	Project         string `json:"project,omitempty"`
-	Session         string `json:"session,omitempty"`
-	Job             string `json:"job"`
-	State           string `json:"status"`
-	QueueReason     string `json:"queue_reason,omitempty"`
-	QueueGeneration uint64 `json:"queue_generation,omitempty"`
-	Profile         string `json:"profile,omitempty"`
-	Engine          string `json:"engine,omitempty"`
-	RunID           string `json:"run_id,omitempty"`
+	Project     string `json:"project,omitempty"`
+	Session     string `json:"session,omitempty"`
+	Job         string `json:"job"`
+	State       string `json:"status"`
+	QueueReason string `json:"queue_reason,omitempty"`
+	Profile     string `json:"profile,omitempty"`
+	Engine      string `json:"engine,omitempty"`
+	RunID       string `json:"run_id,omitempty"`
 
 	Thread          string `json:"thread_id"`
 	Turn            string `json:"turn_id"`
@@ -107,24 +104,27 @@ type status struct {
 	CompactOp       string `json:"compact_op,omitempty"`
 	Error           string `json:"error,omitempty"`
 	LastAction      string `json:"last_action,omitempty"`
+	LaunchID        string `json:"launch_id,omitempty"`
 
+	rateLimitStatus
+	turnSummary
 	Usage     json.RawMessage `json:"token_usage"`
 	Approvals []approval      `json:"pending_requests,omitempty"`
 
-	Generation     uint64 `json:"generation,omitempty"`
-	CompactAfter   int64  `json:"compact_after_seq,omitempty"`
-	CompactSeq     int64  `json:"compact_event_seq,omitempty"`
-	RunnerStart    uint64 `json:"runner_start,omitempty"`
-	Restarts       int    `json:"restarts,omitempty"`
-	LaunchID       string `json:"launch_id,omitempty"`
-	EngineRestarts int    `json:"engine_restarts,omitempty"`
-	CommandPID     int    `json:"command_pid,omitempty"`
-	PID            int    `json:"pid,omitempty"`
-	EnginePID      int    `json:"engine_pid,omitempty"`
-	Finished       int64  `json:"completed_turns"`
-	StallCount     int    `json:"stall_count,omitempty"`
-	Privileged     bool   `json:"privileged,omitempty"`
-	final          bool
+	QueueGeneration uint64 `json:"queue_generation,omitempty"`
+	Generation      uint64 `json:"generation,omitempty"`
+	CompactAfter    int64  `json:"compact_after_seq,omitempty"`
+	CompactSeq      int64  `json:"compact_event_seq,omitempty"`
+	RunnerStart     uint64 `json:"runner_start,omitempty"`
+	Restarts        int    `json:"restarts,omitempty"`
+	EngineRestarts  int    `json:"engine_restarts,omitempty"`
+	CommandPID      int    `json:"command_pid,omitempty"`
+	PID             int    `json:"pid,omitempty"`
+	EnginePID       int    `json:"engine_pid,omitempty"`
+	Finished        int64  `json:"completed_turns"`
+	StallCount      int    `json:"stall_count,omitempty"`
+	Privileged      bool   `json:"privileged,omitempty"`
+	final           bool
 }
 
 // diagnosticf writes advisory text or reports an existing failure. A broken
@@ -503,8 +503,8 @@ func runNode(ctx context.Context, args []string, directSubmit bool) error {
 	if err = fs.Parse(rest); err != nil {
 		return err
 	}
-	if _, err := checkNodeStateFormat(root); err != nil {
-		return err
+	if _, formatErr := checkNodeStateFormat(root); formatErr != nil {
+		return formatErr
 	}
 	explicitApproval := false
 	fs.Visit(func(f *flag.Flag) { explicitApproval = explicitApproval || f.Name == "approval-timeout" })
@@ -661,14 +661,14 @@ func runNode(ctx context.Context, args []string, directSubmit bool) error {
 		if err != nil || closing == nil {
 			return err
 		}
-		work, err := workDir(dir, closing.status)
-		if err != nil {
-			return err
+		work, workErr := workDir(dir, closing.status)
+		if workErr != nil {
+			return workErr
 		}
 		if id := privateWorkspaceID(root, work); id != "" {
-			lock, err := jobOperationLock(ctx, root, id)
-			if err != nil {
-				return err
+			lock, lockErr := jobOperationLock(ctx, root, id)
+			if lockErr != nil {
+				return lockErr
 			}
 			defer closeBestEffort(lock)
 		}
@@ -715,28 +715,28 @@ func runNode(ctx context.Context, args []string, directSubmit bool) error {
 				return err
 			}
 			var saved config
-			if err := readJobConfig(dir, &saved); err != nil {
-				return err
+			if configErr := readJobConfig(dir, &saved); configErr != nil {
+				return configErr
 			}
 			cwd = saved.Dir
 		} else if cwd == "" && (command || c.Shell) {
 			cwd = "."
 		}
-		bound, err := bindWorkspace(root, cwd)
-		if err != nil {
-			return err
+		bound, workspaceErr := bindWorkspace(root, cwd)
+		if workspaceErr != nil {
+			return workspaceErr
 		}
 		if expectedWorkspace != "" && bound.key != expectedWorkspace {
 			return errJobReplaced
 		}
-		releaseWorkspace, err = bound.lock(ctx, root, jobs...)
-		if err != nil {
-			return err
+		releaseWorkspace, workspaceErr = bound.lock(ctx, root, jobs...)
+		if workspaceErr != nil {
+			return workspaceErr
 		}
 		defer releaseWorkspace()
 		if sourceID != "" {
-			if err := sourceIdentity.checkDir(sourceDir); err != nil {
-				return err
+			if identityErr := sourceIdentity.checkDir(sourceDir); identityErr != nil {
+				return identityErr
 			}
 		}
 		if op == "start" && bound.path != "" {
@@ -753,8 +753,8 @@ func runNode(ctx context.Context, args []string, directSubmit bool) error {
 		}
 	}()
 	if op == "start" || op == "resume" {
-		if err := ensureNodeStateFormat(ctx, root); err != nil {
-			return err
+		if formatErr := ensureNodeStateFormat(ctx, root); formatErr != nil {
+			return formatErr
 		}
 	}
 	if *project != "" {
@@ -885,13 +885,13 @@ func runNode(ctx context.Context, args []string, directSubmit bool) error {
 			return startErr
 		}
 		if len(c.Argv) > 0 {
-			key, err := jobDirectoryKey(dir)
-			if err != nil {
-				return err
+			key, keyErr := jobDirectoryKey(dir)
+			if keyErr != nil {
+				return keyErr
 			}
-			handoff, err := lockPath(filepath.Join(dir, "handoff.lock"), 0)
-			if err != nil {
-				return err
+			handoff, handoffErr := lockPath(filepath.Join(dir, "handoff.lock"), 0)
+			if handoffErr != nil {
+				return handoffErr
 			}
 			if handoff == nil {
 				return errors.New("command handoff already active")
@@ -909,9 +909,10 @@ func runNode(ctx context.Context, args []string, directSubmit bool) error {
 				if directSubmit && runtime.GOOS == "windows" && (errors.Is(startErr, context.DeadlineExceeded) || errors.Is(startErr, context.Canceled)) {
 					return fmt.Errorf("psmux launch acknowledgement unavailable: %w", startErr)
 				}
-				guard, err = registryLock(ctx, root)
-				if err != nil {
-					return errors.Join(startErr, err)
+				var lockErr error
+				guard, lockErr = registryLock(ctx, root)
+				if lockErr != nil {
+					return errors.Join(startErr, lockErr)
 				}
 				return recordLaunchFailure(ctx, dir, c, startErr)
 			}
@@ -935,17 +936,17 @@ func runNode(ctx context.Context, args []string, directSubmit bool) error {
 		return errJobReplaced
 	}
 	if expectedDir != "" {
-		key, err := jobDirectoryKey(dir)
-		if err != nil {
-			return err
+		key, keyErr := jobDirectoryKey(dir)
+		if keyErr != nil {
+			return keyErr
 		}
 		if key != expectedDir {
 			return errJobReplaced
 		}
 	}
 	if closing != nil {
-		if err := closing.check(dir, current, cursor); err != nil {
-			return err
+		if confirmErr := closing.check(dir, current, cursor); confirmErr != nil {
+			return confirmErr
 		}
 	}
 	s = current
@@ -1002,22 +1003,22 @@ func runNode(ctx context.Context, args []string, directSubmit bool) error {
 		}
 		return printStatus(dir)
 	}
-	if err := checkJobHandle(f, filepath.Join(dir, "owner.lock")); err != nil {
-		return err
+	if handleErr := checkJobHandle(f, filepath.Join(dir, "owner.lock")); handleErr != nil {
+		return handleErr
 	}
 	s, cursor, err = loadJobStatus(dir)
 	if err != nil {
 		return err
 	}
-	if err := identity.check(dir, s); err != nil {
-		return err
+	if identityErr := identity.check(dir, s); identityErr != nil {
+		return identityErr
 	}
 	if resumeTerminal && !s.final {
 		return errJobOwnerBusy
 	}
 	if closing != nil {
-		if err := closing.check(dir, s, cursor); err != nil {
-			return err
+		if confirmErr := closing.check(dir, s, cursor); confirmErr != nil {
+			return confirmErr
 		}
 	}
 	if err = readJobConfig(dir, &c); err != nil {
@@ -1059,25 +1060,25 @@ func runNode(ctx context.Context, args []string, directSubmit bool) error {
 		if err != nil {
 			return err
 		}
-		confirmed, confirmedCursor, err := loadJobStatus(dir)
-		if err != nil {
-			return err
+		confirmed, confirmedCursor, statusErr := loadJobStatus(dir)
+		if statusErr != nil {
+			return statusErr
 		}
-		if err = identity.check(dir, confirmed); err != nil {
-			return err
+		if identityErr := identity.check(dir, confirmed); identityErr != nil {
+			return identityErr
 		}
 		if !confirmed.final || confirmedCursor != cursor {
 			return errJobReplaced
 		}
-		owner, err := openJobOwner(ctx, dir, jobFileLockExisting)
-		if err != nil {
-			return err
+		owner, ownerErr := openJobOwner(ctx, dir, jobFileLockExisting)
+		if ownerErr != nil {
+			return ownerErr
 		}
 		if owner == nil {
 			return errJobOwnerBusy
 		}
-		if err := archiveAndDetachJob(ctx, root, dir, owner, c, r.s, syncJobTree); err != nil {
-			return err
+		if detachErr := archiveAndDetachJob(ctx, root, dir, owner, c, r.s, syncJobTree); detachErr != nil {
+			return detachErr
 		}
 		_ = guard.Close()
 		guard = nil

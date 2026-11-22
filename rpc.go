@@ -31,12 +31,12 @@ type rpcReceipt struct {
 // receiptRecord is the state-log payload. rpcReceipt preserves the CLI
 // response fields used by controllers.
 type receiptRecord struct {
-	Op         string          `json:"op"`
-	Answer     json.RawMessage `json:"answer,omitempty"`
 	Error      *rpcError       `json:"error,omitempty"`
-	Status     string          `json:"status"`
-	Generation uint64          `json:"generation"`
 	AgentReply *agentReply     `json:"agent_reply,omitempty"`
+	Op         string          `json:"op"`
+	Status     string          `json:"status"`
+	Answer     json.RawMessage `json:"answer,omitempty"`
+	Generation uint64          `json:"generation"`
 }
 
 type agentReply struct {

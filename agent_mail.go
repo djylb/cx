@@ -19,7 +19,6 @@ type pendingAgentAsk struct {
 }
 
 type agentMail struct {
-	Timeout    time.Duration `json:"timeout_ns,omitempty"`
 	Deadline   *time.Time    `json:"deadline,omitempty"`
 	Time       time.Time     `json:"time"`
 	Type       string        `json:"type"`
@@ -29,6 +28,7 @@ type agentMail struct {
 	Request    string        `json:"request_id,omitempty"`
 	RunID      string        `json:"run_id"`
 	Options    []string      `json:"options,omitempty"`
+	Timeout    time.Duration `json:"timeout_ns,omitempty"`
 	Seq        uint64        `json:"seq"`
 	Generation uint64        `json:"generation"`
 	Blocking   bool          `json:"blocking,omitempty"`
@@ -59,7 +59,17 @@ func appendMail(ctx context.Context, dir string, identity jobIdentity, operation
 				}
 			}
 			var err error
-			record.Value, err = json.Marshal(m)
+			// Outbox retries compare payload bytes. Preserve the existing field
+			// order with timeout_ns first in the on-disk JSON.
+			type mailFields agentMail
+			wire := struct {
+				Timeout *time.Duration `json:"timeout_ns,omitempty"`
+				*mailFields
+			}{mailFields: (*mailFields)(m)}
+			if m.Timeout != 0 {
+				wire.Timeout = &m.Timeout
+			}
+			record.Value, err = json.Marshal(wire)
 			return err
 		})
 	return err

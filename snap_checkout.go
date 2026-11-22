@@ -41,11 +41,11 @@ func readPreparedSnapshot(ctx context.Context, dir string) (PreparedSnapshot, bo
 		return prepared, false, err
 	}
 	var ref blobRef
-	if err := json.Unmarshal(record.Value, &ref); err != nil {
-		return prepared, false, err
+	if decodeErr := json.Unmarshal(record.Value, &ref); decodeErr != nil {
+		return prepared, false, decodeErr
 	}
-	if err := syncJobDir(filepath.Join(dir, "state")); err != nil {
-		return prepared, false, err
+	if syncErr := syncJobDir(filepath.Join(dir, "state")); syncErr != nil {
+		return prepared, false, syncErr
 	}
 	if ref.Role != preparedBlobRole || !snapHex(ref.SHA256, 64) {
 		return prepared, false, errors.New("invalid prepared blob reference")
@@ -76,8 +76,8 @@ func publishPreparedSnapshot(dir string, prepared PreparedSnapshot) error {
 		return err
 	}
 	ref := blobRef{Role: preparedBlobRole, SHA256: snapSum(b)}
-	if err := publishImmutable(blobPath(dir, ref.SHA256), b, filepath.Dir(dir)); err != nil {
-		return err
+	if publishErr := publishImmutable(blobPath(dir, ref.SHA256), b, filepath.Dir(dir)); publishErr != nil {
+		return publishErr
 	}
 	w, err := openStateLog(dir)
 	if err != nil {
@@ -194,12 +194,12 @@ func Materialize(ctx context.Context, job string, m Manifest, target string) (Pr
 		for _, repo := range slices.Backward(m.Repositories) {
 			mirror := snapGit{ctx: ctx, dir: repo.bare(target)}
 			dst := filepath.Join(tree, repo.Path)
-			if err := removeUnpublishedWorktree(mirror, dst); err != nil {
-				return out, err
+			if removeErr := removeUnpublishedWorktree(mirror, dst); removeErr != nil {
+				return out, removeErr
 			}
 		}
-		if err := os.RemoveAll(work); err != nil {
-			return out, err
+		if removeErr := os.RemoveAll(work); removeErr != nil {
+			return out, removeErr
 		}
 	} else if !os.IsNotExist(err) {
 		return out, err

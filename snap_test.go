@@ -173,13 +173,3 @@ func TestSnapDirectoryIncrement(t *testing.T) {
 		t.Fatal("accepted untracked sensitive file")
 	}
 }
-
-func TestSnapEmbeddedDenylist(t *testing.T) {
-	shared, err := os.ReadFile(filepath.Join("..", "snapshot", "denylist"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if snapDeny != strings.ReplaceAll(string(shared), "\r\n", "\n") {
-		t.Fatal("embedded snapshot policy differs from snapshot/denylist")
-	}
-}

@@ -51,13 +51,13 @@ func TestRunnerRotationKeepsMailboxAndReports(t *testing.T) {
 		t.Fatal(segments, err)
 	}
 	for _, id := range []string{"first", "second"} {
-		report, err := readTurnReport(t.Context(), dir, id)
-		if err != nil || string(report) != id+" report" {
-			t.Fatalf("turn %s: %q, %v", id, report, err)
+		report, reportErr := readTurnReport(t.Context(), dir, id)
+		if reportErr != nil || string(report) != id+" report" {
+			t.Fatalf("turn %s: %q, %v", id, report, reportErr)
 		}
 	}
-	if data, err := os.ReadFile(first); err != nil || string(data) != "incomplete" {
-		t.Fatalf("unpublished bytes changed: %q, %v", data, err)
+	if data, readErr := os.ReadFile(first); readErr != nil || string(data) != "incomplete" {
+		t.Fatalf("unpublished bytes changed: %q, %v", data, readErr)
 	}
 	in, err := readInboxState(dir)
 	if err != nil || in.acks[4].Result != "delivered" || in.claims[5].ID != "waiting" ||

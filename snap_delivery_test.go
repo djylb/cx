@@ -120,11 +120,11 @@ func TestSnapResume(t *testing.T) {
 	if _, _, e = snapManifest(dest, string(sid)); !os.IsNotExist(e) {
 		t.Fatalf("early publication: %v", e)
 	}
-	if off, e := send(b[split:]); e != nil || off != strconv.Itoa(split) {
-		t.Fatalf("resume: %s %v", off, e)
+	if off, sendErr := send(b[split:]); sendErr != nil || off != strconv.Itoa(split) {
+		t.Fatalf("resume: %s %v", off, sendErr)
 	}
-	if off, e := send(nil); e != nil || off != "done" {
-		t.Fatalf("repeat: %s %v", off, e)
+	if off, sendErr := send(nil); sendErr != nil || off != "done" {
+		t.Fatalf("repeat: %s %v", off, sendErr)
 	}
 	repo := manifest.Repositories[0]
 	if e = os.Remove(filepath.Join(repo.bare(dest), "refs", "snapshots", repo.OID)); e != nil {
@@ -171,8 +171,8 @@ func TestSnapWireDisconnectReleasesSnapshotLock(t *testing.T) {
 			}
 			var stderr bytes.Buffer
 			cmd.Stderr = &stderr
-			if err := cmd.Start(); err != nil {
-				t.Fatal(err)
+			if startErr := cmd.Start(); startErr != nil {
+				t.Fatal(startErr)
 			}
 			defer func() {
 				if cmd.ProcessState == nil {
@@ -181,35 +181,35 @@ func TestSnapWireDisconnectReleasesSnapshotLock(t *testing.T) {
 				}
 			}()
 			scanner := bufio.NewReader(out)
-			if line, err := scanner.ReadString('\n'); line != "0\n" || err != nil {
-				t.Fatalf("snapshot receiver handshake: %q, %v", line, err)
+			if line, readErr := scanner.ReadString('\n'); line != "0\n" || readErr != nil {
+				t.Fatalf("snapshot receiver handshake: %q, %v", line, readErr)
 			}
 			lockName := filepath.Join(store, "incoming", id+".lock")
 			if !tc.keepWriter {
 				// Observe a partial body and the lock before closing stdin.
 				z := gzip.NewWriter(w)
-				if _, err := z.Write([]byte("x")); err != nil {
-					t.Fatal(err)
+				if _, writeErr := z.Write([]byte("x")); writeErr != nil {
+					t.Fatal(writeErr)
 				}
-				if err := z.Flush(); err != nil {
-					t.Fatal(err)
+				if flushErr := z.Flush(); flushErr != nil {
+					t.Fatal(flushErr)
 				}
-				if line, err := scanner.ReadString('\n'); line != "bytes 1\n" || err != nil {
-					t.Fatalf("snapshot receiver partial body: %q, %v", line, err)
+				if line, readErr := scanner.ReadString('\n'); line != "bytes 1\n" || readErr != nil {
+					t.Fatalf("snapshot receiver partial body: %q, %v", line, readErr)
 				}
-				lock, err := lockPath(lockName, 0)
-				if err != nil || lock != nil {
+				lock, lockErr := lockPath(lockName, 0)
+				if lockErr != nil || lock != nil {
 					if lock != nil {
 						closeBestEffort(lock)
 					}
-					t.Fatalf("expected receiver to hold snapshot lock: %v", err)
+					t.Fatalf("expected receiver to hold snapshot lock: %v", lockErr)
 				}
-				if err := w.Close(); err != nil {
-					t.Fatal(err)
+				if closeErr := w.Close(); closeErr != nil {
+					t.Fatal(closeErr)
 				}
 			}
-			if _, err := io.Copy(io.Discard, scanner); err != nil {
-				t.Fatal(err)
+			if _, drainErr := io.Copy(io.Discard, scanner); drainErr != nil {
+				t.Fatal(drainErr)
 			}
 			err = cmd.Wait()
 			var exit *exec.ExitError
@@ -366,8 +366,8 @@ func TestSnapshotRepublishRepairsObjectsBeforePreparedReuse(t *testing.T) {
 	}
 	hub := endpoint{State: t.TempDir()}
 	target := filepath.Join(hub.State, "snapshot")
-	if err := Publish(ctx, hub, id, nil); err != nil {
-		t.Fatal(err)
+	if publishErr := Publish(ctx, hub, id, nil); publishErr != nil {
+		t.Fatal(publishErr)
 	}
 	job := t.TempDir()
 	prepared, err := Materialize(ctx, job, m, target)
@@ -417,17 +417,17 @@ func TestSnapshotCheckoutVolumeFaultPreventsPreparedReuse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := snapImmutable(filepath.Join(job, "input", "manifest.json"), raw); err != nil {
-		t.Fatal(err)
+	if writeErr := snapImmutable(filepath.Join(job, "input", "manifest.json"), raw); writeErr != nil {
+		t.Fatal(writeErr)
 	}
 	repo := m.Repositories[0]
 	dst := filepath.Join(job, "work", "tree", repo.Path)
-	if err := os.MkdirAll(filepath.Dir(dst), 0700); err != nil {
-		t.Fatal(err)
+	if mkdirErr := os.MkdirAll(filepath.Dir(dst), 0700); mkdirErr != nil {
+		t.Fatal(mkdirErr)
 	}
 	mirror := snapGit{ctx: ctx, dir: repo.bare(store)}
-	if err := mirror.worktree("add", "-q", "--detach", dst, repo.OID); err != nil {
-		t.Fatal(err)
+	if checkoutErr := mirror.worktree("add", "-q", "--detach", dst, repo.OID); checkoutErr != nil {
+		t.Fatal(checkoutErr)
 	}
 	damaged := filepath.Join(dst, "payload")
 	w, err := openStateLog(job)
@@ -446,18 +446,18 @@ func TestSnapshotCheckoutVolumeFaultPreventsPreparedReuse(t *testing.T) {
 		}
 		return syncJobFile(f)
 	}
-	if err := w.commit(record); !errors.Is(err, fault) {
-		t.Fatalf("expected checkout barrier failure: %v", err)
+	if commitErr := w.commit(record); !errors.Is(commitErr, fault) {
+		t.Fatalf("expected checkout barrier failure: %v", commitErr)
 	}
-	if err := w.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := w.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
 	// Discard the unsynced file while leaving the Git objects intact.
-	if err := os.Remove(damaged); err != nil {
-		t.Fatal(err)
+	if removeErr := os.Remove(damaged); removeErr != nil {
+		t.Fatal(removeErr)
 	}
-	if _, published, err := readPreparedSnapshot(ctx, job); published || err != nil {
-		t.Fatalf("reused incomplete checkout: published %v, %v", published, err)
+	if _, published, readErr := readPreparedSnapshot(ctx, job); published || readErr != nil {
+		t.Fatalf("reused incomplete checkout: published %v, %v", published, readErr)
 	}
 	prepared, err := Materialize(ctx, job, m, store)
 	if err != nil {
