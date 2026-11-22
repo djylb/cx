@@ -86,21 +86,13 @@ func retryWindowsFileIO(budget time.Duration, retryable func(error) bool, attemp
 
 func replaceFile(from, to string) error {
 	return retryWindowsFileIO(stateReplaceBudget, isWindowsFileConflict, func() error {
-		err := renameFilePOSIX(from, to)
-		if posixRenameUnavailable(err) {
+		// POSIX replacement is preferred; when a volume or filter driver rejects it for
+		// any reason, MoveFileEx decides. A real failure surfaces from MoveFileEx too.
+		if renameFilePOSIX(from, to) != nil {
 			return os.Rename(from, to)
-		}
-		if err != nil {
-			return &os.LinkError{Op: "rename", Old: from, New: to, Err: err}
 		}
 		return nil
 	})
-}
-
-// Some volumes and filter drivers reject the POSIX rename request itself, observed as
-// ERROR_INVALID_NAME for an ordinary path; plain MoveFileEx replacement still works there.
-func posixRenameUnavailable(err error) bool {
-	return errors.Is(err, windows.ERROR_NOT_SUPPORTED) || errors.Is(err, windows.ERROR_INVALID_PARAMETER) || errors.Is(err, windows.ERROR_INVALID_NAME)
 }
 
 func extendedWindowsPath(path string) string {

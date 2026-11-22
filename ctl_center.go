@@ -371,8 +371,14 @@ func rsyncStage(ctx context.Context, h endpoint, src, stage string) error {
 	if e != nil {
 		return e
 	}
+	// No -s/--protect-args: openrsync (macOS) lacks it, and newer GNU rsync changed how
+	// remote arguments are quoted. Restricting the remote path to shell-safe bytes keeps
+	// the remote operand identical under every rsync variant.
+	if strings.IndexFunc(stage, func(r rune) bool { return !shellSafe(r) }) >= 0 {
+		return fmt.Errorf("rsync stage path needs shell-safe characters: %q", stage)
+	}
 	cmd := func() error {
-		c := exec.CommandContext(ctx, "rsync", "-s", "--partial", "--checksum", "--no-whole-file", "--timeout="+strconv.Itoa(max(1, int(idle.Seconds()))), "-e", strings.Join(parts, " "), "--", src, h.SSH+":"+stage)
+		c := exec.CommandContext(ctx, "rsync", "--partial", "--checksum", "--no-whole-file", "--timeout="+strconv.Itoa(max(1, int(idle.Seconds()))), "-e", strings.Join(parts, " "), "--", src, h.SSH+":"+stage)
 		c.Stderr = os.Stderr
 		err := c.Run()
 		var ex *exec.ExitError
@@ -430,4 +436,8 @@ func seedRelayCache(version, plat string) error {
 		return copyFile(basis, stage)
 	}
 	return nil
+}
+
+func shellSafe(r rune) bool {
+	return r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || strings.ContainsRune("._/-+:@%=,", r)
 }

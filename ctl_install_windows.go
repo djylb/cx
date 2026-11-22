@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -60,4 +61,10 @@ func replaceBinary(from, to string) error {
 		})
 	}
 	return err
+}
+
+// Volumes or filter drivers that reject the POSIX rename request itself; MoveFileEx still works there.
+func posixRenameUnavailable(err error) bool {
+	return errors.Is(err, windows.ERROR_NOT_SUPPORTED) || errors.Is(err, windows.ERROR_INVALID_PARAMETER) ||
+		errors.Is(err, windows.ERROR_INVALID_NAME) || errors.Is(err, windows.ERROR_PATH_NOT_FOUND)
 }
