@@ -214,7 +214,7 @@ func TestB1RelaySetup(t *testing.T) {
 	if e := os.WriteFile(filepath.Join(dir, "hosts.toml"), []byte(cfg), 0600); e != nil {
 		t.Fatal(e)
 	}
-	script := "#!/bin/sh\nset -eu\ntest \"$1\" = -oBatchMode=yes && test \"$2\" = -oConnectTimeout=90\ntest \"$3\" = -oControlMaster=auto && test \"$5\" = -oControlPersist=10m\nshift 5\nif test \"$1\" = -J; then test \"$2\" = first; shift 2; fi\ntest \"$1\" = --; shift\ncase \"$1\" in first|second);; *) exit 99;; esac\nif test \"$1\" = second; then test \"$PWD\" = \"$CX_FIXTURE/first\" || exit 98; fi\ncd \"$CX_FIXTURE/$1\"\nexport HOME=\"$PWD\" CXRUN_STATE=\"$PWD/state\"\nexec /bin/sh -c \"$2\"\n"
+	script := "#!/bin/sh\nset -eu\ntest \"$1\" = -oBatchMode=yes && test \"$2\" = -oConnectTimeout=90\ntest \"$3\" = -oControlMaster=auto && test \"$5\" = -oControlPersist=10m\nshift 5\nif test \"$1\" = -J; then test \"$2\" = first; shift 2; fi\ntest \"$1\" = --; shift\ncase \"$1\" in first|second);; *) exit 99;; esac\nif test \"$1\" = second; then test \"$PWD\" = \"$CX_FIXTURE/first\" || exit 98; fi\ncd \"$CX_FIXTURE/$1\"\nexport HOME=\"$PWD\" CXRUN_STATE=\"$PWD/state\"\nshift\n# Like ssh, join the remaining operands into one remote command line.\nexec /bin/sh -c \"$*\"\n"
 	if e := os.WriteFile(filepath.Join(f.home, "ssh"), []byte(script), 0700); e != nil {
 		t.Fatal(e)
 	}
@@ -369,15 +369,17 @@ func TestB1ConnectionAndProgressClocks(t *testing.T) {
 		name, script string
 		expired      bool
 	}{
-		{"slow handshake", "echo proxy-banner >&2; sleep .25; echo connected; sleep .05; echo done", false},
-		{"active transfer", "for i in 1 2 3 4 5; do echo data; sleep .06; done", false},
-		{"silent node", "printf 'cx-wire: ready\n' >&2; exec sleep 2", true},
+		{"slow handshake", "echo proxy-banner >&2; sleep .6; echo connected; sleep .1; echo done", false},
+		{"active transfer", "for i in 1 2 3 4 5; do echo data; sleep .1; done", false},
+		{"silent node", "printf 'cx-wire: ready\n' >&2; exec sleep 3", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			ctx, stop := context.WithTimeout(context.Background(), 2*time.Second)
+			// The idle budget leaves room for process exit and reaping on slow CI runners;
+			// the handshake sleep still exceeds it, so only the connect clock can cover it.
+			ctx, stop := context.WithTimeout(context.Background(), 4*time.Second)
 			defer stop()
 			cmd := exec.CommandContext(ctx, "/bin/sh", "-c", tc.script)
-			e := runActive(cmd, stop, time.Second, 150*time.Millisecond, io.Discard, io.Discard)
+			e := runActive(cmd, stop, 2*time.Second, 400*time.Millisecond, io.Discard, io.Discard)
 			if errors.Is(e, context.DeadlineExceeded) != tc.expired || !tc.expired && e != nil {
 				t.Fatal(e)
 			}

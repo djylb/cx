@@ -63,7 +63,7 @@ func startCommand(cmd *exec.Cmd, id string) (commandTree, error) {
 		syscall.CloseHandle(syscall.Handle(job))
 		return commandTree{}, err
 	}
-	h, err := syscall.OpenProcess(0x0100|0x0800|0x0001|0x100000, false, uint32(cmd.Process.Pid))
+	h, err := syscall.OpenProcess(0x0100|0x0800|0x0001|0x1000|0x100000, false, uint32(cmd.Process.Pid))
 	if err == nil {
 		ok, _, e := assignJob.Call(job, uintptr(h))
 		if ok == 0 {

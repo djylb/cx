@@ -107,3 +107,25 @@ func TestWindowsStateFileErrorsNamePath(t *testing.T) {
 		t.Fatalf("readStateFile returned %v", err)
 	}
 }
+
+// The POSIX rename request is the primary replacement path; report exactly how a
+// volume treats it so a fallback is never silently relied upon.
+func TestWindowsPOSIXRenameReplaces(t *testing.T) {
+	dir := t.TempDir()
+	from, to := filepath.Join(dir, "from"), filepath.Join(dir, "to")
+	for _, f := range []struct{ path, body string }{{from, "new"}, {to, "old"}} {
+		if err := os.WriteFile(f.path, []byte(f.body), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	err := renameFilePOSIX(from, to)
+	got, readErr := os.ReadFile(to)
+	entries, _ := os.ReadDir(dir)
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	if err != nil || readErr != nil || string(got) != "new" || len(names) != 1 {
+		t.Fatalf("dir %s: rename error %v, target %q (%v), entries %q", dir, err, got, readErr, names)
+	}
+}

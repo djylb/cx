@@ -11,13 +11,12 @@ Run these steps with the user who will operate cx. Ask for missing deployment in
 
 ## 2. Obtain the controller binary
 
-Use one of these paths. Install the binary as `cx` (`cx.exe` on Windows) in a user-owned directory on PATH, then run `cx version` to print the installed binary's SHA-256.
+cx is distributed as source only. Build it with Go and install the binary as `cx` (`cx.exe` on Windows) in a user-owned directory on PATH, then run `cx version` to print the installed binary's SHA-256.
 
-1. **Release download.** If the maintainers publish release assets, pick the OS/architecture build and verify it against the published SHA-256 checksum before installing. Use the release location provided by the maintainer.
-2. **Go install.** From `cxrun/` in a source checkout, run `go install .`. Go writes `cx` to `GOBIN` or to the Go binary directory when `GOBIN` is unset.
-3. **Build from source.** From `cxrun/`, run `go build -o cx .` on Unix or `go build -o cx.exe .` on Windows. Move the result to the user-owned PATH directory.
+1. **Go install.** Run `go install github.com/djylb/cx@latest`. Go writes `cx` to `GOBIN`, or to the Go binary directory when `GOBIN` is unset.
+2. **Build from a checkout.** In the directory that holds `go.mod`, run `go build -o cx .` on Unix or `go build -o cx.exe .` on Windows, then move the result to the user-owned PATH directory.
 
-The current module path is `cx`. Both Go commands above use the checked-out module. A versioned `go install` from a public module requires a published import path.
+Keep the checkout when remote hosts use a different platform: `setup` cross-builds their node binary from it.
 
 ## 3. Configure remote hosts
 
@@ -54,7 +53,7 @@ Use `cx setup local` for local execution. `doctor` reports probes such as tool a
 
 `setup` installs or reuses the matching binary and initializes the state directory. An existing `host.json` is preserved. Review the slot and load policy with the user before changing it. For a different target platform, keep a checkout and Go available for cross-building. Set `CX_MODULE` to the `cxrun/` module directory if discovery fails. You can also point `CX_SETUP_BINARY` at a verified, matching target binary for a specific setup invocation.
 
-For deployments with published artifacts, setup can use `[release]` in the user host file, with a `url` template containing `{version}` and `{platform}` and a `[release.sha256]` entry keyed by `goos-goarch` for each platform. SSH and gzip streams carry job and result data. Some Linux upgrade paths use rsync for binary deltas. If rsync is unavailable, use `CX_SETUP_BINARY` for the target to select the explicit artifact path.
+SSH and gzip streams carry job and result data. Some Linux upgrade paths use rsync for binary deltas. If rsync is unavailable, point `CX_SETUP_BINARY` at a binary you built for the target.
 
 ### Configure credentials on the execution host
 

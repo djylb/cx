@@ -65,7 +65,7 @@ func scanProcesses(run string, v *inventory) map[int]process {
 func signalMember(p process, force bool, run string) error {
 	fd, err := unix.PidfdOpen(p.PID, 0)
 	if err == nil {
-		defer unix.Close(fd)
+		defer func() { _ = unix.Close(fd) }()
 	} else if err != unix.ENOSYS && err != unix.EINVAL {
 		return err
 	}
