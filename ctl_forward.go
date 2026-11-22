@@ -63,8 +63,8 @@ func ctlForward(ctx context.Context, op string, args []string) error {
 		}
 		// Query hosts concurrently with a per-host bound so one slow link cannot hold the others.
 		type factsReply struct {
-			r   reply
 			err error
+			r   reply
 		}
 		replies := make([]chan factsReply, len(names))
 		for i, name := range names {
@@ -80,7 +80,7 @@ func ctlForward(ctx context.Context, op string, args []string) error {
 				if err == nil && r.code != 0 {
 					err = r.output()
 				}
-				replies[i] <- factsReply{r, err}
+				replies[i] <- factsReply{err, r}
 			}()
 		}
 		var failed error

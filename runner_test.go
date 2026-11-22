@@ -640,6 +640,9 @@ func (h *testRuns) await(id string, match func(status) bool) status {
 			return s
 		}
 		if err := pause(h.ctx, 10*time.Millisecond); err != nil {
+			// A stuck in-process runner is diagnosed from its goroutine stacks.
+			stacks := make([]byte, 1<<20)
+			h.t.Logf("goroutines:\n%s", stacks[:runtime.Stack(stacks, true)])
 			h.t.Fatalf("%s: %+v: %v", id, s, err)
 		}
 	}

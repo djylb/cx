@@ -214,7 +214,7 @@ func TestB1RelaySetup(t *testing.T) {
 	if e := os.WriteFile(filepath.Join(dir, "hosts.toml"), []byte(cfg), 0600); e != nil {
 		t.Fatal(e)
 	}
-	script := "#!/bin/sh\nset -eu\ntest \"$1\" = -oBatchMode=yes && test \"$2\" = -oConnectTimeout=90\ntest \"$3\" = -oControlMaster=auto && test \"$5\" = -oControlPersist=10m\nshift 5\nif test \"$1\" = -J; then test \"$2\" = first; shift 2; fi\ntest \"$1\" = --; shift\ncase \"$1\" in first|second);; *) exit 99;; esac\nif test \"$1\" = second; then test \"$PWD\" = \"$CX_FIXTURE/first\" || exit 98; fi\ncd \"$CX_FIXTURE/$1\"\nexport HOME=\"$PWD\" CXRUN_STATE=\"$PWD/state\"\nshift\n# Like ssh, join the remaining operands into one remote command line.\nexec /bin/sh -c \"$*\"\n"
+	script := "#!/bin/sh\nset -eu\ntest \"$1\" = -oBatchMode=yes && test \"$2\" = -oConnectTimeout=90\ntest \"$3\" = -oControlMaster=auto && test \"$5\" = -oControlPersist=10m\nshift 5\nif test \"$1\" = -J; then test \"$2\" = first; shift 2; fi\n# cx passes \"--\" before the alias; rsync -e invocations do not.\nif test \"$1\" = --; then shift; fi\ncase \"$1\" in first|second);; *) exit 99;; esac\nif test \"$1\" = second; then test \"$PWD\" = \"$CX_FIXTURE/first\" || exit 98; fi\ncd \"$CX_FIXTURE/$1\"\nexport HOME=\"$PWD\" CXRUN_STATE=\"$PWD/state\"\nshift\n# Like ssh, join the remaining operands into one remote command line.\nexec /bin/sh -c \"$*\"\n"
 	if e := os.WriteFile(filepath.Join(f.home, "ssh"), []byte(script), 0700); e != nil {
 		t.Fatal(e)
 	}

@@ -195,3 +195,15 @@ func (w *receiveProgress) Write(p []byte) (int, error) {
 	}
 	return len(p), nil
 }
+
+// retireMaster asks a host's control master to stop accepting new sessions. ssh removes the
+// control socket, so the next invocation starts a new master; existing sessions continue.
+var retireMaster = func(host string) {
+	opts, e := sshOptions()
+	if e != nil || unsupportedMaster.Load() {
+		return
+	}
+	ctx, stop := context.WithTimeout(context.Background(), 5*time.Second)
+	defer stop()
+	_ = exec.CommandContext(ctx, "ssh", append(opts, "-O", "stop", "--", host)...).Run()
+}

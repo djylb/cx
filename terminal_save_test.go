@@ -12,14 +12,18 @@ import (
 func TestTerminalSaveSurvivesTransientRefusal(t *testing.T) {
 	dir := t.TempDir()
 	failures := 3
-	writeStatus = func(path string, v any) error {
+	orig := writeStatus
+	writeStatus = func(path string, v any, durable bool) error {
+		if !durable {
+			t.Error("terminal state written without a flush")
+		}
 		if failures > 0 {
 			failures--
 			return errors.New("access is denied")
 		}
 		return writeJSON(path, v)
 	}
-	t.Cleanup(func() { writeStatus = writeJSON })
+	t.Cleanup(func() { writeStatus = orig })
 	code := int64(0)
 	r := runner{dir: dir, s: status{Job: "j", State: "done", ExitCode: &code}}
 	if err := r.saveTerminal(); err != nil || failures != 0 {
@@ -36,10 +40,11 @@ func TestTerminalSaveGivesUpAndRecordsCause(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "progress.log"), nil, 0600); err != nil {
 		t.Fatal(err)
 	}
-	writeStatus = func(string, any) error { return errors.New("access is denied") }
+	orig := writeStatus
+	writeStatus = func(string, any, bool) error { return errors.New("access is denied") }
 	budget := terminalSaveBudget
 	terminalSaveBudget = 200 * time.Millisecond
-	t.Cleanup(func() { writeStatus, terminalSaveBudget = writeJSON, budget })
+	t.Cleanup(func() { writeStatus, terminalSaveBudget = orig, budget })
 	start := time.Now()
 	r := runner{dir: dir, s: status{State: "done"}}
 	err := r.saveTerminal()

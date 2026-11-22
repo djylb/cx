@@ -340,11 +340,12 @@ func ReceiveSnapshot(ctx context.Context, args []string) error {
 		return e
 	}
 	// This node invocation owns stdin. Closing it unblocks a silent SSH pipe.
-	stop := context.AfterFunc(ctx, func() { _ = os.Stdin.Close() })
+	in := interruptibleStdin()
+	stop := context.AfterFunc(ctx, func() { _ = in.Close() })
 	defer stop()
-	watchdog := time.AfterFunc(idle, func() { _ = os.Stdin.Close() })
+	watchdog := time.AfterFunc(idle, func() { _ = in.Close() })
 	defer watchdog.Stop()
-	return snapReceiveAt(ctx, store, args, snapActiveReader{os.Stdin, watchdog, idle}, os.Stdout)
+	return snapReceiveAt(ctx, store, args, snapActiveReader{in, watchdog, idle}, os.Stdout)
 }
 func snapReceiveAt(ctx context.Context, store string, args []string, input io.Reader, reply io.Writer) error {
 	if len(args) != 3 || !snapHex(args[0], 64) || !snapHex(args[1], 64) {

@@ -469,6 +469,12 @@ func (h endpoint) invoke(parent context.Context, per time.Duration, replay bool,
 			}
 			return reply{b, exit.ExitCode()}, nil
 		}
+		if expired && len(b) == 0 && h.SSH != "" && !errors.Is(parent.Err(), context.Canceled) {
+			// No reply at all: the shared master may be wedged on a stalled link while still
+			// answering keepalives. Retire it so the next attempt (here or in another
+			// command) opens a fresh connection; sessions already on it keep running.
+			retireMaster(h.SSH)
+		}
 		if cause := parent.Err(); cause != nil {
 			return reply{}, errors.Join(ctlExit(9), cause)
 		}

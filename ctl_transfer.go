@@ -108,11 +108,12 @@ func receiveTask(ctx context.Context, a []string) error {
 		return e
 	}
 	part := filepath.Join(filepath.Dir(p), "."+a[1]+".part")
-	stop := context.AfterFunc(ctx, func() { _ = os.Stdin.Close() })
+	in := interruptibleStdin()
+	stop := context.AfterFunc(ctx, func() { _ = in.Close() })
 	defer stop()
-	timer := time.AfterFunc(idle, func() { _ = os.Stdin.Close() })
+	timer := time.AfterFunc(idle, func() { _ = in.Close() })
 	defer timer.Stop()
-	if e = receivePacket(part, a[1], size, snapActiveReader{os.Stdin, timer, idle}, os.Stdout); e != nil {
+	if e = receivePacket(part, a[1], size, snapActiveReader{in, timer, idle}, os.Stdout); e != nil {
 		return e
 	}
 	return os.Rename(part, p)

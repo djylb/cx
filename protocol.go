@@ -393,7 +393,7 @@ func (r *runner) saveTerminal() error {
 	deadline := time.Now().Add(terminalSaveBudget)
 	delay := 50 * time.Millisecond
 	for {
-		err := r.save()
+		err := r.store(true)
 		if err == nil || time.Now().Add(delay).After(deadline) {
 			return err
 		}
@@ -402,9 +402,21 @@ func (r *runner) saveTerminal() error {
 	}
 }
 
-var writeStatus = writeJSON
+// writeStatus replaces status.json; durable writes also flush it to stable storage.
+var writeStatus = func(path string, v any, durable bool) error {
+	if durable {
+		return writeJSON(path, v)
+	}
+	return writeJSONVolatile(path, v)
+}
 
-func (r *runner) save() error {
+// save publishes the current state. Intermediate states change many times per turn and
+// are rebuilt by the runner, so they are replaced atomically without a flush: on Windows
+// FlushFileBuffers can stall for seconds on a busy volume and would freeze the runner.
+// Terminal states use saveTerminal, which flushes.
+func (r *runner) save() error { return r.store(false) }
+
+func (r *runner) store(durable bool) error {
 	r.dirty = false
 	var approvals []approval
 	for _, a := range r.s.Approvals {
@@ -415,7 +427,7 @@ func (r *runner) save() error {
 	return writeStatus(filepath.Join(r.dir, "status.json"), struct {
 		Legacy []approval `json:"waiting_approval,omitempty"`
 		status
-	}{Legacy: approvals, status: r.s})
+	}{Legacy: approvals, status: r.s}, durable)
 }
 func (r *runner) active() bool { return r.s.TurnStatus == "inProgress" }
 func (r *runner) deriveState() {

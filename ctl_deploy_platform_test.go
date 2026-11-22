@@ -47,7 +47,8 @@ func TestWindowsMissingVersionProbe(t *testing.T) {
 		t.Fatalf("missing file handling: %s", script)
 	}
 	if runtime.GOOS == "windows" {
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		// PowerShell cold start on a busy CI runner can take several seconds.
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		out, err := exec.CommandContext(ctx, args[0], args[1:]...).CombinedOutput()
 		var exit *exec.ExitError

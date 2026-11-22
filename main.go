@@ -171,6 +171,16 @@ func writeJSON(path string, v any) error {
 	}
 	return atomicWrite(path, append(b, '\n'))
 }
+
+// writeJSONVolatile replaces path atomically without flushing it; a crash keeps either
+// the old or the new contents, a power loss may lose the update.
+func writeJSONVolatile(path string, v any) error {
+	b, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return err
+	}
+	return atomicWriteSync(path, append(b, '\n'), func(*os.File) error { return nil })
+}
 func readJSON(path string, v any) error {
 	b, err := readStateFile(path)
 	if err != nil {
@@ -426,9 +436,10 @@ func runNode(ctx context.Context, args []string, directSubmit bool) error {
 			return errors.New("unexpected arguments")
 		}
 		if op == "mcp-tools" {
-			stopRead := context.AfterFunc(ctx, func() { _ = os.Stdin.Close() })
+			in := interruptibleStdin()
+			stopRead := context.AfterFunc(ctx, func() { _ = in.Close() })
 			defer stopRead()
-			return serveTools(ctx, dir, os.Stdin, os.Stdout)
+			return serveTools(ctx, dir, in, os.Stdout)
 		}
 		enc := json.NewEncoder(os.Stdout)
 		return readMail(dir, outSince, func(m agentMail) error { return enc.Encode(m) })
