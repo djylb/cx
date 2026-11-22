@@ -166,7 +166,7 @@ esac
 		t.Fatal("doctor disclosed a credential")
 	}
 	_, diag := credentialCLI(t, f, 0, "exec", "local", "--wait", "--env", "MY_API_KEY=mock-cli-input", "--", "/usr/bin/true")
-	if !strings.Contains(diag, "MY_API_KEY 看起来是凭据键名，请改用执行端 env_file") || strings.Contains(diag, "mock-cli-input") {
+	if !strings.Contains(diag, "MY_API_KEY looks like a credential; put it in the executor env_file instead") || strings.Contains(diag, "mock-cli-input") {
 		t.Fatal(diag)
 	}
 }
@@ -210,7 +210,7 @@ exec "$CX_FIXTURE_CODEX" "$@"
 	writeCredentialFixture(t, input, `[{"type":"text","text":"task","nested":{"SomeToken":"mock-input-value","PASSWORD":"mock-input-value"}}]`, 0600)
 	_, diag := credentialCLI(t, f, 0, "run", "local", work, "agent", prompt, "--inplace", "--idle-exit", "250ms", "--input-json", "@"+input)
 	for _, key := range []string{"SomeToken", "PASSWORD"} {
-		if !strings.Contains(diag, key+" 看起来是凭据键名，请改用执行端 env_file") || strings.Contains(diag, "mock-input-value") {
+		if !strings.Contains(diag, key+" looks like a credential; put it in the executor env_file instead") || strings.Contains(diag, "mock-input-value") {
 			t.Fatal(diag)
 		}
 	}

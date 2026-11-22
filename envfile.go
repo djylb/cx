@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -96,6 +97,13 @@ func (r *runner) loadCredentials() error {
 	if err != nil {
 		return err
 	}
+	// Non-interactive launches (tmux/psmux, ssh) skip shell rc files, so version-manager shims are missing and
+	// an older system toolchain wins. Put existing shim directories first; env_file below may still set PATH.
+	if path := shimPath(os.Getenv("PATH")); path != os.Getenv("PATH") {
+		r.c.localEnv = append(r.c.localEnv, "PATH="+path)
+		// The runner is a per-job process: program lookup (exec.Command) uses this process's PATH.
+		_ = os.Setenv("PATH", path)
+	}
 	if p.EnvFile != "" {
 		path := stateRelative(root, p.EnvFile)
 		info, err := os.Stat(path)
@@ -151,7 +159,7 @@ func sensitiveKey(key string) bool {
 }
 
 func warnCredentialKey(key string) {
-	fmt.Fprintf(os.Stderr, "cx: %s 看起来是凭据键名，请改用执行端 env_file\n", key)
+	fmt.Fprintf(os.Stderr, "cx: %s looks like a credential; put it in the executor env_file instead\n", key)
 }
 
 func warnInputCredentials(data []byte) {
@@ -332,4 +340,48 @@ func checkResumeProfile(root, recorded, requested string) error {
 	}
 	_, _, err := selectedProfile(root, recorded, false)
 	return err
+}
+
+// shimPath prepends the shim directories of installed version managers (mise, asdf, pyenv, rbenv) that are not
+// already on PATH. Which manager exists is a fixed fact (its directory); versions are resolved by the shims.
+func shimPath(current string) string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return current
+	}
+	dirs := []struct{ env, base, sub string }{
+		{"MISE_DATA_DIR", ".local/share/mise", "shims"}, {"ASDF_DATA_DIR", ".asdf", "shims"},
+		{"PYENV_ROOT", ".pyenv", "shims"}, {"RBENV_ROOT", ".rbenv", "shims"},
+	}
+	if runtime.GOOS == "windows" {
+		if local := os.Getenv("LOCALAPPDATA"); local != "" {
+			dirs = append(dirs, struct{ env, base, sub string }{"", filepath.Join(local, "mise"), "shims"})
+		}
+	}
+	have := map[string]bool{}
+	for _, p := range filepath.SplitList(current) {
+		have[p] = true
+	}
+	var front []string
+	for _, d := range dirs {
+		base := ""
+		if d.env != "" {
+			base = os.Getenv(d.env)
+		}
+		if base == "" {
+			base = d.base
+			if !filepath.IsAbs(base) {
+				base = filepath.Join(home, filepath.FromSlash(base))
+			}
+		}
+		dir := filepath.Join(base, d.sub)
+		if fi, err := os.Stat(dir); err == nil && fi.IsDir() && !have[dir] {
+			front = append(front, dir)
+			have[dir] = true
+		}
+	}
+	if len(front) == 0 {
+		return current
+	}
+	return strings.Join(append(front, current), string(os.PathListSeparator))
 }
