@@ -33,7 +33,7 @@ func submitScript(ctx context.Context, h endpoint, args []string, path, shell st
 			return reply{}, e
 		}
 	}
-	f, e := os.Open(path)
+	f, e := openJobFile(path, jobFileRead)
 	if e != nil {
 		return reply{}, e
 	}
@@ -42,7 +42,7 @@ func submitScript(ctx context.Context, h endpoint, args []string, path, shell st
 	if e != nil {
 		return reply{}, e
 	}
-	ctx, cancel := context.WithTimeout(ctx, 6*time.Hour)
+	ctx, cancel := context.WithTimeout(ctx, transferLimit)
 	defer cancel()
 	cmd, e := h.command(ctx, append([]string{"submit-script", shell}, args[1:]...))
 	if e != nil {
@@ -85,11 +85,11 @@ func receiveScript(ctx context.Context, args []string) error {
 	if e != nil {
 		return e
 	}
-	lock, e := jobOperationLock(ctx, root, args[2])
+	cwd, unlock, e := lockCommandWorkspace(ctx, root, args[2], args[3])
 	if e != nil {
 		return e
 	}
-	defer closeBestEffort(lock)
+	defer unlock()
 	dir, e := jobDir(filepath.Join(root, ".scripts"), args[2])
 	if e != nil {
 		return e
@@ -102,7 +102,7 @@ func receiveScript(ctx context.Context, args []string) error {
 		return e
 	}
 	defer closeBestEffort(z)
-	f, e := os.CreateTemp(dir, ".script-*")
+	f, e := createJobTemp(dir, ".script-")
 	if e != nil {
 		return e
 	}
@@ -118,7 +118,7 @@ func receiveScript(ctx context.Context, args []string) error {
 	}
 	argv := scriptArgv(shell, path)
 	submit := append([]string{"submit-command"}, args[2:]...)
-	return submitNodeCommand(ctx, root, append(append(submit, "--"), argv...))
+	return submitNodeCommand(ctx, append(append(submit, "--"), argv...), cwd)
 }
 
 func scriptShell(shell string) string {

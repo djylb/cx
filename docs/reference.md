@@ -1,6 +1,6 @@
 # cxrun
 
-`cxrun` 在执行主机上运行 Codex 作业或命令作业。Codex 引擎持有一个 `codex app-server` 子进程，通过 stdio JSON-RPC 维护一个 Codex 线程。Claude 通过文件收发消息。关闭 Monitor、SSH 断线，或控制端 Mac 进入睡眠后，远端执行主机上的 tmux/psmux 会话可以继续运行。执行主机本身需要保持运行，模型推理需要该主机能访问服务。
+`cxrun` 在执行主机上运行代理作业或命令作业。代理引擎由注册表（`engine.go`）统一描述：Codex 引擎持有一个 `codex app-server` 子进程，通过 stdio JSON-RPC 维护线程；Claude Code 引擎每轮运行一次 `claude` CLI，以 session 续接。关闭 Monitor、SSH 断线，或控制端 Mac 进入睡眠后，远端执行主机上的 tmux/psmux 会话可以继续运行。执行主机本身需要保持运行，模型推理需要该主机能访问服务。
 
 ## 执行端 CLI
 
@@ -29,10 +29,10 @@ cxrun clean --job tools/review
 | `--stall-nudge-file PATH` | 读取非空的 UTF-8 文案，供卡住时提醒和恢复时继续任务使用。省略时，提醒使用 `No progress detected. Report status, abandon any stuck command, and continue the task.`，续跑使用 `Continue the unfinished task.`。 |
 | `start --timeout DUR`、`--queue-timeout DUR` | 两种引擎共用。运行期限从命令进程或 app-server 成功启动时计时。每次等待 FIFO 准入单独计时，含负载、磁盘及缓存检查；获槽后继续消耗运行预算。两项默认均为 0，表示不限。空闲 app-server 计入运行时间，stall 重启沿用剩余预算。运行超时进入 `timeout`，排队超时进入 `queue_timeout`。 |
 | `--dedup-key K`、`--force` | 使用可作文件名的标识（例如十六进制 SHA-256）。同 JOB 重试打印已有状态，退出 0。其他 JOB 命中进行中或已成功的回执时打印原状态，退出 7。失败或中断后可重新提交。force 跳过去重，同 JOB 仍幂等。 |
-| `--stall DUR` | 默认 10 分钟，0 关闭。活动命令的静默窗口取 stall 与 `--cmd-stall` 的较大值，后者默认 30 分钟。连续静默先 steer，再 interrupt 后续跑，再按 PID 杀掉 app-server 进程树、恢复原线程并继续；仍静默则进入 stalled。意外退出和 stall 重启共用 `--max-restarts N`，默认每个作业 3 次，0 禁止自动重启。已使用次数写在 status.json 的 restarts 字段，resume 沿用。动作见 progress.log、status.json 的 stall_count 和 last_action。 |
-| `status --job JOB` | 输出状态 JSON。`status.json` 尚未发布时，输出 `{"job":"…","status":"not_registered"}` 并退出 11。文件无法读取或 JSON 损坏时报告错误。 |
+| `--stall DUR` | 默认 10 分钟，0 关闭。活动命令的静默窗口取 stall 与 `--cmd-stall` 的较大值，后者默认 30 分钟。连续静默先 steer，再 interrupt 后续跑，再按 PID 杀掉 app-server 进程树、恢复原线程并继续；仍静默则进入 stalled。意外退出和 stall 重启共用 `--max-restarts N`，默认每个作业 3 次，0 禁止自动重启。自动恢复已用次数在状态的 `engine_restarts` 中，`restarts` 同时计入显式 resume。动作见 progress.log 及状态的 stall_count 和 last_action。 |
+| `status --job JOB` | 输出状态 JSON。状态日志中尚无有效 `status` 帧时，输出 `{"job":"…","status":"not_registered"}` 并退出 11。状态读取或解码错误会报告异常。 |
 | `wait --timeout DUR` | 在同一个观察期限内等待登记、本轮完成或 runner 终止。退出 0 表示 completed，1 表示 failed/interrupted，3 表示 stalled，4 表示 timeout 或 queue_timeout，5 表示 orphaned，6 表示待回答。124 专用于本次观察超时，打印 wait_timeout=true。登记前超时还会打印 status=not_registered。默认观察期限 24 小时，可用 CXRUN_MONITOR_TIMEOUT 设置。 |
-| `wait --any [--project P] [--session S] [--since-file F] [--timeout DUR]` | 每秒检查状态根，返回首个匹配的新完成或终态。交付待回答问题时退出 6，交付完成或终态时退出 0，观察超时时退出 124，stdout 为空。默认观察期限与单作业 wait 相同。 |
+| `wait --any [--project P] [--session S] [--since-file F] [--timeout DUR]` | 每秒检查状态根，返回首个匹配的新事件。准入阻塞退出 13，待答问题退出 6。完成或终态时，节点命令退出 0，作业结果记在 JSON 的 `code` 字段，控制端用该字段作为退出码。观察超时退出 124 并保持 stdout 为空。默认观察期限与单作业 wait 相同。 |
 | `states` | 输出 JSON 对象，键为终态名，值为 wait 的退出码。已结束轮次的 failed/interrupted 结果返回 1。 |
 | `list [--project P] [--session S] [--fields brief]` | 每行一个作业 JSON，可组合筛选。省略筛选时包含旧扁平作业，省略 fields 时保留完整状态字段。 |
 | `clean --job P/JOB` | 仅删除已经释放 owner.lock 的 由 `states` 列出的终态作业状态目录。保留 `.dedup/K` 回执，成功作业清理后再次命中仍退出 7。控制端的 `cx clean` 一并回收私有工作目录。 |
@@ -41,24 +41,24 @@ cxrun clean --job tools/review
 
 ### 主机准入配置
 
-在执行端状态根放置 `host.json`。状态根由 `--state PATH`、`CXRUN_STATE` 或默认的 `~/.local/share/cx/state` 依次确定。
+在执行端状态根放置 `host.json`。状态根由 `--state PATH`、`CXRUN_STATE` 或默认位置依次确定：Unix 为 `~/.local/share/cx/state`，Windows 为 `%LOCALAPPDATA%\cx\state`。
 
 ```json
-{"slots":{"codex":3,"test":2,"system":1},"load_cmd":""}
+{"slots":{"agent":3,"test":2,"system":1},"load_cmd":""}
 ```
 
-- 槽位数必须是正整数。缺少文件或类别时，`codex`、`test` 及未配置的自定义类别在 Linux、Windows、其他平台上分别默认 10、6、3。`system` 默认 1。可用 `--slot-class` 选择类别。状态根保留 `host.json` 和 `cache` 名称，项目内的作业仍可使用这些名称。
+- 槽位数必须是正整数。缺少文件或类别时，`agent`、`test` 及未配置的自定义类别在 Linux、Windows、其他平台上分别默认 10、6、3。`system` 默认 1。可用 `--slot-class` 选择类别。状态根保留 `host.json` 和 `cache` 名称，项目内的作业仍可使用这些名称。
 - `load_cmd` 适用于所有类别。省略或为空时直接进行槽位检查。非空时 Unix 用 sh，Windows 用 cmd.exe，以退出码 0 表示允许准入。排队时立即检查，随后每 15 秒复查，单次上限 10 秒。
-- 每次准入读取配置，包括跟进轮。已排队的准入沿用读取时的槽位和负载配置，并定期复查磁盘及缓存配置。持有的槽位随该轮结束或进程退出而释放。遇到无法读取或格式错误的配置，`cxrun host` 和新一轮准入都会报错。更新文件时可在同目录写入临时文件并原子替换。
-- 各类别有独立的 FIFO 票据和槽位锁。Codex 默认类别沿用 `.admit/queue/` 和 `.admit/slot-N.lock`，其他类别位于 `.admit/classes/类别/`。等待时显示 `queued`，可用 `close` 取消。空闲时 `say` 开新轮并重新排队，活动轮直接 steer。stall 中断后续跑及 app-server 重启沿用原槽位。跟进轮排队时仍处理控制消息、协议帧和空闲期限。
-- `min_free_bytes` 约束状态根所在卷的可用空间，默认取 20 GB 和该卷容量 5% 中的较大值。可显式设为 0。低于阈值时，作业保持 `queued`，`status` 用 `queue_reason` 说明原因，`doctor` 和 `overview` 输出 `disk_warning`。等到空间达到阈值后按原队列继续准入。
-- 作业进程继承原环境变量（包括 `GOCACHE`），执行端设置 `CARGO_TARGET_DIR=<state>/cache/cargo-target/<project>`，并加入 Codex `workspace-write` 的可写目录。同项目复用 Cargo 增量构建产物，无项目名的作业使用自己的缓存目录。准入前按目录最近使用时间从旧到新淘汰，直到管理的 Cargo 缓存总量达到 `cache_max_bytes` 以下，默认 50 GB。持有作业租约的目录会跳过，缓存总量可能暂时超过上限。
+- 每次准入读取配置，包括跟进轮。排队时定期刷新配置，负载命令变化后重新检查。持有的槽位随该轮结束或进程退出而释放。遇到无法读取或格式错误的配置，`cxrun host` 和新一轮准入都会报错。更新文件时可在同目录写入临时文件并原子替换。
+- 各类别有独立的 FIFO 票据和槽位锁。代理默认类别 `agent` 使用 `.admit/queue/` 和 `.admit/slot-N.lock`，其他类别位于 `.admit/classes/类别/`。等待时显示 `queued`，可用 `close` 取消。空闲时 `say` 开新轮并重新排队，活动轮直接 steer。stall 中断后续跑及引擎重启沿用原槽位。跟进轮排队时仍处理控制消息、协议帧和空闲期限。
+- `min_free_bytes` 约束状态根所在卷的可用空间，默认取 20 GB 和该卷容量 5% 中的较大值。可显式设为 0。低于阈值时作业保持 `queued`，并请求主机回收可再生缓存。多个作业共享回收扫描，排队期间继续检查可用空间和 close 请求。逐项删除后复测实际可用空间。`status` 的 `queue_reason` 说明阻塞条件，`doctor` 和 `overview` 的 `disk_warning` 提供当前字节数。满足水位后按原队列继续准入。
+- 作业进程继承原环境变量（包括 `GOCACHE`），执行端设置 `CARGO_TARGET_DIR=<state>/cache/cargo-target/<project>`，并加入代理 `workspace-write` 的可写目录。同项目复用 Cargo 构建产物，无项目名的作业使用自己的缓存目录。`cache_max_bytes`（默认 50 GB）合计各 Cargo target、共享 npm/pnpm/yarn/pip 缓存，以及 Cargo 下载的 registry 和 Git 缓存中的普通文件逻辑大小。运行器释放租约后和磁盘低水位时触发主机清理，按目录及内容记录的最近使用时间从旧到新淘汰。清理限于 cx 准备并登记且身份匹配的目录，跳过包含挂载边界的目录。项目 Cargo target 和共享包缓存的租约保护运行器及其仍存活的后台进程。作业工作目录、用户自定义缓存路径以及 Cargo 凭据、配置和已安装工具均在回收范围之外。
 - 执行端在 `<state>/cache/packages/` 下共享 npm、pnpm、Yarn、pip 和 Cargo 注册表缓存。作业收到 `npm_config_cache`、`PNPM_STORE_DIR`（以及 pnpm 的 `npm_config_store_dir`）、`YARN_CACHE_FOLDER`、`PIP_CACHE_DIR` 与 `CARGO_HOME`，这些目录也加入 Codex `workspace-write` 的可写目录。命令作业仍可通过 `--env` 显式覆盖变量。
 - 从旧版升级时，把 `--slots` 和 `--load-cmd` 的设置迁到主机文件，并从调用方删除这两个参数。旧作业快照中的 `slots` 和 `load_cmd` 不再参与准入。
 
 ### 执行账户与凭据
 
-- 在执行端 `host.json` 配置可选的 `env_file`、`default_profile` 和 `profiles`。每个 profile 支持 `codex_home`、`claude_config_dir`、`env_file`，相对路径以执行端状态根为基准。配置示例见 [安装指南](../docs/agent-install.md#configure-credentials-on-the-execution-host)。
+- 在执行端 `host.json` 配置可选的 `env_file`、`default_profile` 和 `profiles`。每个 profile 支持 `engine_homes`（引擎名到账户目录，按引擎导出为 `CODEX_HOME`、`CLAUDE_CONFIG_DIR`）和 `env_file`，相对路径以执行端状态根为基准。配置示例见 [安装指南](../docs/agent-install.md#configure-credentials-on-the-execution-host)。
 - 新作业使用 `--profile NAME` 或主机默认账户。未知 profile 报错。作业状态只保存已选账户名。续跑和续轮沿用该账户，显式指定的名称必须一致。fork 默认继承，也可为新作业显式选择账户。
 - profile 提供的 `env_file` 替换主机文件，省略时使用主机文件。文件缺失时跳过；格式错误或其他读取错误会使作业启动失败。文件应在工作区和快照外，Unix 建议权限 `0600`。doctor 报告文件存在状态和 Unix 权限，并按 profile 检查 Codex 登录状态和 Claude CLI 可用性。
 - runner 在准入后读取 UTF-8 环境文件。支持空行和整行 `#` 注释，首个等号后的值按字面使用，重复键取最后一项。合并顺序为继承环境、显式环境、所选环境文件、账户目录及 runner 的作业标记。每次新启动 runner 时读取当前文件。子进程只收到本机注入的值，加载事件只记录键名。cx 会过滤自己捕获的输出中的字面凭据值。作业及其工具生成的文件由作业控制，保持凭据远离这些文件。
@@ -69,7 +69,7 @@ cxrun clean --job tools/review
 | 设置 | 默认值 | 覆盖方式 |
 | --- | --- | --- |
 | 模型、推理力度 | 引擎配置 | `--model`、`--effort` |
-| Codex 沙箱与网络 | `read-only`，网络关闭 | `--sandbox`、`--network` |
+| 沙箱与网络 | `workspace-write`；网络在 `workspace-write` 下默认开启，其他沙箱默认关闭 | `--sandbox`、`--network`、`--no-network` |
 | 运行、排队期限 | 均为 0（不限） | `start --timeout`、`--queue-timeout` |
 | 空闲、单轮、审批期限 | 30m、6h、2m | `--idle-exit`、`--turn-timeout`、`--approval-timeout` |
 | stall、活动命令静默窗口、命令作业输出静默窗口 | 10m、30m、15m | `--stall`、`--cmd-stall`、`--quiet-timeout` |
@@ -98,7 +98,7 @@ cxrun clean --job tools/review
 {"version":1,"kind":"reply","generation":3,"request_id":42,"result":{"decision":"acceptForSession"}}
 ```
 
-reply 必须携带收到请求时的代次和原始 JSON ID，并在 `result`、`error` 中选一项。服务端定义结果结构和所有决策选项。错误使用 JSON-RPC 的 code、message 和可选 data。runner 处理调用过程中仍可交付 reply。完成后先原子发布 `outbox/<op-id>.json`，再把信封从 pending 归档。回执含 `op_id`、`generation`、`status` 以及 `result` 或 `error`。状态为 completed、error 或 uncertain。后者表示请求可能已执行。消费方应按原 ID 读取回执并核查历史。CLI 等待回执超时后，执行端仍可能完成操作。
+reply 必须携带收到请求时的代次和原始 JSON ID，并在 `result`、`error` 中选一项。服务端定义结果结构和所有决策选项。错误使用 JSON-RPC 的 code、message 和可选 data。runner 处理调用过程中仍可交付 reply。完成后在状态日志追加 `receipt`，随后按信封序号追加 `inbox_ack`。回执含 `op_id`、`generation`、`status` 以及 `result` 或 `error`。状态为 completed、error 或 uncertain。后者表示请求可能已执行。消费方应按原 ID 读取回执并核查历史。CLI 等待回执超时后，执行端仍可能完成操作。
 
 ### 提问、审批和输入
 
@@ -126,7 +126,7 @@ cxrun say --job JOB --image "$IMAGE" "请检查这张图"
 | `rpc METHOD --job JOB --params @json` | 发送原始方法与 JSON 参数，包括实验方法。 |
 | `fork SOURCE --job NEW --through TURN` | 从源作业读取线程，前台运行新作业，使用 thread/fork 的 lastTurnId（含该轮）。省略 through 即从当前历史分叉。新作业的 initial-fork 回执用于断线恢复。 |
 | `review --job JOB --target @target.json --delivery inline\|detached` | target 为 ReviewTarget 对象。默认 inline。0.171 仅支持 inline 线协议，detached 通过一条 cxrun/reviewDetached 信封创建独立线程并在其上启动 review。状态保留 review_thread_id 和 review_turn_id，可用 history 查询。 |
-| `undo --job JOB --before TURN` | thread/revert 的 beforeTurnId，随后从 thread/turns/list 同步最近轮次和 last.md。 |
+| `undo --job JOB --before TURN` | thread/revert 的 beforeTurnId，随后从 thread/turns/list 同步最近轮次及对应的报告引用。 |
 | `compact --job JOB` | thread/compact/start 回执表示受理。compact_op 和 compact_after_seq 标记最近一次受理及发送前事件位置。compact_event_seq 大于该位置表示之后观察到本线程的压缩完成通知；上游通知只标识线程和轮次。 |
 | `settings --job JOB --scope turn\|thread --model M --effort E` | 发送 turn/settings/update 或 thread/settings/update。model、effort 可只给其中一项。启动配置提供初值，后续轮次沿用服务端设置。 |
 | `mcp list\|reload\|login\|resource\|call --job JOB --params @json` | 依次对应 mcpServerStatus/list、config/mcpServer/reload、mcpServer/oauth/login、mcpServer/resource/read、mcpServer/tool/call。 |
@@ -153,16 +153,16 @@ cxrun close --job tools/unit
 需要管道、重定向等 shell 语法时，显式使用 `--cmd-shell -- '一段脚本'`，仅传一个脚本参数。Unix 使用 `/bin/sh -c`，Windows 使用 `cmd.exe /d /s /c`。直接执行模式不做字符串拼接。
 
 - 提交成功返回登记状态。命令 runner 独立运行，Unix 使用新会话、忽略 SIGHUP，并将标准流与提交端分离；Windows 从登录会话的 psmux 启动 cxrun，子进程留在该控制台。命令另有自己的进程组。用 `close` 取消已排队或运行中的命令。
-- 命令默认槽位类别为 `test`，Codex 默认为 `codex`。两种引擎共用主机配置、负载检查、project、session、去重和 clean。
+- 命令默认槽位类别为 `test`，代理默认为 `agent`。所有引擎共用主机配置、负载检查、project、session、去重和 clean。
 - `--quiet-timeout` 从进程启动或最近一次输出计算，默认 15m，0 关闭。运行中命中期限或收到 close 时，close 按下文的进程回收规则处理；超时只停止前台负载。清理时间可能延后终态发布。
-- `status.json` 的 `engine` 为 `cmd`，运行时有 `command_pid`，进程退出后有 `exit_code`。Windows 以无符号 32 位值记录；Unix 因信号退出时记为 -1。尚未启动的作业没有进程退出码。`progress.log` 记录生命周期；`output.log` 按原始字节合并 stdout/stderr。`tail` 跟随输出，`log OFFSET` 从字节偏移读取，包括没有换行的末尾，终态读尽返回 10。`last.md` 保存最后 64 KiB，较短输出完整保留。
+- 状态的 `engine` 为 `cmd`，运行时有 `command_pid`，进程退出后有 `exit_code`。Windows 以无符号 32 位值记录；Unix 因信号退出时记为 -1。尚未启动的作业没有进程退出码。`progress.log` 记录生命周期；`output.log` 按原始字节合并 stdout/stderr。`tail` 跟随输出，`log OFFSET` 从字节偏移读取，包括没有换行的末尾，终态读尽返回 10。轮次报告保存最后 64 KiB，较短输出完整保留。
 - `wait` 成功返回 0；命令失败或取消返回 1，已取得的退出码以 `exit_code=N` 打印。无输出超时返回 3，输出含 `status=stalled`。总时长超时返回 4，输出含 `status=timeout`；仅本次观察超时返回 124，输出含 `wait_timeout=true`。命令为一次性执行，重跑请使用新 JOB。
 
 ### 查看和回收后台进程
 
 `cxrun ps --project tools --job review` 输出一个 JSON 对象。`processes` 中每项含 `pid`、`ppid`、`start_time`、`command_line`、`run_marked` 和 `in_runner_tree`。后两项分别表示是否读到本次 run 标记，以及能否沿父链追溯到持有该作业的 runner。启动时间保留内核精度，Linux 使用自开机以来的时钟滴答，macOS 使用 Unix 纳秒，Windows 使用 FILETIME。读取受限时，查看 `unreadable` 计数、单项的 `metadata_unreadable` 和顶层 `warning`。
 
-登记时生成随机 `config.json.run_id`，恢复和 stall 重启沿用该值。两种引擎都向负载注入 `CXRUN_RUN` 和 `CXRUN_JOB=<project>/<job>`，旧扁平命名空间使用 `/job`。Unix 合并进程树和完整环境项匹配，因此 `setsid`、`nohup` 和 shell 的 `&` 不会清除标记。Linux 读取 procfs；macOS 使用 sysctl，受限时尝试枚举当前 UID。macOS 会隐藏部分系统程序的环境。进程在首次观察前已脱离父链且标记不可读或已清除时，Unix 扫描无法归属它。Windows 在放行子进程之前加入命名 Job Object，按该对象的成员枚举。
+登记时生成配置记录中的随机 `run_id`，恢复和 stall 重启沿用该值。两种引擎都向负载注入 `CXRUN_RUN` 和 `CXRUN_JOB=<project>/<job>`，旧扁平命名空间使用 `/job`。Unix 合并进程树和完整环境项匹配，因此 `setsid`、`nohup` 和 shell 的 `&` 不会清除标记。Linux 读取 procfs；macOS 使用 sysctl，受限时尝试枚举当前 UID。macOS 会隐藏部分系统程序的环境。进程在首次观察前已脱离父链且标记不可读或已清除时，Unix 扫描无法归属它。Windows 在放行子进程之前加入命名 Job Object，`ps` 同时识别对象成员和带标记的进程。最后一个 Job Object 句柄关闭后，存活的后台进程仍可通过 `CXRUN_RUN` 标记保留缓存。
 
 自然结束或重启后，后台进程可继续运行。用 `ps` 检查，再用 `close` 回收；`clean` 在删除终态作业目录之前也执行回收。Unix 先向仍带本作业 `CXRUN_RUN` 的 PID 发 SIGTERM，Windows 向匹配成员的顶层窗口请求关闭。10 秒后对仍存活的匹配进程强杀，每次发送前核对启动时间。Linux 支持时用 pidfd，Windows 使用进程句柄。progress.log 记录回收 PID、阶段和系统调用结果。旧作业恢复时补建标记；旧负载缺少标记时不参与回收。
 
@@ -178,7 +178,9 @@ go build -trimpath -o cx .
 ./cx close "$project/review"
 ```
 
-节点和控制端的单作业 `wait` 在轮次结束或 runner 结束时返回。调用时若有进行中或排队的轮次，或者 `say` 已投递但新轮尚未开始，等待该轮或之后的轮次完成。调用时若作业已经空闲，立即返回最近一次完成。轮次失败时 `wait` 和 `wait --any` 均返回 1，中断、runner 失败和观察超时也返回非零退出码。app-server 的不可重试错误或失败轮次在 `last_completed_status` 和 `turn_status` 中均记为 `failed`。可重试的尝试错误仍可由该轮后续成功完成。模型正常提交 `STATUS: BLOCKED` 也属于已完成的协议轮次。自动化应再读取 `last.md` 首行判断任务交付结果。
+节点和控制端的单作业 `wait` 在轮次结束或 runner 结束时返回。调用时若有进行中或排队的轮次，或者 `say` 已投递但新轮尚未开始，等待该轮或之后的轮次完成。调用时若作业已经空闲，立即返回最近一次完成。轮次失败时 `wait` 和 `wait --any` 均返回 1，中断、runner 失败和观察超时也返回非零退出码。app-server 的不可重试错误或失败轮次在 `last_completed_status` 和 `turn_status` 中均记为 `failed`。可重试的尝试错误仍可由该轮后续成功完成。模型正常提交 `STATUS: BLOCKED` 也属于已完成的协议轮次。自动化应再通过 `cx result` 读取报告首行判断任务交付结果。
+
+`wait JOB`、`wait --any` 和 `agent` 观察到准入阻塞时退出 13，stdout 输出含 `status: "queued"` 和 `queue_reason` 的 JSON 对象。低于磁盘水位、无法探测磁盘空间或负载检查未通过时，节点即时发布原因。相同 FIFO 或名额等待持续两秒才发布原因。每次出现新原因、或原因解除后再次出现，均可通知一次。单作业等待和 `agent` 共享认领，带游标的 `wait --any` 按游标单独去重。作业继续排队，后续等待继续观察。
 
 `interrupt` 中断当前轮，runner 继续接收消息。`close` 优先于尚未发送的普通消息；它中断活动轮，等待结束通知，然后关闭 stdio 并回收子进程。需要让当前轮自然结束时，先 `wait` 再 `close`。空闲退出由 `--idle-exit` 控制，默认 30 分钟。`--turn-timeout` 默认 6 小时。每个连接由单一写协程按队列发送，写入超过 10 秒即废弃连接并按预算恢复。迟到的已超时请求应答记入 progress.log。单次 RPC 等待 60 秒，存在待审批请求时最多额外等待一个审批期限。
 
@@ -191,7 +193,7 @@ cxrun start --job JOB --dir DIR --model M --effort E --sandbox workspace-write -
 cxrun resume --job JOB --state STATE
 ```
 
-运行器先发布完整的任务目录，再持有操作系统文件锁。崩溃会释放锁。重复 `resume` 只允许一个写入者。`status.json` 是最后一次持久化的快照，status、wait 和 list 会在登记锁内检查 owner.lock，若锁空闲且快照非终态，则记录 orphaned 并持久化。命令 worker 在取锁前崩溃也适用。恢复时，`thread/resume` 用原线程 ID 读取 Codex 历史，重建最后一轮状态。若旧轮被中断，Claude 用 `say` 明确交代接下来要做的事；历史上下文仍属于原线程。
+登记方先持有 `owner.lock`，再在新段发布配置和初始状态。崩溃会释放锁，重复 `resume` 只允许一个写入者。status、wait 和 list 在登记锁内检查 owner.lock。若锁空闲且没有 final，则新开段追加并刷盘 orphaned 终态。命令 worker 在取锁前崩溃也适用。恢复时，`thread/resume` 用原线程 ID 读取 Codex 历史，重建最后一轮状态。若旧轮被中断，Claude 用 `say` 明确交代接下来要做的事；历史上下文仍属于原线程。
 
 ## 文件契约
 
@@ -199,23 +201,27 @@ cxrun resume --job JOB --state STATE
 
 | 作业目录下的路径 | 含义 |
 | --- | --- |
-| `config.json`、`owner.lock` | 启动参数、首轮提示词和自定义提醒文案快照，以及进程持有的独占锁。保留锁文件即可自动复用。 |
-| `events.jsonl` | 每行一个 JSON 对象，附加数值 seq，保留未知协议字段、delta 与原始请求 ID。非沙箱作业的事件带有顶层 `"privileged": true`。 |
-| `progress.log` | 以制表符分隔 seq、UTC 时间、类型、单行摘要。每个日志独立编号，seq 为该行起始字节位置加一，跨 resume 严格递增，可有间隔。含计划、命令与退出码、文件变更状态、diff 统计、投递、审批和终态。 |
-| `status.json` | 原子更新的快照。含 queued、running、waiting_approval、waiting_input、waiting 和 states 表列出的终态、线程与轮次 ID、轮次结果、完成计数、最近事件时间、最新 token 用量、批量观察字段。限流字段 `rate_limited`、`reset_at`、`primary`、`secondary`、`limit_id` 在顶层。非沙箱作业带有顶层 `"privileged": true`。 |
-| `last.md` | 保存最后一条完整代理消息。协议轮次失败时以 `STATUS: FAILED` 开头，接着保留服务端提供的原始消息、重试标志和错误码，再附上该轮最后一条代理消息（如有）。 |
-| `server.stderr.log` | app-server 自身诊断，独立于 JSON-RPC。 |
-| `inbox/*.msg` | UTF-8 文本，按文件名字典顺序读取。生产者先写同目录临时文件，再原子改名发布。 |
-| `inbox/pending/`、`inbox/done/` | 已取走待确认、已处理。消息名和内容应保持不可变。 |
-| `inbox/uncertain/` | 恢复时无法从历史确认是否已接收的消息。核对历史和已产生的副作用后，确需重发时使用新消息名。 |
-| `inbox/interrupt`、`inbox/close` | 控制标记，消费后归档。 |
-| `inbox/approve`、`inbox/deny` | 对当前审批的回复，消费后归档。 |
+| `state/*.jsonl`、`owner.lock` | 持锁方追加配置和完整状态快照，终态记录带 `final:true`。状态包括轮次、请求、用量、限流、完成计数及批量观察字段。 |
+| `events.jsonl` | 每行一个 JSON 对象，保留未知协议字段、delta 与原始请求 ID。 |
+| `progress.log` | 按制表符分隔 seq、UTC 时间、类型与摘要。seq 为该行起始字节位置加一，跨 resume 递增。 |
+| `turns/*.md` | 报告发布后内容固定。协议失败时报告以 `STATUS: FAILED` 开头。结果包提供 `last.md`。 |
+| `inbox/*.jsonl` | 依序追加消息、控制标记与 RPC，状态日志记录消费意图、结果和回执。 |
+| `outbox/*.jsonl` | 代理向外发送消息和问答。以消息序号为游标。 |
+| `server.stderr.log`、`output.log` | 引擎诊断及命令输出。 |
 
-interrupt、close、approve、deny 的文件内容为 JSON，必含字符串 cmd_id 和 turn_id。活动轮使用该轮 ID，空闲、初始排队和命令作业使用空串。CLI 支持 --cmd-id / --turn-id 或 CXRUN_CMD_ID / CXRUN_TURN_ID。首次调用省略时自动生成命令 ID 并读取目标轮。重复命令按归档回执去重，过期目标和无效文件记入 progress.log。
+mailbox 的锁在作业目录同级的 `.mail-locks/`。终态与仍未处理的操作结果在同一段发布。读者成功同步链接所在目录后才确认终态。关闭和回收按 run、目录身份和终态游标确认。已认领但进程回收失败的 close 记为 `uncertain`。清理失败时，使用相同作业 ID 重试，可继续删除已移到 `.trash/` 的目录。
+
+MCP 的 `send` 和 `ask` 支持可选的 `operation_id`。在同一个 run 内重连重试时，使用相同 ID 和参数。阻塞问答沿用初次发布的请求号和期限。
+
+整批切换时保留旧状态根用于退役，使用新状态根重新提交，并清除旧控制端的 wait 和 follow 游标。
+
+用 `cx doctor HOST --json` 检查 `state_local`。Windows 节点会给本地作业根设置禁止内容索引属性，并报告 `state_not_content_indexed`。受控 checkout 在自己的状态日志记录准备数据的 blob 引用。
+
+`interrupt`、`close`、`approve` 和 `deny` 按消息 ID 去重。指定 `--cmd-id` / `--turn-id` 或 `CXRUN_CMD_ID` / `CXRUN_TURN_ID` 时，重试沿用原值。活动轮用轮次 ID，空闲、初始排队和命令作业用空串。恢复后若 ack 为 `uncertain`，先核对历史和副作用，再判断是否用新 ID 重发。
 
 `account/rateLimits/updated` 更新账户额度窗口，`thread/tokenUsage/updated` 更新轮次 token 用量。额度耗尽的窗口、协议报告的额度拦截和轮次限流错误均可标记 `rate_limited`，该字段反映最近观测。存在耗尽窗口时，`reset_at` 取可确定的最晚重置时刻，其余情况显示已知窗口的最近重置时刻。限流错误在 `error` 通知或 `turn/completed` 的错误字段出现时，以 `turn/rate_limited` 写入原始事件和进度日志，记录轮次、来源及是否重试。槽位和并发控制继续沿用原规则。
 
-默认始终请求 `approvalPolicy=never`。实际收到命令、文件、权限或旧版审批时，状态切换为 `waiting_approval` 并显示请求列表。决策文件应在请求出现后写入，在 request_id 字段使用列表中 `id` 的 JSON 表示（数值保持数值，字符串保留双引号）。只有一个待处理请求时可省略 request_id。并发请求需指定 ID。默认 2 分钟后拒绝并继续，可用 `--approval-timeout` 调整。批准权限请求只返回本次请求的权限，作用域为当前轮。
+默认始终请求 `approvalPolicy=never`。实际收到命令、文件、权限或旧版审批时，状态切换为 `waiting_approval` 并显示请求列表。请求出现后再提交决策，使用列表中 `id` 的 JSON 表示（数值保持数值，字符串保留双引号）。只有一个待处理请求时可省略 request_id。并发请求需指定 ID。默认 2 分钟后拒绝并继续，可用 `--approval-timeout` 调整。批准权限请求只返回本次请求的权限，作用域为当前轮。
 
 ```bash
 # TURN 和 CMD_ID 由调用方固定，同一次投递重试沿用
@@ -252,19 +258,19 @@ tool_timeout_sec = 150
 - `ask(question, options?, blocking=false, timeout?)` 默认发给 parent 并立即返回投递记录。blocking 模式的 timeout 单位为秒，默认 120 秒。客户端的 tool_timeout_sec 应大于期望等待时间。挂起时状态为 `waiting_input`、`input_kind=agent_ask`，wait 返回 6。问题文本也进入 progress.log。管理端用 `cxrun say --state S --project P --job J --request ask-3 "答复内容"` 答复，工具结果的 JSON 中含 answer。超时返回工具错误，runner 清除本次等待。
 - `send(to, text)` 记录目的地（parent、project/job 或 #channel）和正文。控制端负责转发至目标作业的 say 或频道日志。
 - `inbox()` 返回本作业收到的消息，键为投递文件名，值为原始正文。它也包含已交给轮次的历史消息，重复读取可按键去重。
-- `cxrun outbox --state S --project P --job J --since 2` 输出 seq 大于 2 的记录，每行一个 JSON。序号从 1 开始，在本作业内递增。`outbox/messages/` 存放原子发布的记录，字段含 seq、type、time（UTC）、to，send 带 text，ask 带 question、request_id。管理端在处理成功后保存游标。`wait --any --since-file FILE` 在 runner 观察到新消息时也会唤醒，输出 outbox_seq。一次唤醒可以覆盖多条消息。
+- `cxrun outbox --state S --project P --job J --since 2` 输出 seq 大于 2 的记录，每行一个 JSON。序号从 1 开始，在本作业内递增。`outbox/*.jsonl` 存放追加发布的记录，字段含 seq、type、time（UTC）、to，send 带 text，ask 带 question、request_id。管理端在处理成功后保存游标。`wait --any --since-file FILE` 在 runner 观察到新消息时也会唤醒，输出 outbox_seq。一次唤醒可以覆盖多条消息。
 
 ### 主机信息与笔记指纹
 
-`cxrun facts --state S` 只读探测执行端并输出一个 JSON 对象。容量字段以字节计，load1 为一分钟平均负载，Windows 对应 cpu_usage_percent。macOS 通过空闲与 inactive 页数估计可用内存。version_managers 记录工具目录是否存在，rustup 对应 Cargo 的 bin 目录。codex_login_status 为 logged_in、logged_out 或 null。探测失败或平台缺少相应指标时字段为 null。
+`cxrun facts --state S` 只读探测执行端并输出一个 JSON 对象。容量字段以字节计，load1 为一分钟平均负载，Windows 对应 cpu_usage_percent。macOS 通过空闲与 inactive 页数估计可用内存。version_managers 记录工具目录是否存在，rustup 对应 Cargo 的 bin 目录。engines 按引擎名给出 path、version 和 login_status（logged_in、logged_out 或 null）。探测失败或平台缺少相应指标时字段为 null。
 
 `cxrun notes fingerprint --dir D` 输出含 fingerprint 的 JSON 对象。SHA-256 输入包括目录顶层的版本声明文件、package.json 中的 engines、PATH 中相关可执行文件的路径及 mtime，以及 OS 和 Codex 版本。仅对输入计算指纹，版本选择、安装和笔记更新由代理处理。
 
 ### 执行驱动
 
-`start --engine codex|claude` 选择代理，省略时使用 Codex。`--cmd` 选择命令驱动。旧作业根据已有 argv 和默认引擎读取原配置。准入、收件箱和逐轮结果沿用原文件契约。
+`start --engine NAME` 选择代理引擎，省略时使用注册表的默认引擎（codex）；登记时总是把解析后的引擎名写入 config 和 status，未写引擎名的作业不能运行。`--cmd` 选择命令驱动。引擎不支持的选项（如 Claude 的 `--approval-timeout`、fork、`workspace-write` 下的 `--no-network`）在登记前报 `... not supported by engine NAME`。准入、收件箱和逐轮结果沿用原文件契约。
 
-Claude Code 需要支持 `--restricted` 的 CLI。只读作业提供 Read、Glob、Grep，工作区写作业额外提供当前目录内的 Edit、Write。全权限作业使用 bypassPermissions。`--web-search` 启用 WebSearch、WebFetch；Codex 将 thread 配置的 web_search 设为 live。Claude 每轮使用 stream-json，后续轮以保存的 session ID 续接，因此执行账户必须可持久化 Claude 会话。插话顺延到下一轮。Claude 不支持 Codex app-server 的 fork、审批和 RPC。
+Claude Code 需要支持 `--restricted` 的 CLI。只读作业提供 Read、Glob、Grep；工作区写作业额外提供当前目录与 `--writable-root`（`--add-dir`）内的 Edit、Write 以及 Bash；网络开启时提供 WebFetch，`--web-search` 再加 WebSearch；`--effort` 透传为 `--effort`；作业工具通过 `--mcp-config` 注入并允许 `mcp__cxrun`。全权限作业使用 bypassPermissions。Codex 将 thread 配置的 web_search 设为 live。图片输入两种引擎共用同一输入模型（`localImage` 路径或 `image` URL 部分，`--image` 可重复）：Claude 把它们转为 stream-json 的 image 块（按内容识别 png/jpeg/gif/webp 并 base64 编码；`https` URL 直接引用），超出 Claude API 限制（单张 5 MB、单边 8000 像素、每条消息 100 张）时报错，不做压缩。Claude 的用量（`usage.total/last`）与限速（result 的 429/限额文案、rate_limit_event）记入同一组状态字段。Claude 每轮使用 stream-json，后续轮以保存的 session ID 续接，因此执行账户必须可持久化 Claude 会话。插话顺延到下一轮。Claude 不支持 fork、审批、插话和引擎 RPC，相应命令按能力拒绝。
 
 ## 单一二进制 cx（B1）
 
@@ -302,7 +308,7 @@ func Collect(ctx context.Context, job string) (SnapshotResult, error)
 
 B3 已接入节点分派。`nodeCLI` 的 `snap-receive` 参数交给 `ReceiveSnapshot(ctx, args[1:])`，`endpoint.command` 将它列为流式命令（含 forward-stream 中转）。正常发布在同一条连接上读取已收偏移、发送剩余归档、等待导入回执。
 
-冻结和发布都沿用 v1 清单、`repos/<store_id>.git` 和 `refs/snapshots/<oid>`。读取原有对象库时可把 `CX_SNAPSHOT_STORE` 指向其根目录。控制端解析 Go 模块或工作区时调用本机 `go mod edit`、`go work edit`。上下文目录的所有普通文件会随任务包发送。显式请求 Git 历史时，可达历史对象也会发送。敏感名单内嵌进二进制，修改策略后由差分测试核对 `snapshot/denylist`。
+冻结和发布都沿用 v1 清单、`repos/<store_id>.git` 和 `refs/snapshots/<oid>`。读取原有对象库时可把 `CX_SNAPSHOT_STORE` 指向其根目录。导入先刷盘 Git 对象、引用和目录，再发布清单。已发布的快照复用前校验 Git 引用及可达对象，缺失时重新导入。控制端解析 Go 模块或工作区时调用本机 `go mod edit`、`go work edit`。上下文目录的所有普通文件会随任务包发送。显式请求 Git 历史时，可达历史对象也会发送。测试逐项对照二进制内嵌的敏感名单与 `snapshot/denylist`。
 
 发布归档留在控制端直到收到导入成功回执；节点按归档 SHA-256 保留已收前缀，按清单 SHA-256 发布。检出使用私有 bare 的 detached worktree。收集补丁使用临时索引和临时对象目录，主工作目录的 `artifacts/` 单独回收。原 Python 路径仍可读写现有清单，保留作迁移回退。
 

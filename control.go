@@ -13,53 +13,207 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 )
 
-// pendingInput reports input that will start a new turn: any undelivered inbox message, or a message taken
-// for delivery after the last recorded event (a steer delivered during an earlier turn can linger in
-// pending/ and must not make an idle job look busy).
-func pendingInput(dir string, since time.Time) (bool, error) {
-	for _, sub := range []string{"inbox", "inbox/pending"} {
-		entries, err := os.ReadDir(filepath.Join(dir, sub))
-		if err != nil {
-			return false, err
+func loadJobStatus(dir string) (s status, cursor stateCursor, err error) {
+	record, cursor, err := jobStatusRecord(dir)
+	if err == nil {
+		err = decodeJobStatus(record, &s)
+	}
+	return s, cursor, err
+}
+
+func loadJobStatusInto(dir string, dst *status) error {
+	_, err := readJobStatus(dir, dst)
+	return err
+}
+
+func readSharedFile(path string) ([]byte, error) {
+	f, err := openJobFile(path, jobFileRead)
+	if err != nil {
+		return nil, err
+	}
+	defer closeBestEffort(f)
+	return io.ReadAll(f)
+}
+
+type jobStateObserver struct {
+	dir                  string
+	s                    status
+	cursor               stateCursor
+	tail                 *stateTail
+	pending              map[uint64]string
+	identity             jobIdentity
+	floor                *status
+	selected             *turnCompletion
+	withdrawn            bool
+	watchWithdrawals     bool
+	deliveredWithdrawals []uint64
+	withdrawal           *inboxAck
+}
+
+func (o *jobStateObserver) Close() error { return o.tail.Close() }
+
+// Seed the view once. A reconnect can still consume the tail from its saved
+// position. The seed prevents intermediate records from regressing the view.
+func openJobObservation(dir string, from stateCursor, runID string) (*jobStateObserver, error) {
+	identity, s, cur, err := captureJobIdentity(dir)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	if from == (stateCursor{}) || runID != "" && runID != s.RunID || runID == "" && from.Seg > cur.Seg {
+		from = cur
+	}
+	tail, err := openStateTail(dir, from)
+	if err != nil {
+		return nil, err
+	}
+	return &jobStateObserver{dir: dir, s: s, cursor: cur, tail: tail, identity: identity}, nil
+}
+
+func (o *jobStateObserver) read() error {
+	identity := o.identity
+	if identity.key == "" {
+		key, err := jobDirectoryKey(o.dir)
+		if os.IsNotExist(err) {
+			return nil
 		}
-		for _, e := range entries {
-			if !e.Type().IsRegular() || !strings.HasSuffix(e.Name(), ".msg") {
-				continue
+		if err != nil {
+			return err
+		}
+		identity.key = key
+	} else if err := identity.checkDir(o.dir); err != nil {
+		return err
+	}
+	records, err := o.tail.Next()
+	if err != nil {
+		return err
+	}
+	if err := identity.checkDir(o.dir); err != nil {
+		return err
+	}
+	for _, record := range records {
+		if record.Kind != "inbox_ack" || len(o.pending) == 0 && !o.watchWithdrawals {
+			continue
+		}
+		var ack inboxAck
+		if err := json.Unmarshal(record.Value, &ack); err != nil {
+			return err
+		}
+		if id := o.pending[ack.Seq]; id != "" && id == ack.ID {
+			if ack.Result != "withdrawn" {
+				o.pending = nil
+			} else {
+				delete(o.pending, ack.Seq)
+				o.withdrawn = len(o.pending) == 0
+				if o.withdrawn && !o.watchWithdrawals {
+					o.withdrawal = &ack
+				}
 			}
-			if sub == "inbox" {
-				return true, nil
+		}
+		if o.watchWithdrawals && ack.Result == "withdrawn" && !slices.Contains(o.deliveredWithdrawals, ack.Seq) &&
+			(o.withdrawal == nil || ack.Seq < o.withdrawal.Seq) {
+			inbox := filepath.Join(o.dir, "inbox")
+			message, err := findMailboxID(inbox, filepath.Join(inbox, ".ids", snapSum([]byte(ack.ID))), ack.ID)
+			if err != nil {
+				return err
 			}
-			if info, err := e.Info(); err == nil && info.ModTime().After(since) {
-				return true, nil
+			if message.Kind == "msg" && message.Seq == ack.Seq {
+				o.withdrawal = &ack
 			}
 		}
 	}
-	return false, nil
+	cur := o.tail.Cursor()
+	if cur.Seq < o.cursor.Seq {
+		// Latest can seed a verified status past damage in a saved segment.
+		// Resume at that anchor when the tail could not reach it.
+		tail, err := openStateTail(o.dir, o.cursor)
+		if err != nil {
+			return err
+		}
+		closeBestEffort(o.tail)
+		o.tail = tail
+		return nil
+	}
+	for _, record := range records {
+		var completion turnCompletion
+		switch record.Kind {
+		case "status":
+			var s status
+			if err := decodeJobStatus(record, &s); err != nil {
+				return err
+			}
+			if record.Seq > o.cursor.Seq {
+				if o.identity.key != "" && o.identity.run != s.RunID {
+					return errJobReplaced
+				}
+				identity.run = s.RunID
+				o.s, o.identity = s, identity
+			}
+			completion = completedTurn(s)
+		case "turn_completion":
+			if err := json.Unmarshal(record.Value, &completion); err != nil {
+				return err
+			}
+		default:
+			continue
+		}
+		if o.floor != nil && completion.RunID == o.floor.RunID && completion.Number > o.floor.Finished &&
+			completion.TurnID != "" && (o.selected == nil || completion.Number < o.selected.Number ||
+			completion.Number == o.selected.Number && completion.TurnID == o.selected.TurnID) {
+			copy := completion
+			o.selected = &copy
+		}
+	}
+	o.cursor = cur
+	return nil
+}
+
+func (o *jobStateObserver) poll(ctx context.Context) error {
+	if err := o.read(); err != nil {
+		return err
+	}
+	return o.project(ctx)
+}
+
+func (o *jobStateObserver) project(ctx context.Context) error {
+	refreshed, err := projectJobStatus(ctx, o.dir, &o.s, o.identity)
+	if err != nil || !refreshed {
+		return err
+	}
+	return o.read()
 }
 
 // waitStart observes a job once to select the floor for this invocation.
-func waitStart(dir string, s status) (status, bool, error) {
+func waitStart(observer *jobStateObserver) (bool, error) {
+	s := observer.s
 	if s.Engine == "cmd" || isTerminal(s.State) {
-		return s, false, nil
+		return false, nil
 	}
-	if s.TurnStatus == "inProgress" || s.State == "queued" {
-		return s, true, nil
+	if s.TurnStatus == "inProgress" || s.State == "queued" && s.Finished == 0 {
+		return true, nil
 	}
-	pending, err := pendingInput(dir, s.LastEvent)
-	if pending || err != nil {
-		return s, pending, err
+	pending, err := pendingInboxMessages(observer.dir)
+	if err != nil {
+		return false, err
+	}
+	if len(pending) != 0 {
+		observer.pending = make(map[uint64]string, len(pending))
+		for _, message := range pending {
+			observer.pending[message.Seq] = message.ID
+		}
+		return true, nil
 	}
 	// The inbox can be drained between the status read and the scan.
-	// Delivery publishes the new turn (or its completion) before archiving.
-	var now status
-	err = readJSON(filepath.Join(dir, "status.json"), &now)
+	// Delivery publishes the new turn (or its completion) before acknowledging.
+	err = observer.read()
+	now := observer.s
 	busy := !isTerminal(now.State) && (now.TurnStatus == "inProgress" || now.State == "queued")
-	return now, busy, err
+	return busy, err
 }
 
 func pause(ctx context.Context, d time.Duration) error {
@@ -73,170 +227,204 @@ func pause(ctx context.Context, d time.Duration) error {
 	}
 }
 
-// A single 30-second observation interval can contain multiple complete turns.
-// finish writes this same completion record for live events and restored history.
-func waitOutcome(dir string, before, now status) (id, outcome string, err error) {
-	if now.Finished <= before.Finished+1 {
-		return now.LastCompleted, now.CompletedStatus, nil
+func progressRecord(line string) (kind, detail string) {
+	fields := strings.SplitN(line, "\t", 4)
+	if len(fields) != 4 {
+		return "", ""
 	}
-	f, err := openShared(filepath.Join(dir, "progress.log"))
-	if err != nil {
-		return "", "", err
+	if _, err := strconv.ParseUint(fields[0], 10, 64); err != nil {
+		return "", ""
 	}
-	defer closeBestEffort(f)
-	after := before.LastCompleted == ""
-	lines := bufio.NewScanner(f)
-	for lines.Scan() {
-		kind, detail := progressRecord(lines.Text())
-		if kind != "turn/completed" {
-			continue
-		}
-		turn := strings.Fields(detail)
-		if len(turn) < 2 {
-			continue
-		}
-		if turn[0] == before.LastCompleted {
-			after = true
-			continue
-		}
-		if after && (before.TurnStatus != "inProgress" || before.Turn == turn[0]) {
-			return turn[0], turn[1], nil
-		}
-	}
-	if err = lines.Err(); err != nil {
-		return "", "", err
-	}
-	if before.TurnStatus == "inProgress" {
-		// Recovery can replace the original turn without recording its completion.
-		return now.LastCompleted, now.CompletedStatus, nil
-	}
-	return "", "", errors.New("completion record missing for wait target")
+	return fields[2], strings.TrimRight(fields[3], "\r\n")
 }
 
-// progressRecord accepts both byte-sequenced records and the older format
-// with a timestamp in the first column.
-func progressRecord(line string) (kind, detail string) {
-	first, rest, ok := strings.Cut(line, "\t")
-	if !ok {
-		return "", ""
+func openObservedFile(dir, name string, identity *jobIdentity) (*os.File, error) {
+	f, err := openJobFile(filepath.Join(dir, name), jobFileRead)
+	if identity != nil {
+		if replacement := identity.checkDir(dir); replacement != nil {
+			if f != nil {
+				closeBestEffort(f)
+			}
+			return nil, replacement
+		}
 	}
-	if _, err := strconv.ParseUint(first, 10, 64); err == nil {
-		_, rest, _ = strings.Cut(rest, "\t")
-	}
-	kind, detail, ok = strings.Cut(rest, "\t")
-	if !ok {
-		return "", ""
-	}
-	return kind, strings.TrimRight(detail, "\r\n")
+	return f, err
 }
 
 func observe(ctx context.Context, op, dir string) error {
 	if op == "wait" {
-		_, err := waitJob(ctx, dir)
+		_, err := waitJob(ctx, dir, true)
 		return err
 	}
-	var s status
-	if err := readJSON(filepath.Join(dir, "status.json"), &s); err != nil {
+	observer, err := openJobObservation(dir, stateCursor{}, "")
+	if err != nil {
 		return err
 	}
-	log, err := openShared(filepath.Join(dir, s.logName()))
+	defer closeBestEffort(observer)
+	if err = observer.poll(ctx); err != nil {
+		return err
+	}
+	log, err := openObservedFile(dir, observer.s.logName(), &observer.identity)
 	if err != nil {
 		return err
 	}
 	defer closeBestEffort(log)
 	for {
-		if err = projected(ctx, dir, &s); err != nil {
-			return err
-		}
 		if _, err = io.Copy(os.Stdout, log); err != nil {
 			return err
 		}
-		if isTerminal(s.State) {
+		if observer.s.final {
 			return nil
 		}
 		if err = pause(ctx, 500*time.Millisecond); err != nil {
 			return err
 		}
+		if err = observer.poll(ctx); err != nil {
+			return err
+		}
 	}
 }
 
-func waitJob(ctx context.Context, dir string) (status, error) {
-	var s status
+type observedResult struct {
+	RunID  string `json:"run_id"`
+	Number int64  `json:"turn"`
+	TurnID string `json:"turn_id"`
+}
+
+// The status describes the job at the end of the observation. Result identifies
+// the selected completion, which can precede that status's latest completion.
+type waitObservation struct {
+	status
+	Result    *observedResult `json:"result,omitempty"`
+	EventID   string          `json:"event_id,omitempty"`
+	NoticeKey string          `json:"notice_key,omitempty"`
+}
+
+func waitJob(ctx context.Context, dir string, acknowledge bool) (waitObservation, error) {
+	observer, err := openJobObservation(dir, stateCursor{}, "")
+	if err != nil {
+		return waitObservation{}, err
+	}
+	defer closeBestEffort(observer)
 	for {
-		err := projected(ctx, dir, &s)
+		err = observer.poll(ctx)
 		if err == nil {
 			break
 		}
+		s := observer.s
 		if !errors.Is(err, os.ErrNotExist) {
 			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-				return s, waitTimeout(s, dir)
+				return waitObservation{}, waitTimeout(s, dir)
 			}
-			return s, err
+			return waitObservation{}, err
 		}
 		if err = pause(ctx, 200*time.Millisecond); err != nil {
 			if errors.Is(err, context.DeadlineExceeded) {
-				return s, waitTimeout(s, dir)
+				return waitObservation{}, waitTimeout(s, dir)
 			}
-			return s, err
+			return waitObservation{}, err
 		}
 	}
-	initial, busy, err := waitStart(dir, s)
+	busy, err := waitStart(observer)
+	s := observer.s
 	if err != nil {
-		return s, err
+		return waitObservation{}, err
 	}
-	s = initial
+	initial := s
+	observer.floor = &initial
 	for {
+		if replacedRun(initial.RunID, s.RunID) {
+			return waitObservation{}, errors.New("job generation changed during wait")
+		}
+		if observer.withdrawn {
+			fmt.Printf("job=%s status=%s outcome=interrupted\n", s.Job, s.State)
+			return waitObservation{status: s}, outcomeError(s.State, "interrupted")
+		}
 		advanced := s.Finished > initial.Finished
-		terminal := isTerminal(s.State)
-		question := s.State == "waiting_input"
-		if question && (!busy || advanced || s.InputKind != "next_turn") {
-			fresh, claimErr := claimQuestion(dir, s)
-			if claimErr != nil {
-				return s, claimErr
+		if !advanced && s.State == "queued" && s.QueueReason != "" {
+			observation := waitObservation{status: s, EventID: queueEventID(s)}
+			if !acknowledge {
+				observation.NoticeKey = observer.identity.key
+			}
+			fresh, err := deliverNotice(ctx, dir, observer.identity, observation.EventID, acknowledge, func() error {
+				return json.NewEncoder(os.Stdout).Encode(observation)
+			})
+			if err != nil {
+				return waitObservation{}, err
 			}
 			if fresh {
-				fmt.Printf("job=%s status=waiting_input input_kind=%s\n", s.Job, s.InputKind)
-				return s, errQuestion
+				return observation, ctlExit(exitQueued)
 			}
 		}
-		if terminal || advanced || (!question && !busy && (s.State == "waiting" || s.Finished > 0)) {
-			if busy && terminal && !advanced {
-				s.LastCompleted = ""
-				if s.CompletedStatus == initial.CompletedStatus {
-					s.CompletedStatus = ""
-				}
+		terminal := s.final
+		question := s.State == "waiting_input"
+		if question && (!busy || advanced || s.InputKind != "next_turn") {
+			observation := waitObservation{status: s, EventID: questionKey(s)}
+			if !acknowledge {
+				observation.NoticeKey = observer.identity.key
 			}
+			fresh, claimErr := deliverNotice(ctx, dir, observer.identity, observation.EventID, acknowledge, func() error {
+				if !acknowledge {
+					return json.NewEncoder(os.Stdout).Encode(observation)
+				}
+				_, err := fmt.Printf("job=%s status=waiting_input input_kind=%s\n", s.Job, s.InputKind)
+				return err
+			})
+			if claimErr != nil {
+				return waitObservation{}, claimErr
+			}
+			if fresh {
+				return observation, errQuestion
+			}
+		}
+		if terminal || advanced || (!question && !busy && (s.State == "waiting" || s.State != "queued" && s.Finished > 0)) {
+			observation := waitResult(initial, s, busy, observer.selected)
+			s = observation.status
 			if s.Engine == "cmd" || terminalCodes[s.State] != 0 {
 				fmt.Printf("job=%s status=%s", s.Job, s.State)
 				if s.ExitCode != nil {
 					fmt.Printf(" exit_code=%d", *s.ExitCode)
 				}
 				fmt.Println()
-				return s, outcomeError(s.State, s.CompletedStatus)
-			}
-			if busy && advanced {
-				s.LastCompleted, s.CompletedStatus, err = waitOutcome(dir, initial, s)
-				if err != nil {
-					return s, err
-				}
+				return observation, outcomeError(s.State, s.CompletedStatus)
 			}
 			fmt.Printf("job=%s status=%s completed_turn=%s outcome=%s\n", s.Job, s.State, s.LastCompleted, s.CompletedStatus)
-			return s, outcomeError(s.State, s.CompletedStatus)
+			return observation, outcomeError(s.State, s.CompletedStatus)
 		}
 		if err = pause(ctx, 200*time.Millisecond); err == nil {
-			s = status{}
-			err = projected(ctx, dir, &s)
+			err = observer.poll(ctx)
+			s = observer.s
 		}
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			if s.Job == "" {
 				s = initial
 			}
-			return s, waitTimeout(s, dir)
+			return waitObservation{}, waitTimeout(s, dir)
 		}
 		if err != nil {
-			return s, err
+			return waitObservation{}, err
 		}
 	}
+}
+
+func waitResult(initial, s status, busy bool, selected *turnCompletion) waitObservation {
+	if busy && s.final && s.Finished <= initial.Finished {
+		s.LastCompleted = ""
+		if s.CompletedStatus == initial.CompletedStatus {
+			s.CompletedStatus = ""
+		}
+		return waitObservation{status: s}
+	}
+	result := observedResult{s.RunID, s.Finished, s.LastCompleted}
+	if busy && selected != nil {
+		result = selected.observedResult
+		s.LastCompleted, s.CompletedStatus = selected.TurnID, selected.Outcome
+	}
+	observation := waitObservation{status: s}
+	if result.RunID != "" && (result.TurnID != "" || result.Number == 0 && readyResult(s)) {
+		observation.Result = &result
+	}
+	return observation
 }
 
 func waitTimeout(s status, dir string) error {
@@ -270,19 +458,18 @@ func control(ctx context.Context, op, dir string, args []string) error {
 	switch op {
 	case "status":
 		var s status
-		if err := projected(ctx, dir, &s); err != nil {
-			var pathErr *os.PathError
-			if errors.Is(err, os.ErrNotExist) && errors.As(err, &pathErr) &&
-				pathErr.Path == filepath.Join(dir, "status.json") {
-				row := map[string]string{"job": filepath.Base(dir), "status": "not_registered"}
-				if encodeErr := json.NewEncoder(os.Stdout).Encode(row); encodeErr != nil {
-					return encodeErr
-				}
-				return errNotRegistered
+		err := projected(ctx, dir, &s)
+		if errors.Is(err, os.ErrNotExist) {
+			row := map[string]string{"job": filepath.Base(dir), "status": "not_registered"}
+			if encodeErr := json.NewEncoder(os.Stdout).Encode(row); encodeErr != nil {
+				return encodeErr
 			}
+			return errNotRegistered
+		}
+		if err != nil {
 			return err
 		}
-		return printStatus(dir)
+		return json.NewEncoder(os.Stdout).Encode(s)
 	case "wait", "tail":
 		waitCtx, cancel, err := monitorContext(ctx, 0)
 		if err != nil {
@@ -292,37 +479,11 @@ func control(ctx context.Context, op, dir string, args []string) error {
 		return observe(waitCtx, op, dir)
 	case "log":
 		return logFrom(dir, args)
-	case "close", "interrupt", "approve", "deny":
-		return publishMarker(dir, op, markerOptions{}, args)
 	case "say":
 	default:
 		return fmt.Errorf("unknown operation %q", op)
 	}
 
-	// A retried delivery (lost reply) names the message itself: an already known name is a success.
-	if v := os.Getenv("CXRUN_MSG_NAME"); v != "" {
-		if !msgName.MatchString(v) {
-			return errors.New("invalid CXRUN_MSG_NAME")
-		}
-		for _, sub := range []string{"", "pending", "done", "uncertain", "withdrawn"} {
-			if ok, err := fileExists(filepath.Join(dir, "inbox", sub, v)); err != nil {
-				return err
-			} else if ok {
-				fmt.Println(v)
-				return nil
-			}
-		}
-	}
-	var s status
-	if err := readJSON(filepath.Join(dir, "status.json"), &s); err != nil {
-		return err
-	}
-	if s.Engine == "cmd" {
-		return fmt.Errorf("%s is unsupported for command jobs", op)
-	}
-	if isTerminal(s.State) {
-		return fmt.Errorf("job is %s; resume it first", s.State)
-	}
 	var name string
 	var b []byte
 	if len(args) != 1 {
@@ -330,7 +491,7 @@ func control(ctx context.Context, op, dir string, args []string) error {
 	}
 	if strings.HasPrefix(args[0], "@") {
 		var err error
-		b, err = os.ReadFile(args[0][1:])
+		b, err = readSharedFile(args[0][1:])
 		if err != nil {
 			return err
 		}
@@ -346,9 +507,12 @@ func control(ctx context.Context, op, dir string, args []string) error {
 	}
 	name = fmt.Sprintf("%019d-%s.msg", time.Now().UnixNano(), hex.EncodeToString(nonce[:]))
 	if v := os.Getenv("CXRUN_MSG_NAME"); v != "" {
+		if !msgName.MatchString(v) {
+			return errors.New("invalid CXRUN_MSG_NAME")
+		}
 		name = v
 	}
-	if err := atomicWrite(filepath.Join(dir, "inbox", name), b); err != nil {
+	if err := publishMessage(ctx, dir, name, inboxMessage{Text: string(b)}); err != nil {
 		return err
 	}
 	fmt.Println(name)
@@ -377,10 +541,14 @@ func writeLogFrom(out io.Writer, dir string, args []string) error {
 		off = n
 	}
 	var s status
-	if err := readJSON(filepath.Join(dir, "status.json"), &s); err != nil {
+	if err := loadJobStatusInto(dir, &s); err != nil {
 		return err
 	}
-	f, err := openShared(filepath.Join(dir, s.logName()))
+	return writeJobLog(out, dir, off, s, nil)
+}
+
+func writeJobLog(out io.Writer, dir string, off int64, s status, identity *jobIdentity) error {
+	f, err := openObservedFile(dir, s.logName(), identity)
 	if err != nil {
 		return err
 	}
@@ -392,7 +560,7 @@ func writeLogFrom(out io.Writer, dir string, args []string) error {
 		if _, err = io.Copy(out, f); err != nil {
 			return err
 		}
-		if isTerminal(s.State) {
+		if s.final {
 			return errDrained
 		}
 		return nil
@@ -405,7 +573,7 @@ func writeLogFrom(out io.Writer, dir string, args []string) error {
 	if _, err = out.Write(b[:end]); err != nil {
 		return err
 	}
-	if isTerminal(s.State) && end == len(b) {
+	if s.final && end == len(b) {
 		return errDrained
 	}
 	return nil
@@ -425,10 +593,14 @@ func writeLogSince(out io.Writer, dir, raw string) error {
 		return err
 	}
 	var s status
-	if err = readJSON(filepath.Join(dir, "status.json"), &s); err != nil {
+	if err = loadJobStatusInto(dir, &s); err != nil {
 		return err
 	}
-	f, err := openShared(filepath.Join(dir, "progress.log"))
+	return writeJobProgress(out, dir, since, s, nil)
+}
+
+func writeJobProgress(out io.Writer, dir string, since uint64, s status, identity *jobIdentity) error {
+	f, err := openObservedFile(dir, "progress.log", identity)
 	if err != nil {
 		return err
 	}
@@ -460,7 +632,7 @@ func writeLogSince(out io.Writer, dir, raw string) error {
 	for {
 		line, e := r.ReadString('\n')
 		if e == io.EOF {
-			if len(line) == 0 && isTerminal(s.State) {
+			if len(line) == 0 && s.final {
 				return errDrained
 			}
 			return nil

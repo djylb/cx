@@ -17,14 +17,18 @@ import (
 // receivers only need to know that the process has been reaped.
 type processWait struct{ err error }
 
-func launchCommand(root, project, job string) (<-chan error, error) {
+var startDetachedWorker = func(cmd *exec.Cmd) error {
+	detachWorker(cmd)
+	return cmd.Start()
+}
+
+func launchCommand(root, project, job, runID, directory string) (<-chan error, error) {
 	exe, err := os.Executable()
 	if err != nil {
 		return nil, err
 	}
-	cmd := exec.Command(exe, "_command", "--state", root, "--project", project, "--job", job)
-	detachWorker(cmd)
-	if err = cmd.Start(); err != nil {
+	cmd := exec.Command(exe, "_command", "--state", root, "--project", project, "--job", job, "--expect-run", runID, "--expect-dir", directory)
+	if err = startDetachedWorker(cmd); err != nil {
 		return nil, err
 	}
 	done := make(chan error, 1)
@@ -34,7 +38,12 @@ func launchCommand(root, project, job string) (<-chan error, error) {
 
 const outputTailBytes = 64 * 1024
 
-func saveOutputTail(dir string, f *os.File) error {
+func (r *runner) publishOutputTail() error {
+	f, err := openJobFile(filepath.Join(r.dir, "output.log"), jobFileRead)
+	if err != nil {
+		return err
+	}
+	defer closeBestEffort(f)
 	fi, err := f.Stat()
 	if err != nil {
 		return err
@@ -47,7 +56,12 @@ func saveOutputTail(dir string, f *os.File) error {
 	if err != nil {
 		return err
 	}
-	return atomicWrite(filepath.Join(dir, "last.md"), b)
+	const turnID = "1"
+	if err := r.publishTurnReport(turnID, b); err != nil {
+		return err
+	}
+	r.s.Turn, r.s.LastCompleted = turnID, turnID
+	return nil
 }
 
 func (r *runner) serveCommand() (err error) {
@@ -76,17 +90,17 @@ func (r *runner) serveCommand() (err error) {
 			appendProgress(r.dir, "runner/error", r.c.secret.text(err.Error()))
 		}
 	}()
-	r.log, err = os.OpenFile(filepath.Join(r.dir, "progress.log"), os.O_APPEND|os.O_WRONLY, 0600)
+	r.log, err = openJobFile(filepath.Join(r.dir, "progress.log"), jobFileAppend)
 	if err != nil {
 		return err
 	}
 	defer closeBestEffort(r.log)
-	out, err := os.OpenFile(filepath.Join(r.dir, "output.log"), os.O_RDWR|os.O_APPEND, 0600)
+	out, err := openJobFile(filepath.Join(r.dir, "output.log"), jobFileAppend)
 	if err != nil {
 		return err
 	}
 	defer closeBestEffort(out)
-	defer func() { err = errors.Join(err, saveOutputTail(r.dir, out)) }()
+	defer func() { err = errors.Join(err, r.publishOutputTail()) }()
 	if r.c.Shell {
 		cmd = shellCommand(r.c.Argv[0])
 	} else {
@@ -97,7 +111,7 @@ func (r *runner) serveCommand() (err error) {
 	cmd.Stdout, cmd.Stderr = output, output
 	defer func() { err = errors.Join(err, flush()) }()
 	r.c.mark(cmd, r.dir)
-	tree, err := startCommand(cmd, r.c.RunID)
+	tree, err := r.c.startCachedCommand(cmd)
 	if err != nil {
 		return err
 	}
@@ -134,6 +148,7 @@ func (r *runner) serveCommand() (err error) {
 	lastOutput := time.Now()
 	for {
 		var reason string
+		var closing bool
 		select {
 		case waited := <-done:
 			err = waited.err
@@ -171,6 +186,7 @@ func (r *runner) serveCommand() (err error) {
 				return e
 			} else if ok {
 				reason = "interrupted"
+				closing = true
 				if err = r.reclaim(); err != nil {
 					return err
 				}
@@ -197,6 +213,7 @@ func (r *runner) serveCommand() (err error) {
 			}
 		}
 		exited = true
+		r.closeCompleted = closing
 		if cmd.ProcessState != nil {
 			code := commandExitCode(cmd.ProcessState)
 			r.s.ExitCode = &code

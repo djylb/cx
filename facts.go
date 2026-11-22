@@ -58,20 +58,23 @@ func uintValue(s string, mul uint64) any {
 	}
 	return n * mul
 }
+
+// hostFactsTimeout bounds one host facts collection; it exceeds engineLoginTimeout.
+const hostFactsTimeout = 12 * time.Second
+
 func emptyFacts() fields {
 	f := fields{"os": runtime.GOOS, "arch": runtime.GOARCH, "cpu_cores": runtime.NumCPU()}
-	for _, k := range strings.Fields("os_version codex_version cpu_model memory_total_bytes memory_available_bytes disk_free_bytes load1 cpu_usage_percent codex_login_status version_managers") {
+	for _, k := range strings.Fields("os_version cpu_model memory_total_bytes memory_available_bytes disk_free_bytes load1 cpu_usage_percent engines version_managers") {
 		f[k] = nil
 	}
 	return f
 }
 func hostFacts(ctx context.Context, root string) fields {
-	ctx, cancel := context.WithTimeout(ctx, 12*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, hostFactsTimeout)
 	defer cancel()
 	probes := []func() fields{
 		func() fields { return fields{"os_version": stringOrNil(osVersion(ctx))} },
-		func() fields { return fields{"codex_version": stringOrNil(probe(ctx, "codex", "--version"))} },
-		func() fields { return fields{"codex_login_status": loginStatus(ctx, nil)} },
+		func() fields { return fields{"engines": engineFacts(ctx, nil, true)} },
 		func() fields { return fields{"version_managers": managerDirs()} },
 		func() fields { return platformFacts(ctx, root) },
 	}
@@ -91,27 +94,6 @@ func hostFacts(ctx context.Context, root string) fields {
 		}
 	}
 	return f
-}
-func loginStatus(ctx context.Context, env []string) any {
-	// Keep login output private. Codex can include account information in its diagnostic.
-	loginCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(loginCtx, "codex", "login", "status")
-	if len(env) > 0 {
-		cmd.Env = append(cmd.Environ(), env...)
-	}
-	cmd.WaitDelay = 200 * time.Millisecond
-	b, err := cmd.CombinedOutput()
-	if loginCtx.Err() != nil {
-		return nil
-	}
-	login := strings.ToLower(strings.TrimSpace(string(b)))
-	if strings.Contains(login, "not logged in") {
-		return "logged_out"
-	} else if err == nil {
-		return "logged_in"
-	}
-	return nil
 }
 func managerDirs() any {
 	if home, err := os.UserHomeDir(); err == nil {
@@ -254,7 +236,9 @@ func fingerprint(ctx context.Context, dir string) (string, error) {
 	enc := json.NewEncoder(h)
 	record := func(key string, value any) { _ = enc.Encode([]any{key, value}) }
 	record("os", []string{runtime.GOOS, runtime.GOARCH, osVersion(ctx)})
-	record("codex", probe(ctx, "codex", "--version"))
+	for _, e := range engines {
+		record(e.name, probe(ctx, append([]string{e.binary}, e.versionArgs...)...))
+	}
 	for _, name := range strings.Fields(".mise.toml mise.toml .tool-versions go.mod rust-toolchain.toml rust-toolchain .python-version .nvmrc .node-version package.json") {
 		path := filepath.Join(dir, name)
 		f, err := os.Open(path)
@@ -288,7 +272,11 @@ func fingerprint(ctx context.Context, dir string) (string, error) {
 		}
 		record(name, fmt.Sprintf("%x", digest.Sum(nil)))
 	}
-	for _, cmd := range strings.Fields("codex git mise asdf rustup rustc cargo go python python3 node npm java") {
+	tools := strings.Fields("git mise asdf rustup rustc cargo go python python3 node npm java")
+	for _, e := range engines {
+		tools = append(tools, e.binary)
+	}
+	for _, cmd := range tools {
 		path, err := exec.LookPath(cmd)
 		if err != nil {
 			continue

@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,12 +24,12 @@ func toolList() []fields {
 		return fields{"name": name, "description": desc, "inputSchema": schema}
 	}
 	return []fields{
-		tool("ask", "Ask the parent. A blocking request waits for an answer; timeout is in seconds.", fields{"question": str, "options": fields{"type": "array", "items": str}, "blocking": fields{"type": "boolean", "default": false}, "timeout": fields{"type": "number", "exclusiveMinimum": 0}}, "question"),
-		tool("send", "Post a message for the parent, project/job, or #channel.", fields{"to": str, "text": str}, "to", "text"),
+		tool("ask", "Ask the parent. A blocking request waits for an answer; timeout is in seconds.", fields{"question": str, "options": fields{"type": "array", "items": str}, "blocking": fields{"type": "boolean", "default": false}, "timeout": fields{"type": "number", "exclusiveMinimum": 0}, "operation_id": str}, "question"),
+		tool("send", "Post a message for the parent, project/job, or #channel.", fields{"to": str, "text": str, "operation_id": str}, "to", "text"),
 		tool("inbox", "Read messages delivered to this job, indexed by immutable message name.", fields{}),
 	}
 }
-func callTool(ctx context.Context, dir string, params json.RawMessage) (any, error) {
+func callTool(ctx context.Context, dir string, identity jobIdentity, requestKey string, params json.RawMessage) (any, error) {
 	var p struct {
 		Name      string
 		Arguments json.RawMessage
@@ -37,6 +38,7 @@ func callTool(ctx context.Context, dir string, params json.RawMessage) (any, err
 		return nil, err
 	}
 	var a struct {
+		OperationID        string `json:"operation_id"`
 		Timeout            *float64
 		Question, To, Text string
 		Options            []string
@@ -46,6 +48,15 @@ func callTool(ctx context.Context, dir string, params json.RawMessage) (any, err
 		if err := json.Unmarshal(p.Arguments, &a); err != nil {
 			return nil, err
 		}
+	}
+	if err := identity.checkDir(dir); err != nil {
+		return nil, err
+	}
+	if a.OperationID != "" {
+		if !jobName.MatchString(a.OperationID) {
+			return nil, errors.New("invalid operation_id")
+		}
+		requestKey = "op/" + a.OperationID
 	}
 	m := agentMail{Type: p.Name}
 	switch p.Name {
@@ -67,8 +78,7 @@ func callTool(ctx context.Context, dir string, params json.RawMessage) (any, err
 			limit = time.Duration(*a.Timeout * float64(time.Second))
 		}
 		if m.Blocking {
-			deadline := time.Now().UTC().Add(limit)
-			m.Deadline = &deadline
+			m.Timeout = limit
 		}
 	case "send":
 		if a.To != "parent" {
@@ -97,35 +107,31 @@ func callTool(ctx context.Context, dir string, params json.RawMessage) (any, err
 	default:
 		return nil, fmt.Errorf("unknown tool %q", p.Name)
 	}
-	if err := appendMail(ctx, dir, &m); err != nil {
+	if err := appendMail(ctx, dir, identity, requestKey, &m); err != nil {
 		return nil, err
 	}
 	if !m.Blocking {
 		return m, nil
 	}
-	id, _ := json.Marshal(m.Request)
-	path, err := answerPath(dir, id)
-	if err != nil {
-		return nil, err
-	}
 	ctx, cancel := context.WithDeadline(ctx, *m.Deadline)
 	defer cancel()
-	for {
-		var reply fields
-		err := readJSON(path, &reply)
-		if err == nil {
-			return reply, nil
-		}
-		if !os.IsNotExist(err) {
-			return nil, err
-		}
-		if err = pause(ctx, 50*time.Millisecond); err != nil {
-			return nil, err
-		}
-	}
+	return waitAgentAnswer(ctx, dir, identity, m.Request)
 }
 
-func serveTools(ctx context.Context, dir string, in io.Reader, out io.Writer) error {
+func serveToolsFor(ctx context.Context, dir, runID string, in io.Reader, out io.Writer) error {
+	identity, s, _, err := captureJobIdentity(dir)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if runID != "" {
+		if err != nil {
+			return err
+		}
+		if s.RunID != runID {
+			return errJobReplaced
+		}
+	}
+	session := "session/" + rand.Text() + "/"
 	scanner := bufio.NewScanner(in)
 	scanner.Buffer(make([]byte, 4096), 8<<20)
 	enc := json.NewEncoder(out)
@@ -154,7 +160,11 @@ func serveTools(ctx context.Context, dir string, in io.Reader, out io.Writer) er
 			case "tools/list":
 				response["result"] = fields{"tools": toolList()}
 			case "tools/call":
-				v, err := callTool(ctx, dir, req.Params)
+				var v any
+				err := unregisteredJob(dir)
+				if identity.key != "" {
+					v, err = callTool(ctx, dir, identity, session+string(req.ID), req.Params)
+				}
 				var text string
 				if err != nil {
 					text = err.Error()

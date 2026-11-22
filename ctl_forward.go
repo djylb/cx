@@ -61,46 +61,55 @@ func ctlForward(ctx context.Context, op string, args []string) error {
 		if len(args) == 1 {
 			names = args
 		}
-		// Query hosts concurrently with a per-host bound so one slow link cannot hold the others.
-		type factsReply struct {
-			err error
-			r   reply
-		}
-		replies := make([]chan factsReply, len(names))
-		for i, name := range names {
-			h, hostErr := hs.get(name)
-			if hostErr != nil {
-				return hostErr
+		for _, name := range names {
+			if _, err := hs.get(name); err != nil {
+				return err
 			}
-			replies[i] = make(chan factsReply, 1)
+		}
+		ctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		type factsReply struct {
+			index int
+			data  []byte
+			err   error
+		}
+		replies := make(chan factsReply, len(names))
+		for i, name := range names {
 			go func() {
 				hostCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 				defer cancel()
-				r, err := h.call(hostCtx, 30*time.Second, "facts")
+				r, err := hs[name].call(hostCtx, 30*time.Second, "facts")
 				if err == nil && r.code != 0 {
-					err = r.output()
+					err = ctlExit(r.code)
 				}
-				replies[i] <- factsReply{err, r}
+				replies <- factsReply{i, r.data, err}
 			}()
 		}
-		var failed error
-		for i, name := range names {
-			v := <-replies[i]
+		enc := json.NewEncoder(os.Stdout)
+		failures := make([]error, len(names))
+		for range names {
+			v := <-replies
+			name := names[v.index]
+			var row map[string]json.RawMessage
+			if v.err == nil {
+				v.err = json.Unmarshal(v.data, &row)
+				if v.err == nil && row == nil {
+					v.err = errors.New("expected host facts object")
+				}
+			}
 			if v.err != nil {
-				failed = errors.Join(failed, fmt.Errorf("%s: %w", name, v.err))
-				if hostErr := emitRows([]byte(fmt.Sprintf(`{"error":%q}`, v.err.Error())), "host", name); hostErr != nil {
-					return hostErr
+				failures[v.index] = fmt.Errorf("%s: %w", name, v.err)
+				if err := enc.Encode(fields{"host": name, "error": v.err.Error()}); err != nil {
+					return err
 				}
 				continue
 			}
-			if hostErr := emitRows(v.r.data, "host", name); hostErr != nil {
-				return hostErr
+			row["host"], _ = json.Marshal(name)
+			if err := enc.Encode(row); err != nil {
+				return err
 			}
 		}
-		if failed != nil {
-			return failed
-		}
-		return nil
+		return errors.Join(failures...)
 	}
 	if op == "outbox" {
 		return ctlOutbox(ctx, hs, o)
@@ -118,7 +127,7 @@ func ctlForward(ctx context.Context, op string, args []string) error {
 			return e
 		}
 	}
-	r, e := h.invoke(ctx, 185*time.Second, false, append([]string{"control-action", op, id}, argv...)...)
+	r, e := h.invoke(ctx, controlCallIdle, false, append([]string{"control-action", op, id}, argv...)...)
 	if e != nil {
 		return e
 	}
@@ -199,7 +208,7 @@ func controlOperands(op string, args []string) ([]string, error) {
 			}
 			value = string(b)
 		case "image":
-			b, e := os.ReadFile(value)
+			b, e := readSharedFile(value)
 			if e != nil {
 				return nil, e
 			}
@@ -230,7 +239,7 @@ func nodeAction(ctx context.Context, a []string) error {
 	}
 	if op == "say" {
 		var s status
-		if e = readJSON(filepath.Join(dir, "status.json"), &s); e != nil {
+		if e = loadJobStatusInto(dir, &s); e != nil {
 			return e
 		}
 		if readyResult(s) {
@@ -241,7 +250,7 @@ func nodeAction(ctx context.Context, a []string) error {
 	}
 	if op == "interrupt" {
 		var s status
-		if e = readJSON(filepath.Join(dir, "status.json"), &s); e != nil {
+		if e = loadJobStatusInto(dir, &s); e != nil {
 			return e
 		}
 		if s.Engine == "cmd" {
@@ -259,9 +268,6 @@ func nodeAction(ctx context.Context, a []string) error {
 			if op != "say" || i+1 >= len(a) {
 				return errors.New("invalid attachment")
 			}
-			if _, statErr := os.Stat(filepath.Join(dir, "config.json")); statErr != nil {
-				return statErr
-			}
 			folder := filepath.Join(dir, "attachments")
 			if e = os.MkdirAll(folder, 0700); e != nil {
 				return e
@@ -271,10 +277,7 @@ func nodeAction(ctx context.Context, a []string) error {
 			isText := a[i] == "--cx-text"
 			i++
 			if !isText {
-				suffix = string(data)
-				if len(suffix) > 13 || strings.ContainsAny(suffix, "/\\:") {
-					suffix = ""
-				}
+				suffix = safeExt(string(data))
 				if i+1 >= len(a) {
 					return errors.New("missing image data")
 				}
@@ -285,7 +288,7 @@ func nodeAction(ctx context.Context, a []string) error {
 				}
 			}
 			path := filepath.Join(folder, fmt.Sprintf("%x%s", sha256.Sum256(data), suffix))
-			if e = atomicWrite(path, data); e != nil {
+			if e = snapImmutable(path, data); e != nil {
 				return e
 			}
 			if isText {

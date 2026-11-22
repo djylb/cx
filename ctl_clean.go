@@ -2,13 +2,11 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"runtime"
+	"slices"
 	"strings"
 	"time"
 )
@@ -25,6 +23,87 @@ func jobOperationLock(ctx context.Context, root, id string) (*os.File, error) {
 	}
 	return lockUntil(ctx, p+".lock")
 }
+
+type workspaceBinding struct {
+	path string
+	key  string
+	ids  []string
+}
+
+func bindWorkspace(root, cwd string) (workspaceBinding, error) {
+	if cwd == "" {
+		return workspaceBinding{}, nil
+	}
+	path, err := filepath.Abs(cwd)
+	if err != nil {
+		return workspaceBinding{}, err
+	}
+	path, err = filepath.EvalSymlinks(path)
+	if err != nil {
+		return workspaceBinding{}, err
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return workspaceBinding{}, err
+	}
+	if !info.IsDir() {
+		return workspaceBinding{}, fmt.Errorf("working directory is not a directory: %s", path)
+	}
+	bound := workspaceBinding{path: path}
+	base, err := filepath.EvalSymlinks(filepath.Join(root, ".work"))
+	if os.IsNotExist(err) {
+		return bound, nil
+	}
+	if err != nil {
+		return workspaceBinding{}, err
+	}
+	rel, err := filepath.Rel(base, path)
+	if err != nil || !filepath.IsLocal(rel) {
+		return bound, nil
+	}
+	if rel == "." {
+		return workspaceBinding{}, errors.New("working directory cannot be the workspace container")
+	}
+	// A workspace is addressed by a flat ID or by project/job. A nested
+	// path can have both prefixes, so lock them in the usual ID order.
+	parts := strings.Split(filepath.ToSlash(rel), "/")
+	for n := 1; n <= min(2, len(parts)); n++ {
+		id := strings.Join(parts[:n], "/")
+		if _, err := jobDir(base, id); err == nil {
+			bound.ids = append(bound.ids, id)
+		}
+	}
+	bound.key, err = jobDirectoryKey(path)
+	return bound, err
+}
+
+func (b workspaceBinding) lock(ctx context.Context, root string, jobs ...string) (func(), error) {
+	ids := append(slices.Clone(b.ids), jobs...)
+	slices.Sort(ids)
+	var locks []*os.File
+	unlock := func() {
+		for i := len(locks) - 1; i >= 0; i-- {
+			closeBestEffort(locks[i])
+		}
+		locks = nil
+	}
+	for _, id := range slices.Compact(ids) {
+		f, err := jobOperationLock(ctx, root, id)
+		if err != nil {
+			unlock()
+			return nil, err
+		}
+		locks = append(locks, f)
+	}
+	if b.key != "" {
+		if err := (jobIdentity{key: b.key}).checkDir(b.path); err != nil {
+			unlock()
+			return nil, fmt.Errorf("workspace changed before registration: %w", err)
+		}
+	}
+	return unlock, nil
+}
+
 func cleanNodeJob(ctx context.Context, id string) error {
 	root, e := stateRoot()
 	if e != nil {
@@ -47,11 +126,6 @@ func cleanNodeJob(ctx context.Context, id string) error {
 	if e != nil {
 		return e
 	}
-	if _, e = os.Stat(dir); os.IsNotExist(e) {
-		return cleanPrivateWork(ctx, work, scripts)
-	} else if e != nil {
-		return e
-	}
 	if _, e = os.Stat(work); e == nil {
 		user, err := workspaceUser(ctx, root, work, id)
 		if err != nil {
@@ -63,6 +137,15 @@ func cleanNodeJob(ctx context.Context, id string) error {
 	} else if !os.IsNotExist(e) {
 		return e
 	}
+	if _, e = os.Stat(dir); os.IsNotExist(e) {
+		project, job, ok := strings.Cut(id, "/")
+		if !ok {
+			project, job = "", id
+		}
+		return errors.Join(reapDetachedJobs(root, project, job), cleanPrivateWork(ctx, work, scripts))
+	} else if e != nil {
+		return e
+	}
 	// Explicit working directories belong to the caller. Only remove the
 	// reserved job workspace and script directory, never config.Dir.
 	if e = run(ctx, []string{"clean", "--job", id}); e != nil {
@@ -72,28 +155,60 @@ func cleanNodeJob(ctx context.Context, id string) error {
 }
 
 func workspaceUser(ctx context.Context, root, work, id string) (string, error) {
+	var err error
+	work, err = filepath.EvalSymlinks(work)
+	if err != nil {
+		return "", err
+	}
 	var user string
-	err := scanJobs(ctx, root, "", "", func(s status) (bool, error) {
+	err = walkJobDirs(ctx, root, "", func(dir, _, _ string) (bool, bool, error) {
+		s, _, err := loadJobStatus(dir)
+		if errors.Is(err, os.ErrNotExist) {
+			return false, false, nil
+		}
+		if err != nil {
+			return true, false, err
+		}
 		other := s.Job
 		if s.Project != "" {
 			other = s.Project + "/" + s.Job
 		}
-		if other == id || isTerminal(s.State) {
-			return false, nil
-		}
-		d, err := jobDir(root, other)
-		if err != nil {
-			return false, err
+		if other == id || s.final {
+			return true, false, nil
 		}
 		var c config
-		if err := readJSON(filepath.Join(d, "config.json"), &c); err != nil {
-			return false, err
+		if err := readJobConfig(dir, &c); err != nil {
+			return true, false, err
 		}
-		if snapWithin(work, c.Dir) {
-			user = other
-			return true, nil
+		if !snapWithin(work, c.Dir) {
+			cwd, err := filepath.EvalSymlinks(c.Dir)
+			if os.IsNotExist(err) {
+				return true, false, nil
+			}
+			if err != nil {
+				return true, false, err
+			}
+			if !snapWithin(work, cwd) {
+				return true, false, nil
+			}
 		}
-		return false, nil
+		// The workspace operation lock prevents a coordinated restart.
+		// This probe cannot acquire the registry while close holds owner.lock.
+		free, err := probeJobOwner(dir)
+		if os.IsNotExist(err) {
+			return false, false, nil
+		}
+		if err != nil {
+			return true, false, err
+		}
+		if free {
+			pending, err := commandHandoffPending(dir, s)
+			if err != nil || !pending {
+				return true, false, err
+			}
+		}
+		user = other
+		return true, true, nil
 	})
 	return user, err
 }
@@ -122,11 +237,7 @@ func (r *runner) releaseClosedWorkspace() error {
 	if id == "" {
 		return nil
 	}
-	lock, err := jobOperationLock(ctx, r.root, id)
-	if err != nil {
-		return err
-	}
-	defer closeBestEffort(lock)
+
 	if _, err = os.Stat(filepath.Join(work, "input", "manifest.json")); os.IsNotExist(err) {
 		return nil // Explicit source, whose directory belongs to the caller.
 	} else if err != nil {
@@ -168,43 +279,12 @@ func cleanControllerJob(ctx context.Context, h endpoint, host, id string) error 
 		return errors.New("job is still being submitted")
 	}
 	defer closeBestEffort(owner)
-	var old legacyCleanup
-	var oldPath string
-	args := []string{"clean-job", id}
-	if _, err := os.Stat(filepath.Join(dir, "input.json")); os.IsNotExist(err) {
-		path, err := legacyRouteFile(id)
-		if err == nil {
-			err = readJSON(path, &old)
-		}
-		if err == nil && old.Host == host && old.Work != "" {
-			l, routeErr := lockUntil(ctx, strings.TrimSuffix(path, ".env")+".lock")
-			if routeErr != nil {
-				return routeErr
-			}
-			defer closeBestEffort(l)
-			if routeErr = readJSON(path, &old); routeErr != nil {
-				return routeErr
-			}
-			if old.Host != host || old.Project+"/"+old.Tag != id || old.Submit == "submitting" || !snapHex(old.Request, 64) {
-				return errors.New("legacy registration changed or is still submitting")
-			}
-			args = append(args, old.Work, old.Request)
-			oldPath = path
-		} else if err != nil && !os.IsNotExist(err) {
-			return err
-		}
-	}
-	r, e := h.invoke(ctx, 90*time.Second, false, args...)
+	r, e := h.invoke(ctx, 90*time.Second, false, "clean-job", id)
 	if e != nil {
 		return e
 	}
 	if r.code != 0 {
 		return r.output()
-	}
-	if oldPath != "" {
-		if e = os.Remove(oldPath); e != nil {
-			return e
-		}
 	}
 	entries, e := os.ReadDir(dir)
 	if e != nil {
@@ -268,116 +348,4 @@ func releaseSnapshotWorktrees(ctx context.Context, work string) error {
 		}
 	}
 	return nil
-}
-
-type legacyCleanup struct {
-	Host, Project, Tag, State, Work, Request, Mux, Socket string
-	Submit                                                string `json:"submit_status"`
-}
-
-func cleanLegacyJob(ctx context.Context, id, work, token string) error {
-	root, e := stateRoot()
-	if e != nil {
-		return e
-	}
-	dir, e := jobDir(root, id)
-	if e != nil {
-		return e
-	}
-	// The old controller's private work root ends in cx-v2/jobs/PROJECT/TAG.
-	work = filepath.FromSlash(work)
-	suffix := filepath.Join("cx-v2", "jobs", filepath.FromSlash(id))
-	if !filepath.IsAbs(work) || filepath.Clean(work) != work || !strings.HasSuffix(work, string(os.PathSeparator)+suffix) || !snapHex(token, 64) {
-		return errors.New("invalid legacy workspace")
-	}
-	if _, e = os.Stat(work); os.IsNotExist(e) {
-		if _, e = os.Stat(dir); os.IsNotExist(e) {
-			return nil
-		}
-		return errors.New("missing legacy request")
-	} else if e != nil {
-		return e
-	}
-	lock, e := lockUntil(ctx, filepath.Join(filepath.Dir(work), "."+filepath.Base(work)+".lock"))
-	if e != nil {
-		return e
-	}
-	defer closeBestEffort(lock)
-	var old legacyCleanup
-	if e = readJSON(filepath.Join(work, "request.json"), &old); e != nil {
-		return e
-	}
-	if old.Request != token || old.Project+"/"+old.Tag != id || filepath.Clean(old.Work) != work || filepath.Clean(old.State) != filepath.Clean(root) {
-		return errors.New("legacy registration changed")
-	}
-	var hadState bool
-	if _, e = os.Stat(dir); e == nil {
-		hadState = true
-		if e = run(ctx, []string{"clean", "--job", id}); e != nil {
-			return e
-		}
-	} else if !os.IsNotExist(e) {
-		return e
-	}
-	if old.Mux != "" {
-		ident, _ := json.Marshal(id)
-		if old.Mux != "cxv2-"+snapSum(ident)[:32] {
-			return errors.New("unexpected legacy session")
-		}
-		exe := "tmux"
-		var args []string
-		session := "=" + old.Mux
-		if runtime.GOOS == "windows" {
-			var socket string
-			exe, socket = psmuxSettings(root)
-			args = []string{"-L", socket}
-			session = old.Mux
-		} else if old.Socket != "" {
-			args = []string{"-S", old.Socket}
-		}
-		mctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		defer cancel()
-		if e = exec.CommandContext(mctx, exe, append(args, "has-session", "-t", session)...).Run(); e == nil {
-			if !hadState {
-				return errors.New("legacy worker active")
-			}
-			if e = exec.CommandContext(mctx, exe, append(args, "kill-session", "-t", session)...).Run(); e != nil {
-				return e
-			}
-		} else {
-			var exit *exec.ExitError
-			if !errors.As(e, &exit) || exit.ExitCode() != 1 {
-				return e
-			}
-		}
-	}
-	checkout := filepath.Join(work, "jobs", "checkout")
-	var m Manifest
-	if e = readJSON(filepath.Join(checkout, "input", "manifest.json"), &m); e == nil {
-		if e = m.validate(); e != nil {
-			return e
-		}
-		for _, r := range m.Repositories {
-			target := filepath.Join(checkout, "work", "tree", r.Path)
-			if info, err := os.Lstat(filepath.Join(target, ".git")); err == nil && info.Mode().IsRegular() {
-				g := snapGit{ctx: ctx, dir: target}
-				common, gitErr := g.get("rev-parse", "--path-format=absolute", "--git-common-dir")
-				if gitErr != nil {
-					return gitErr
-				}
-				g.dir = common
-				if gitErr = g.worktree("remove", "--force", target); gitErr != nil {
-					return gitErr
-				}
-				if gitErr = g.worktree("prune", "--expire", "now"); gitErr != nil {
-					return gitErr
-				}
-			} else if err != nil && !os.IsNotExist(err) {
-				return err
-			}
-		}
-	} else if !os.IsNotExist(e) {
-		return e
-	}
-	return os.RemoveAll(work)
 }

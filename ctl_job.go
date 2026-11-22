@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -31,25 +32,26 @@ func startNodeJob(ctx context.Context, raw string) error {
 	if e != nil {
 		return e
 	}
-	lock, e := jobOperationLock(ctx, root, req.ID)
+	bound, e := bindWorkspace(root, req.Source)
 	if e != nil {
 		return e
 	}
-	defer closeBestEffort(lock)
+	unlock, e := bound.lock(ctx, root, req.ID)
+	if e != nil {
+		return e
+	}
+	defer unlock()
 	if e = os.MkdirAll(work, 0700); e != nil {
 		return e
 	}
 	receipt := filepath.Join(work, "request.json")
-	if _, e = os.Stat(filepath.Join(dir, "status.json")); e == nil {
-		b, receiptErr := readStateFile(receipt)
+	if _, _, e = jobStatusRecord(dir); e == nil {
+		b, receiptErr := readSharedFile(receipt)
 		if receiptErr != nil || string(b) != raw {
 			return errors.New("job already registered with different input")
 		}
-		if receiptErr = writeJSON(filepath.Join(dir, "cx-work.json"), work); receiptErr != nil {
-			return receiptErr
-		}
 		return printStatus(dir)
-	} else if !os.IsNotExist(e) {
+	} else if !errors.Is(e, os.ErrNotExist) {
 		return e
 	}
 	if e = snapImmutable(receipt, []byte(raw)); e != nil {
@@ -66,7 +68,13 @@ func startNodeJob(ctx context.Context, raw string) error {
 			return snapshotErr
 		}
 	} else {
-		prep.Source = req.Source
+		prep.Source = bound.path
+	}
+	if req.Source == "" {
+		bound, e = bindWorkspace(root, prep.Source)
+		if e != nil {
+			return e
+		}
 	}
 	env := prep.Env
 	if env == nil {
@@ -91,7 +99,7 @@ func startNodeJob(ctx context.Context, raw string) error {
 	for i := range argv {
 		if argv[i] == "--input-json" && i+1 < len(argv) {
 			path := filepath.Join(work, "start-input.json")
-			if e = atomicWrite(path, []byte(argv[i+1])); e != nil {
+			if e = snapImmutable(path, []byte(argv[i+1])); e != nil {
 				return e
 			}
 			argv[i+1] = "@" + path
@@ -102,72 +110,131 @@ func startNodeJob(ctx context.Context, raw string) error {
 		flag string
 		name string
 		data []byte
-	}{{"--prompt-file", "prompt.txt", []byte(req.Prompt)}, {"--preamble-file", "preamble.md", []byte(req.Preamble)}, {"--stall-nudge-file", "nudge.md", []byte(req.Nudge)}, {"--image", "image", req.Image}} {
+	}{{"--prompt-file", "prompt.txt", []byte(req.Prompt)}, {"--preamble-file", "preamble.md", []byte(req.Preamble)}, {"--stall-nudge-file", "nudge.md", []byte(req.Nudge)}} {
 		if len(item.data) > 0 {
 			p := filepath.Join(work, item.name)
-			if e = atomicWrite(p, item.data); e != nil {
+			if e = snapImmutable(p, item.data); e != nil {
 				return e
 			}
 			argv = append(argv, item.flag, p)
 		}
 	}
+	for i, image := range req.Images {
+		p := filepath.Join(work, fmt.Sprintf("image-%d%s", i+1, safeExt(image.Ext)))
+		if e = snapImmutable(p, image.Data); e != nil {
+			return e
+		}
+		argv = append(argv, "--image", p)
+	}
 	if len(req.Command) > 0 {
 		argv = append(argv, "--cmd", "--")
 		argv = append(argv, req.Command...)
 	}
-	if e = launchRunner(ctx, root, dir, work, argv, env, false); e != nil {
-		return e
+	if e = launchRunner(ctx, root, dir, work, argv, env, jobIdentity{}, bound, unlock); e != nil {
+		// Another submission of the same receipt can win the worker's
+		// operation lock after the launcher hands it off.
+		identity, current, _, readErr := captureJobIdentity(dir)
+		if readErr != nil || current.PID == 0 && !current.final {
+			return e
+		}
+		data, readErr := readSharedFile(receipt)
+		if readErr != nil || string(data) != raw || identity.checkDir(dir) != nil {
+			return e
+		}
+		return json.NewEncoder(os.Stdout).Encode(current)
 	}
-	return writeJSON(filepath.Join(dir, "cx-work.json"), work)
+	return nil
 }
 
 // The runner owns its lifetime. The caller waits only for registration.
-func launchRunner(ctx context.Context, root, dir, work string, argv []string, env map[string]string, resume bool) error {
+func launchRunner(ctx context.Context, root, dir, work string, argv []string, env map[string]string, source jobIdentity, workIdentity workspaceBinding, release func()) error {
 	exe, e := os.Executable()
 	if e != nil {
 		return e
 	}
-	if runtime.GOOS == "windows" {
-		return launchMuxRunner(ctx, root, exe, dir, work, argv, env, resume)
+	token := rand.Text()
+	argv = append([]string{argv[0], "--launch-id", token}, argv[1:]...)
+	var expected string
+	if argv[0] == "resume" {
+		expected = source.run
 	}
-	log, e := os.OpenFile(filepath.Join(work, "launch.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+	if source.key != "" {
+		argv = append([]string{argv[0], "--expect-run", source.run, "--expect-dir", source.key}, argv[1:]...)
+	}
+	if workIdentity.key != "" {
+		argv = append([]string{argv[0], "--expect-workspace", workIdentity.key}, argv[1:]...)
+	}
+	if runtime.GOOS == "windows" {
+		return launchMuxRunner(ctx, root, exe, dir, work, argv, env, expected, token, release)
+	}
+	log, e := openJobFile(filepath.Join(work, "launch.log"), jobFileAppendCreate)
 	if e != nil {
 		return e
 	}
 	defer closeBestEffort(log)
 	cmd := exec.Command(exe, append([]string{"node"}, argv...)...)
-	detachWorker(cmd)
 	cmd.Stdout = log
 	cmd.Stderr = log
 	cmd.Env = os.Environ()
 	for k, v := range env {
 		cmd.Env = append(cmd.Env, k+"="+v)
 	}
-	if e = cmd.Start(); e != nil {
+	if e = startDetachedWorker(cmd); e != nil {
 		return e
 	}
+	// The worker takes the same operation locks and rechecks both identities
+	// before it publishes ownership. The acknowledgement comes after that.
+	release()
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
+	return awaitRunner(ctx, dir, expected, token, cmd.Process.Pid, done, "")
+}
+
+// A worker acknowledges ownership with its launch token or, for the command
+// handoff, the expected RunID and its first nonzero PID/terminal publication.
+func awaitRunner(ctx context.Context, dir, runID, token string, pid int, done <-chan error, rejected string) error {
 	end, stop := context.WithTimeout(ctx, 10*time.Second)
 	defer stop()
+	observer, err := openJobObservation(dir, stateCursor{}, runID)
+	if err != nil {
+		return err
+	}
+	defer closeBestEffort(observer)
+	var workerErr error
+	var exited bool
 	for {
-		var s status
-		e = readJSON(filepath.Join(dir, "status.json"), &s)
-		if e == nil && (!resume || s.PID == cmd.Process.Pid) {
-			return printStatus(dir)
+		if err := observer.read(); err != nil {
+			return err
 		}
-		if e != nil && !os.IsNotExist(e) {
-			return e
+		s := observer.s
+		if runID != "" && s.RunID != "" && s.RunID != runID {
+			return errJobReplaced
+		}
+		if (token != "" && s.LaunchID == token && (s.PID != 0 && (s.PID == pid || pid == 0 || s.Engine == "cmd") || s.final)) ||
+			(token == "" && s.RunID == runID && (s.PID != 0 || s.final)) {
+			return json.NewEncoder(os.Stdout).Encode(s)
+		}
+		if rejected != "" {
+			data, err := readSharedFile(rejected)
+			if err != nil && !os.IsNotExist(err) {
+				return err
+			}
+			switch string(data) {
+			case "owner-busy":
+				return errJobOwnerBusy
+			case "job-replaced":
+				return errJobReplaced
+			}
+		}
+		if exited {
+			return errors.Join(errors.New("worker exited before acquiring ownership"), workerErr)
 		}
 		select {
 		case <-end.Done():
-			return fmt.Errorf("registration unconfirmed: %w", end.Err())
-		case err := <-done:
-			if err != nil {
-				return fmt.Errorf("runner exit: %w (see %s)", err, log.Name())
-			}
-			return printStatus(dir)
-		case <-time.After(30 * time.Millisecond):
+			return fmt.Errorf("runner ownership unconfirmed: %w", end.Err())
+		case workerErr = <-done:
+			exited = true
+		case <-time.After(25 * time.Millisecond):
 		}
 	}
 }
@@ -265,30 +332,34 @@ func restartNode(ctx context.Context, a []string) error {
 			target = p + "/" + target
 		}
 	}
-	var s status
-	if e = readJSON(filepath.Join(dir, "status.json"), &s); e != nil {
+	identity, s, _, e := captureJobIdentity(dir)
+	if e != nil {
 		return e
 	}
 	work, e := workDir(dir, s)
 	if e != nil {
 		return e
 	}
-	workspaceID := privateWorkspaceID(root, work)
-	if workspaceID != "" && workspaceID != target {
-		lock, err := jobOperationLock(ctx, root, workspaceID)
-		if err != nil {
-			return err
-		}
-		defer closeBestEffort(lock)
+	var saved config
+	if e = readJobConfig(dir, &saved); e != nil {
+		return e
 	}
-	lock, e := jobOperationLock(ctx, root, target)
+	bound, e := bindWorkspace(root, saved.Dir)
 	if e != nil {
 		return e
 	}
-	defer closeBestEffort(lock)
-	if e = readJSON(filepath.Join(dir, "status.json"), &s); e != nil {
+	unlock, e := bound.lock(ctx, root, target, id)
+	if e != nil {
 		return e
 	}
+	defer unlock()
+	if _, e = readJobStatus(dir, &s); e != nil {
+		return e
+	}
+	if e = identity.check(dir, s); e != nil {
+		return e
+	}
+
 	switch op {
 	case "resume":
 		if e = checkResumeProfile(root, s.Profile, profile); e != nil {
@@ -305,18 +376,33 @@ func restartNode(ctx context.Context, a []string) error {
 	}
 	argv := []string{"resume", "--job", id}
 	env := map[string]string{"CX_PARENT": host + ":" + id}
-	var prep PreparedSnapshot
-	if e = readJSON(filepath.Join(work, "prepared.json"), &prep); e == nil {
+	prep, prepared, e := readPreparedSnapshot(ctx, work)
+	if e != nil {
+		return e
+	}
+	if prepared {
 		if _, err := os.Stat(prep.Source); os.IsNotExist(err) {
 			return errors.New("job checkout was reclaimed; submit a new job")
 		} else if err != nil {
 			return err
 		}
+		var manifest Manifest
+		if err := readJSON(filepath.Join(work, "input", "manifest.json"), &manifest); err != nil {
+			return err
+		}
+		if err := manifest.validate(); err != nil {
+			return err
+		}
+		store, err := snapStore()
+		if err != nil {
+			return err
+		}
+		if err := validateSnapshotRepos(ctx, store, manifest); err != nil {
+			return fmt.Errorf("snapshot repository unavailable: %w", err)
+		}
 		for k, v := range prep.Env {
 			env[k] = v
 		}
-	} else if !os.IsNotExist(e) {
-		return e
 	}
 	if st, statErr := os.Stat(filepath.Join(work, "context")); statErr == nil && st.IsDir() {
 		env["CX_CONTEXT"] = filepath.Join(work, "context")
@@ -326,7 +412,6 @@ func restartNode(ctx context.Context, a []string) error {
 			return e
 		}
 	}
-	resume := true
 	if op == "fork" {
 		child := a[3]
 		if _, e = jobPath("", child); e != nil {
@@ -348,14 +433,13 @@ func restartNode(ctx context.Context, a []string) error {
 		if a[4] != "" {
 			argv = append(argv, "--through", a[4])
 		}
-		resume = false
 	} else if op != "resume" {
 		return errors.New("invalid operation")
 	}
 	if profile != "" {
 		argv = append(argv, "--profile", profile)
 	}
-	return launchRunner(ctx, root, dir, work, argv, env, resume)
+	return launchRunner(ctx, root, dir, work, argv, env, identity, bound, unlock)
 }
 
 func continueNode(ctx context.Context, host, id, text, profile string) error {

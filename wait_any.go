@@ -4,171 +4,387 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 )
 
 type waitCursor struct {
-	Question  string `json:"question,omitempty"`
-	RunID     string `json:"run_id,omitempty"`
-	Terminal  string `json:"terminal,omitempty"`
-	OutboxSeq uint64 `json:"outbox_seq,omitempty"`
-	Finished  int64  `json:"completed_turns"`
+	StateCursor  string `json:"state_cursor"`
+	OutboxCursor string `json:"outbox_cursor,omitempty"`
+	// Notification acknowledgements can lag the state tail while a job is
+	// busy. OutboxSeq belongs to the independent outbox stream.
+	Question        string   `json:"question,omitempty"`
+	RunID           string   `json:"run_id,omitempty"`
+	Terminal        string   `json:"terminal,omitempty"`
+	OutboxSeq       uint64   `json:"outbox_seq,omitempty"`
+	Finished        int64    `json:"completed_turns"`
+	QueueGeneration uint64   `json:"queue_generation,omitempty"`
+	Withdrawals     []uint64 `json:"withdrawals,omitempty"`
 }
 
 type waitReport struct {
-	Project   string `json:"project"`
-	Job       string `json:"job"`
-	State     string `json:"status"`
-	Outcome   string `json:"outcome"`
-	OutboxSeq uint64 `json:"outbox_seq,omitempty"`
-	Finished  int64  `json:"completed_turns"`
-	Code      int    `json:"code"`
+	Project     string `json:"project"`
+	Job         string `json:"job"`
+	State       string `json:"status"`
+	QueueReason string `json:"queue_reason,omitempty"`
+	Outcome     string `json:"outcome"`
+	OutboxSeq   uint64 `json:"outbox_seq,omitempty"`
+	Finished    int64  `json:"completed_turns"`
+	Code        int    `json:"code"`
+	Event       string `json:"event"`
+	EventID     string `json:"event_id"`
+}
+
+const exitQueued = 13
+
+type waitFloor struct {
+	runID    string
+	finished int64
+	busy     bool
+}
+
+func decodeWaitBaseline(b []byte) (map[string]waitCursor, error) {
+	baseline := make(map[string]waitCursor)
+	if len(bytes.TrimSpace(b)) > 0 {
+		if err := json.Unmarshal(b, &baseline); err != nil {
+			return nil, fmt.Errorf("read wait baseline: %w", err)
+		}
+	}
+	if baseline == nil {
+		return nil, errors.New("wait baseline must be a JSON object")
+	}
+	for id, before := range baseline {
+		if _, err := parseCursor(before.StateCursor); err != nil {
+			return nil, fmt.Errorf("wait baseline for %s: %w", id, err)
+		}
+	}
+	return baseline, nil
 }
 
 func waitAny(ctx context.Context, root, project, session, sinceFile string, out io.Writer) error {
-	baseline := make(map[string]waitCursor)
+	var baseline map[string]waitCursor
 	if sinceFile != "" {
-		b, err := readStateFile(sinceFile)
-		if err != nil && !os.IsNotExist(err) {
+		lock, err := lockUntil(ctx, sinceFile+".lock")
+		if err != nil {
+			return err
+		}
+		defer closeBestEffort(lock)
+		b, err := readSharedFile(sinceFile)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("read wait baseline: %w", err)
 		}
-		if len(bytes.TrimSpace(b)) > 0 {
-			if err = json.Unmarshal(b, &baseline); err != nil {
-				return fmt.Errorf("read wait baseline: %w", err)
-			}
-		}
-		if baseline == nil {
-			return errors.New("wait baseline must be a JSON object")
+		baseline, err = decodeWaitBaseline(b)
+		if err != nil {
+			return err
 		}
 	}
-	// These floors apply only to this call. Losing a poll to another job
-	// must not advance that job's persisted cursor.
-	type start struct {
-		runID   string
-		outcome string
-		floor   int64
-		busy    bool
-	}
-	starts := make(map[string]start)
 	tick := time.NewTicker(time.Second)
 	defer tick.Stop()
-	for ctx.Err() == nil {
+	report, err := selectWaitAny(ctx, root, project, session, baseline, tick.C, json.NewEncoder(out).Encode)
+	if err != nil {
+		return err
+	}
+	if sinceFile != "" {
+		if err = json.NewEncoder(out).Encode(report); err != nil {
+			return err
+		}
+		if err = writeJSON(sinceFile, baseline); err != nil {
+			return fmt.Errorf("write wait baseline: %w", err)
+		}
+	}
+	if report.Code == 6 {
+		return errQuestion
+	}
+	if report.Code == exitQueued {
+		return ctlExit(exitQueued)
+	}
+	return nil
+}
+
+func pollWaitAny(ctx context.Context, root, project, session string, baseline map[string]waitCursor) (*waitReport, error) {
+	tick := time.NewTicker(time.Second)
+	defer tick.Stop()
+	return pollWaitAnyTicks(ctx, root, project, session, baseline, tick.C)
+}
+
+func pollWaitAnyTicks(ctx context.Context, root, project, session string, baseline map[string]waitCursor, ticks <-chan time.Time) (*waitReport, error) {
+	return selectWaitAny(ctx, root, project, session, baseline, ticks, nil)
+}
+
+func selectWaitAny(ctx context.Context, root, project, session string, baseline map[string]waitCursor, ticks <-chan time.Time, output func(any) error) (*waitReport, error) {
+	// A floor belongs to this observation call. A job that loses the race
+	// to another result must retain its original persisted cursor.
+	type observedJob struct {
+		*jobStateObserver
+		key     string
+		seen    uint64
+		started bool
+		floor   waitFloor
+		outbox  uint64
+		mail    *stateTail
+		anchor  stateCursor
+	}
+	jobs := make(map[string]*observedJob)
+	defer func() {
+		for _, job := range jobs {
+			closeBestEffort(job.jobStateObserver)
+			closeBestEffort(job.mail)
+		}
+	}()
+	for scan := uint64(1); ctx.Err() == nil; scan++ {
 		var result *waitReport
-		var key string
-		var cursor waitCursor
-		err := scanJobs(ctx, root, project, session, func(s status) (bool, error) {
-			id := s.Job
-			if s.Project != "" {
-				id = s.Project + "/" + id
+		err := walkJobDirs(ctx, root, project, func(dir, p, j string) (bool, bool, error) {
+			id := j
+			if p != "" {
+				id = p + "/" + j
 			}
-			dir := filepath.Join(root, s.Project, s.Job)
-			target, seen := starts[id]
-			if !seen || replacedRun(target.runID, s.RunID) {
-				var busy bool
-				var err error
-				s, busy, err = waitStart(dir, s)
-				if os.IsNotExist(err) {
-					return false, nil
-				}
-				if err != nil {
-					return false, err
-				}
-				target = start{runID: s.RunID, floor: s.Finished, busy: busy, outcome: s.CompletedStatus}
-				starts[id] = target
+			key, err := jobDirectoryKey(dir)
+			if errors.Is(err, os.ErrNotExist) {
+				return false, false, nil
+			}
+			if err != nil {
+				return false, false, err
 			}
 			before := baseline[id]
+			job := jobs[dir]
+			if job != nil && key != job.key {
+				closeBestEffort(job.jobStateObserver)
+				closeBestEffort(job.mail)
+				delete(jobs, dir)
+				job = nil
+			}
+			if job == nil {
+				var from stateCursor
+				if before.StateCursor != "" {
+					from, err = parseCursor(before.StateCursor)
+					if err != nil {
+						return false, false, err
+					}
+				}
+				observer, err := openJobObservation(dir, from, before.RunID)
+				if err != nil {
+					return false, false, err
+				}
+				if baseline != nil && (before.RunID == "" || before.RunID == observer.s.RunID) {
+					observer.floor = &status{RunID: observer.s.RunID, Finished: before.Finished}
+					observer.watchWithdrawals = before.StateCursor != ""
+					observer.deliveredWithdrawals = before.Withdrawals
+				}
+				job = &observedJob{jobStateObserver: observer, key: key, anchor: observer.tail.Cursor()}
+				jobs[dir] = job
+			}
+			job.seen = scan
+			if err := job.read(); err != nil {
+				return false, false, err
+			}
+			if job.s.State == "" {
+				return false, false, nil
+			}
+			if (project != "" && p != project) || (session != "" && job.s.Session != session) {
+				return true, false, nil
+			}
+			if err := job.project(ctx); errors.Is(err, os.ErrNotExist) {
+				return false, false, nil
+			} else if err != nil {
+				return true, false, err
+			}
+			s := job.s
+			if !job.started || replacedRun(job.floor.runID, s.RunID) {
+				busy, err := waitStart(job.jobStateObserver)
+				if errors.Is(err, os.ErrNotExist) {
+					return false, false, nil
+				}
+				if err != nil {
+					return true, false, err
+				}
+				s = job.s
+				job.floor = waitFloor{s.RunID, s.Finished, busy}
+				job.started = true
+				job.outbox = 0
+				var from stateCursor
+				if before.RunID == s.RunID && before.OutboxCursor != "" {
+					from, err = parseCursor(before.OutboxCursor)
+					if err != nil {
+						return true, false, err
+					}
+				}
+				if s.Engine != "cmd" {
+					closeBestEffort(job.mail)
+					job.mail, err = openOutboxTail(dir, from)
+					if err != nil {
+						return true, false, err
+					}
+				}
+			}
 			if replacedRun(before.RunID, s.RunID) {
 				before = waitCursor{}
 			}
-			now := waitCursor{OutboxSeq: s.OutboxSeq, RunID: s.RunID, Finished: before.Finished}
-			if isTerminal(s.State) {
-				now.Terminal = s.State
-			}
-			terminal := now.Terminal != "" && now.Terminal != before.Terminal
-			blocked := target.busy && s.Finished <= target.floor
-			// An explicit close of a job whose turns were already reported (or predate this wait) ends it
-			// without new information: not an event. Failure-like terminal states still wake the waiter.
-			if terminal && now.Terminal == "done" && s.Finished > 0 && s.Finished <= max(before.Finished, target.floor) {
-				terminal = false
-			}
-			question := s.State == "waiting_input" && (!blocked || s.InputKind != "next_turn")
-			mail := now.OutboxSeq > before.OutboxSeq
-			if mail && sinceFile == "" {
-				var err error
-				mail, err = claimNotice(dir, fmt.Sprintf("outbox-%d", now.OutboxSeq))
-				if err != nil {
-					return false, err
-				}
-			}
-			if question {
-				now.Question = questionKey(s)
-				if sinceFile == "" {
-					fresh, err := claimQuestion(dir, s)
-					if err != nil || (!fresh && !mail) {
-						return false, err
+			job.outbox = max(job.outbox, before.OutboxSeq)
+			if job.mail != nil {
+				err = readMailTail(job.mail, job.outbox, func(m agentMail) error {
+					if m.RunID != s.RunID {
+						return errJobReplaced
 					}
-				} else if now.Question == before.Question && !mail {
-					return false, nil
+					job.outbox = m.Seq
+					return nil
+				})
+				if err != nil {
+					if !s.final || !errors.Is(err, errLogDamage) {
+						return true, false, err
+					}
+					// A published job-level failure remains observable even when
+					// the damaged mailbox cannot establish an outbox event.
+					job.outbox = before.OutboxSeq
 				}
 			}
-			completion := !blocked && s.Finished > before.Finished
-			if !mail && !question && !completion && !terminal {
-				return false, nil
+			if err := job.identity.checkDir(dir); err != nil {
+				return true, false, err
 			}
-			if completion {
-				now.Finished = s.Finished
+			for {
+				report, next := waitEvent(s, before, job.anchor, job.cursor, job.outbox, job.floor, job.withdrawal, job.selected)
+				if report == nil {
+					return true, false, nil
+				}
+				if baseline != nil {
+					if report.Event == "outbox" {
+						next.OutboxCursor = job.mail.Cursor().String()
+					}
+					baseline[id] = next
+				} else if output != nil {
+					if report.Event == "queue" || report.Event == "question" || report.Event == "outbox" {
+						fresh, err := deliverNotice(ctx, dir, job.identity, report.EventID, true, func() error { return output(report) })
+						if err != nil {
+							return true, false, err
+						}
+						if !fresh {
+							before = next
+							if report.Event == "question" && s.InputKind == "next_turn" {
+								// The report asking for input already represents this turn for
+								// consumers without a separate completion cursor.
+								before.Finished = max(before.Finished, s.Finished)
+							}
+							continue
+						}
+					} else if err := output(report); err != nil {
+						return true, false, err
+					}
+				}
+				result = report
+				return true, true, nil
 			}
-			outcome := s.CompletedStatus
-			if blocked && (!terminal || outcome == target.outcome) {
-				outcome = ""
-			}
-			code := 0
-			if completion || terminal {
-				code, _ = outcomeResult(s.State, outcome)
-			}
-			if question {
-				code = 6
-			}
-			result = &waitReport{OutboxSeq: s.OutboxSeq, Project: s.Project, Job: s.Job, State: s.State, Outcome: outcome, Finished: s.Finished, Code: code}
-			key, cursor = id, now
-			return true, nil
 		})
 		if err != nil {
 			if ctx.Err() == nil {
-				return err
+				return nil, err
 			}
 			break
 		}
 		if result != nil {
-			if err := json.NewEncoder(out).Encode(result); err != nil {
-				return err
+			return result, nil
+		}
+		for dir, job := range jobs {
+			if job.seen != scan {
+				closeBestEffort(job.jobStateObserver)
+				closeBestEffort(job.mail)
+				delete(jobs, dir)
 			}
-			if sinceFile != "" {
-				baseline[key] = cursor
-				if err := writeJSON(sinceFile, baseline); err != nil {
-					return fmt.Errorf("write wait baseline: %w", err)
-				}
-			}
-			if result.Code == 6 {
-				return errQuestion
-			}
-			return nil
 		}
 		select {
 		case <-ctx.Done():
-		case <-tick.C:
+		case <-ticks:
 		}
 	}
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		return errObserveTimeout
+		return nil, errObserveTimeout
 	}
-	return ctx.Err()
+	return nil, ctx.Err()
+}
+
+func waitEvent(s status, before waitCursor, anchor, cursor stateCursor, outbox uint64, floor waitFloor, withdrawal *inboxAck, selected *turnCompletion) (*waitReport, waitCursor) {
+	next := before
+	next.RunID = s.RunID
+	next.StateCursor = anchor.String()
+	report := &waitReport{Project: s.Project, Job: s.Job, State: s.State, Finished: s.Finished}
+	switch {
+	case withdrawal != nil:
+		next.Withdrawals = append(next.Withdrawals, withdrawal.Seq)
+		report.Event = "withdrawal"
+		report.State = "withdrawn"
+		report.EventID = waitEventID(s.RunID, report.Event, withdrawal.ID)
+		report.Code, report.Outcome, report.Finished = 1, "interrupted", before.Finished
+		return report, next
+	case s.State == "queued" && s.QueueReason != "" && s.QueueGeneration != before.QueueGeneration:
+		next.QueueGeneration = s.QueueGeneration
+		report.Event = "queue"
+		report.EventID = queueEventID(s)
+		report.Code, report.QueueReason = exitQueued, s.QueueReason
+		return report, next
+	}
+	blocked := floor.busy && s.Finished <= floor.finished
+	if s.State == "waiting_input" && (!blocked || s.InputKind != "next_turn") {
+		key := questionKey(s)
+		if key != before.Question {
+			next.Question = key
+			report.Event, report.EventID, report.Code = "question", key, 6
+			return report, next
+		}
+	}
+	if s.Engine == "cmd" {
+		// The command's completion and process exit are one terminal event.
+		selected = nil
+	} else if selected == nil && !blocked && s.Finished > before.Finished && (s.LastCompleted != "" || s.Engine == "") {
+		completion := completedTurn(s)
+		selected = &completion
+	}
+	if selected != nil {
+		next.Finished = selected.Number
+		if selected.Number == s.Finished {
+			next.StateCursor = cursor.String()
+		}
+		report.Event = "completion"
+		if s.State == "queued" || s.final {
+			report.State = "completed"
+		}
+		report.EventID = waitEventID(s.RunID, report.Event, fmt.Sprintf("%d/%s", selected.Number, selected.TurnID))
+		report.Finished, report.Outcome = selected.Number, selected.Outcome
+		report.Code, _ = outcomeResult("", selected.Outcome)
+		return report, next
+	}
+	if s.final {
+		key := fmt.Sprintf("%s/%d", s.State, s.Restarts)
+		// Closing after the already observed turns carries no new result.
+		quietClose := s.Engine != "cmd" && s.State == "done" && s.Finished > 0 && s.Finished <= max(before.Finished, floor.finished)
+		if key != before.Terminal && !quietClose {
+			next.Terminal = key
+			next.StateCursor = cursor.String()
+			report.Event = "terminal"
+			report.EventID = waitEventID(s.RunID, report.Event, key)
+			if s.Engine == "cmd" {
+				next.Finished = s.Finished
+				report.Outcome = s.CompletedStatus
+			}
+			report.Code, _ = outcomeResult(s.State, report.Outcome)
+			return report, next
+		}
+	}
+	if outbox > before.OutboxSeq {
+		next.OutboxSeq = outbox
+		report.Event = "outbox"
+		if s.State == "queued" {
+			report.State = "outbox"
+		}
+		report.EventID = waitEventID(s.RunID, report.Event, strconv.FormatUint(outbox, 10))
+		report.OutboxSeq = outbox
+		return report, next
+	}
+	return nil, before
 }
 
 func replacedRun(before, now string) bool {
@@ -189,16 +405,74 @@ func questionKey(s status) string {
 	}
 	return fmt.Sprintf("%x", sha256.Sum256([]byte(key)))
 }
-func claimQuestion(dir string, s status) (bool, error) {
-	return claimNotice(dir, "question-"+questionKey(s))
+func waitEventID(runID, kind, identity string) string {
+	return fmt.Sprintf("%x", sha256.Sum256(fmt.Appendf(nil, "%q/%q/%q", runID, kind, identity)))
 }
-func claimNotice(dir, name string) (bool, error) {
-	f, err := os.OpenFile(filepath.Join(dir, "inbox", "done", name), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
-	if os.IsExist(err) {
-		return false, nil
+
+func queueEventID(s status) string {
+	return waitEventID(s.RunID, "queue", strconv.FormatUint(s.QueueGeneration, 10))
+}
+
+func confirmWaitNotice(ctx context.Context, dir string, identity jobIdentity, eventID string) error {
+	if _, err := hex.DecodeString(eventID); len(eventID) != sha256.Size*2 || err != nil {
+		return errors.New("invalid wait event identity")
 	}
+	_, err := deliverNotice(ctx, dir, identity, eventID, true, func() error { return nil })
+	return err
+}
+
+// Serialize emitters outside the job directory. A failed output leaves the
+// notification available. Check identity under the inbox lock before looking
+// at the marker and before writing it, since detach takes that same lock.
+func deliverNotice(ctx context.Context, dir string, identity jobIdentity, eventID string, acknowledge bool, output func() error) (bool, error) {
+	guard, err := lockUntil(ctx, mailboxLockPath(dir, "notices"))
 	if err != nil {
 		return false, err
 	}
-	return true, f.Close()
+	defer closeBestEffort(guard)
+	folder := filepath.Join(dir, ".notices")
+	path := filepath.Join(folder, eventID)
+	underInbox := func(fn func() error) error {
+		inbox, err := lockMailbox(ctx, mailboxLockPath(dir, "inbox"))
+		if err != nil {
+			return err
+		}
+		defer closeBestEffort(inbox)
+		s, _, err := loadJobStatus(dir)
+		if err != nil {
+			return err
+		}
+		if err = identity.check(dir, s); err != nil {
+			return err
+		}
+		return fn()
+	}
+	var exists bool
+	err = underInbox(func() error {
+		_, err := os.Lstat(path)
+		exists = err == nil
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	})
+	if err != nil || exists {
+		return false, err
+	}
+	if err := output(); err != nil {
+		return false, err
+	}
+	if !acknowledge {
+		return true, nil
+	}
+	err = underInbox(func() error {
+		if err := os.Mkdir(folder, 0700); err != nil && !os.IsExist(err) {
+			return err
+		}
+		if err := writeJobBytes(path, nil); err != nil {
+			return err
+		}
+		return syncJobTree(folder, dir)
+	})
+	return true, err
 }

@@ -24,10 +24,10 @@ type ctlOptions struct {
 	env                                                                map[string]string
 	project, session, tag, cwd, dir, host                              string
 	engine, model, effort, sandbox, role, parent                       string
-	batch, snapshot, history, previous, input, image, profile          string
+	batch, snapshot, history, previous, input, profile                 string
 	quiet, timeout, idle, turnLimit, approval, stall, queue            string
 	turn, sinceTurn, cursor, since, kind, mention, repo, script, shell string
-	hosts, channels, sets, argv, pos                                   []string
+	hosts, channels, sets, argv, pos, images                           []string
 	interval                                                           time.Duration
 	max                                                                int
 	cleanBase, all, explicitSession                                    bool
@@ -56,7 +56,7 @@ func ctlFlags(op string, o *ctlOptions) *flag.FlagSet {
 		"sandbox": &o.sandbox, "role": &o.role, "parent": &o.parent,
 		"batch": &o.batch, "snapshot": &o.snapshot, "with-history": &o.history,
 		"profile": &o.profile, "dir": &o.dir, "continue": &o.previous, "input-json": &o.input,
-		"image": &o.image, "idle-exit": &o.idle, "turn-timeout": &o.turnLimit,
+		"idle-exit": &o.idle, "turn-timeout": &o.turnLimit,
 		"approval-timeout": &o.approval, "stall": &o.stall, "queue-timeout": &o.queue,
 		"script": &o.script, "shell": &o.shell, "project": &o.project,
 		"session": &o.session, "tag": &o.tag, "cwd": &o.cwd,
@@ -111,6 +111,8 @@ func ctlFlags(op string, o *ctlOptions) *flag.FlagSet {
 			})
 		case "set":
 			f.Func(k, ctlFlagHelp(op, k), func(v string) error { o.sets = append(o.sets, v); return nil })
+		case "image":
+			f.Func(k, ctlFlagHelp(op, k), func(v string) error { o.images = append(o.images, v); return nil })
 		default:
 			panic("unregistered flag " + k)
 		}
@@ -521,24 +523,37 @@ func controller(ctx context.Context, a []string) error {
 }
 func waitOne(ctx context.Context, h endpoint, host, id string, limit time.Duration) error {
 	deadline := time.Now().Add(limit)
+	marker, seen, cacheErr := resultMarkerSnapshot(host, id)
 	r, e := h.call(ctx, limit+2*time.Second, "observe-one", id, limit.String())
 	if e != nil {
 		return e
 	}
-	// A completed turn or terminal state: collect its result inside the same budget so a
-	// following `cx result` reads the local cache instead of returning 12 (collecting).
-	switch r.code {
-	case 0, 1, 3, 4, 5:
-		prefetchCtx, cancel := context.WithDeadline(ctx, deadline)
-		prefetchResult(prefetchCtx, h, host, id)
-		cancel()
+	if r.code == exitQueued {
+		return printQueuedWait(ctx, h, id, r)
 	}
-	// The node appends its terminal snapshot to the ordinary wait diagnostic.
+	if r.code == 6 {
+		var notice waitObservation
+		if e = json.Unmarshal(r.data, &notice); e != nil {
+			return e
+		}
+		if _, e = fmt.Printf("job=%s status=waiting_input input_kind=%s\n", notice.Job, notice.InputKind); e != nil {
+			return e
+		}
+		return acknowledgeWait(ctx, h, id, notice, r.code)
+	}
+	// The node appends the observation to the ordinary wait diagnostic.
 	first, last, ok := bytes.Cut(r.data, []byte("\n{"))
 	if ok {
-		var s status
+		var s waitObservation
 		if e = json.Unmarshal(append([]byte("{"), last...), &s); e != nil {
 			return e
+		}
+		if cacheErr == nil && s.Result != nil {
+			defer func() {
+				prefetchCtx, cancel := context.WithDeadline(ctx, deadline)
+				defer cancel()
+				prefetchResult(prefetchCtx, h, host, id, marker, seen, *s.Result)
+			}()
 		}
 		if isTerminal(s.State) {
 			fmt.Printf("job=%s status=%s completed_turn=%s outcome=%s", s.Job, s.State, s.LastCompleted, s.CompletedStatus)
@@ -546,11 +561,35 @@ func waitOne(ctx context.Context, h endpoint, host, id string, limit time.Durati
 				fmt.Printf(" exit_code=%d", *s.ExitCode)
 			}
 			fmt.Println()
-			return resultCode(s, r.code)
+			return resultCode(s.status, r.code)
 		}
 		r.data = append(first, '\n')
 	}
 	return r.output()
+}
+
+func printQueuedWait(ctx context.Context, h endpoint, id string, r reply) error {
+	var notice waitObservation
+	if err := json.Unmarshal(r.data, &notice); err != nil || notice.State != "queued" {
+		return r.output()
+	}
+	row := notice
+	row.NoticeKey = ""
+	if err := json.NewEncoder(os.Stdout).Encode(row); err != nil {
+		return err
+	}
+	return acknowledgeWait(ctx, h, id, notice, r.code)
+}
+
+func acknowledgeWait(ctx context.Context, h endpoint, id string, notice waitObservation, code int) error {
+	r, err := h.call(ctx, 5*time.Second, "wait-ack", id, notice.RunID, notice.NoticeKey, notice.EventID)
+	if err != nil {
+		return err
+	}
+	if r.code != 0 {
+		return r.output()
+	}
+	return ctlExit(code)
 }
 func observation(s string) (time.Duration, error) {
 	if s == "" {

@@ -17,11 +17,63 @@ import (
 	"reflect"
 	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
 
 type controllerFixture struct{ home, cx, python string }
+
+func TestCommandInputCancelsWindowsStdin(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows console and inherited pipe")
+	}
+	const child = "CX_TEST_WINDOWS_STDIN"
+	if kind := os.Getenv(child); kind != "" {
+		if kind == "console" {
+			in, e := os.Open("CONIN$")
+			if e != nil {
+				t.Fatal(e)
+			}
+			defer closeBestEffort(in)
+			os.Stdin = in
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+		defer cancel()
+		if _, e := io.ReadAll(commandInput{ctx: ctx}); !errors.Is(e, context.DeadlineExceeded) {
+			t.Fatalf("cancel %s stdin: %v", kind, e)
+		}
+		return
+	}
+	for _, kind := range []string{"pipe", "console"} {
+		t.Run(kind, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestCommandInputCancelsWindowsStdin$")
+			cmd.Env = append(os.Environ(), child+"="+kind)
+			if kind == "pipe" {
+				r, w, e := os.Pipe()
+				if e != nil {
+					t.Fatal(e)
+				}
+				defer closeBestEffort(r)
+				defer closeBestEffort(w)
+				cmd.Stdin = r
+			} else {
+				// Give the child a private console without showing a window.
+				// SysProcAttr only exposes these fields in Windows builds.
+				const createNewConsole = 0x00000010
+				cmd.SysProcAttr = new(syscall.SysProcAttr)
+				attr := reflect.ValueOf(cmd.SysProcAttr).Elem()
+				attr.FieldByName("CreationFlags").SetUint(createNewConsole)
+				attr.FieldByName("HideWindow").SetBool(true)
+			}
+			if out, e := cmd.CombinedOutput(); e != nil {
+				t.Fatalf("%s stdin child: %v: %s", kind, e, out)
+			}
+		})
+	}
+}
 
 func newControllerFixture(t *testing.T) controllerFixture {
 	t.Helper()
@@ -47,6 +99,7 @@ func newControllerFixture(t *testing.T) controllerFixture {
 	for k, v := range map[string]string{"HOME": dir, "CXRUN_STATE": state, "CX_HOME": dir, "CX_PROJECT": "p", "CX_HOSTS": "local", "CXRUN_BIN": filepath.Join(dir, "cxrun"), "PYTHONDONTWRITEBYTECODE": "1", "GORACE": "atexit_sleep_ms=1", "CX_CHAT_LOCAL_ROOT": ""} {
 		t.Setenv(k, v)
 	}
+	joinFixtureWorkers(t, dir)
 	return controllerFixture{dir, filepath.Join(dir, "cx"), py}
 }
 func cliOutput(t *testing.T, code int, stdin []byte, exe string, args ...string) []byte {
@@ -80,7 +133,7 @@ func cliStreams(t *testing.T, code int, stdin []byte, exe string, args ...string
 	}
 	return b, diag.String()
 }
-func TestB1PythonContract(t *testing.T) {
+func TestB1CommandContract(t *testing.T) {
 	f := newControllerFixture(t)
 	if f.python == "" {
 		t.Log("cx-control.py unavailable: skipping controller output and exit-code comparisons")
@@ -106,7 +159,8 @@ func TestB1PythonContract(t *testing.T) {
 					t.Fatalf("Go output %q: %v", got, err)
 				}
 			}
-			if f.python == "" {
+			// The Python controller uses a separate node storage format.
+			if f.python == "" || tc.args[0] != "host" {
 				return
 			}
 			want := cliOutput(t, 0, nil, "python3", append([]string{f.python}, tc.args...)...)
@@ -131,27 +185,15 @@ func TestB1PythonContract(t *testing.T) {
 	t.Setenv("PATH", f.home+string(os.PathListSeparator)+os.Getenv("PATH"))
 	for _, args := range [][]string{{"wait", "--any", "--project", "p", "--timeout", "2s"}, {"overview", "--project", "p", "--json"}} {
 		got := cliOutput(t, 0, nil, f.cx, args...)
-		var a, b fields
+		var a fields
 		if err := json.Unmarshal(got, &a); err != nil {
 			t.Fatalf("Go output %q: %v", got, err)
 		}
-		if f.python == "" {
-			continue
+		if args[0] == "wait" && (a["job"] != "sample" || a["status"] != "done") {
+			t.Fatalf("wait --any: %s", got)
 		}
-		want := cliOutput(t, 0, nil, "python3", append([]string{f.python}, args...)...)
-		if json.Unmarshal(want, &b) != nil {
-			t.Fatalf("%s != %s", got, want)
-		}
-		if args[0] == "overview" {
-			ga := a["local"].(map[string]any)
-			gb := b["local"].(map[string]any)
-			for _, k := range []string{"load1", "memory_available_bytes", "disk_free_bytes", "cpu_usage_percent"} {
-				delete(ga, k)
-				delete(gb, k)
-			}
-		}
-		if !reflect.DeepEqual(a, b) {
-			t.Fatalf("%v: %s != %s", args, got, want)
+		if args[0] == "overview" && a["local"] == nil {
+			t.Fatalf("missing local node: %s", got)
 		}
 	}
 	if b := cliOutput(t, 0, nil, f.cx, a...); len(b) != 0 {
@@ -371,7 +413,9 @@ func TestB1ConnectionAndProgressClocks(t *testing.T) {
 	}{
 		{"slow handshake", "echo proxy-banner >&2; sleep .6; echo connected; sleep .1; echo done", false},
 		{"active transfer", "for i in 1 2 3 4 5; do echo data; sleep .1; done", false},
-		{"silent node", "printf 'cx-wire: ready\n' >&2; exec sleep 3", true},
+		// This process exits before the connection deadline. Only the idle clock
+		// can interrupt it.
+		{"silent node", "printf 'cx-wire: ready\n' >&2; exec sleep 1.1", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			// The idle budget leaves room for process exit and reaping on slow CI runners;
@@ -380,7 +424,7 @@ func TestB1ConnectionAndProgressClocks(t *testing.T) {
 			defer stop()
 			cmd := exec.CommandContext(ctx, "/bin/sh", "-c", tc.script)
 			e := runActive(cmd, stop, 2*time.Second, 400*time.Millisecond, io.Discard, io.Discard)
-			if errors.Is(e, context.DeadlineExceeded) != tc.expired || !tc.expired && e != nil {
+			if errors.Is(e, errWireSilence) != tc.expired || !tc.expired && e != nil {
 				t.Fatal(e)
 			}
 		})
@@ -417,5 +461,97 @@ func TestB1RawCursorAndFullJSON(t *testing.T) {
 		if (obj.Report == payload+"\n") != tc.full {
 			t.Fatal("incorrect report preview")
 		}
+	}
+}
+
+func TestB1HostsEmitCompletedQueries(t *testing.T) {
+	f := newControllerFixture(t)
+	config := filepath.Join(f.home, ".config", "cx")
+	if err := os.MkdirAll(config, 0700); err != nil {
+		t.Fatal(err)
+	}
+	hosts := "[hosts.slow]\nssh='slow'\n[hosts.fast]\nssh='fast'\n[hosts.failed]\nssh='failed'\n"
+	if err := os.WriteFile(filepath.Join(config, "hosts.toml"), []byte(hosts), 0600); err != nil {
+		t.Fatal(err)
+	}
+	release := filepath.Join(f.home, "release-slow")
+	script := `#!/bin/sh
+set -eu
+while test "$1" != --; do shift; done
+case "$2" in
+slow)
+  i=0
+  while test "$i" -lt 300; do
+    if test -f "$CX_HOSTS_FIXTURE_RELEASE"; then
+      printf '{"cpu_cores":1}\n'
+      exit 0
+    fi
+    i=$((i+1))
+    sleep .02
+  done
+  exit 99
+  ;;
+fast) printf '{"cpu_cores":2}\n' ;;
+failed) printf '{"raw":"unattributed node output"}\n'; exit 7 ;;
+*) exit 98 ;;
+esac
+`
+	if err := os.WriteFile(filepath.Join(f.home, "ssh"), []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", f.home+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("CX_HOSTS", "slow,fast,failed")
+	t.Setenv("CX_HOSTS_FIXTURE_RELEASE", release)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, f.cx, "hosts")
+	cmd.WaitDelay = time.Second
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if cmd.ProcessState == nil {
+			_ = os.WriteFile(release, nil, 0600)
+			cancel()
+			_ = cmd.Wait()
+		}
+	}()
+	lines := bufio.NewScanner(stdout)
+	read := func() fields {
+		t.Helper()
+		if !lines.Scan() {
+			t.Fatalf("missing host row: %v, %v", lines.Err(), ctx.Err())
+		}
+		var row fields
+		if err := json.Unmarshal(lines.Bytes(), &row); err != nil {
+			t.Fatalf("invalid host row %q: %v", lines.Text(), err)
+		}
+		return row
+	}
+	first := map[string]fields{}
+	for range 2 {
+		row := read()
+		host, _ := row["host"].(string)
+		first[host] = row
+	}
+	if first["fast"]["cpu_cores"] != float64(2) || first["failed"]["error"] != "exit 7" || len(first["failed"]) != 2 {
+		t.Fatalf("unexpected rows before releasing the slow host: %v", first)
+	}
+	if err := os.WriteFile(release, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if slow := read(); slow["host"] != "slow" || slow["cpu_cores"] != float64(1) {
+		t.Fatalf("unexpected slow host row: %v", slow)
+	}
+	if lines.Scan() || lines.Err() != nil {
+		t.Fatalf("unexpected extra output %q: %v", lines.Text(), lines.Err())
+	}
+	if err := cmd.Wait(); cmd.ProcessState.ExitCode() != 7 {
+		t.Fatalf("hosts exit code: %v", err)
 	}
 }

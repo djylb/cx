@@ -86,7 +86,7 @@ For a configured SSH host, replace `local` with its cx alias. Snapshot jobs may 
 | `say JOB TEXT`, `interrupt JOB`, `resume JOB`, `close JOB` | Send input or manage an agent's lifecycle. |
 | `result JOB`, `patch JOB`, `apply JOB`, `rebase JOB TEXT`, `clean JOB` | Retrieve, inspect, apply, retry against fresh inputs, or clean up. |
 
-Use `HOST:project/tag` to address a known job directly from another controller. See the [agent guide](docs/agent-guide.md) for command syntax, session grouping, and Codex controls. Every command accepts `-h`/`--help`.
+Use `HOST:project/tag` to address a known job directly from another controller. See the [agent guide](docs/agent-guide.md) for command syntax, session grouping, and engine controls. Every command accepts `-h`/`--help`.
 
 ## Exit codes
 
@@ -106,6 +106,7 @@ These codes describe the observation or operation. A command process that exits 
 | 10 | `apply` wrote changes, then failed to read Git status. Check the worktree before retrying. |
 | 11 | A node observation could not find a registered job. |
 | 12 | Result collection is in progress. Retry or use `result --wait`. |
+| 13 | `wait` or `agent` observed an admission block. Stdout is JSON with `status: "queued"` and `queue_reason`. |
 | 44 | The requested result is unavailable. Check the job and turn. |
 | 124 | Observation timed out. The job keeps running. |
 

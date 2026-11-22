@@ -25,7 +25,7 @@ func snapManifest(store, id string) (Manifest, []byte, error) {
 	if !snapHex(id, 64) {
 		return m, nil, errors.New("invalid snapshot ID")
 	}
-	b, e := readStateFile(filepath.Join(store, "manifests", id+".json"))
+	b, e := readSharedFile(filepath.Join(store, "manifests", id+".json"))
 	if e != nil {
 		return m, nil, e
 	}
@@ -122,7 +122,7 @@ func snapArchive(ctx context.Context, store, id, receipts, dst string, full bool
 		oids := groups[k]
 		var old []string
 		if !full {
-			if prior, readErr := readStateFile(filepath.Join(receipts, k)); readErr == nil {
+			if prior, readErr := readSharedFile(filepath.Join(receipts, k)); readErr == nil {
 				if prev, _, manifestErr := snapManifest(store, string(prior)); manifestErr == nil {
 					old = snapGroups(prev)[k]
 				}
@@ -195,12 +195,16 @@ func writeSnapshotArchive(dst io.Writer, dir string, members []string) (err erro
 	return nil
 }
 func snapImport(ctx context.Context, store, id, packet string) error {
+	return snapImportWithSync(ctx, store, id, packet, syncSnapshotRepo)
+}
+
+func snapImportWithSync(ctx context.Context, store, id, packet string, syncRepo func(string) error) error {
 	tmp, e := os.MkdirTemp(store, ".import-")
 	if e != nil {
 		return e
 	}
 	defer removeTreeBestEffort(tmp)
-	f, e := os.Open(packet)
+	f, e := openJobFile(packet, jobFileRead)
 	if e != nil {
 		return e
 	}
@@ -225,7 +229,7 @@ func snapImport(ctx context.Context, store, id, packet string) error {
 			return extractErr
 		}
 	}
-	raw, e := readStateFile(filepath.Join(tmp, "manifest.json"))
+	raw, e := readSharedFile(filepath.Join(tmp, "manifest.json"))
 	if e != nil {
 		return e
 	}
@@ -254,7 +258,7 @@ func snapImport(ctx context.Context, store, id, packet string) error {
 			continue
 		}
 		delete(groups, r.key())
-		if e = snapImportGroup(ctx, store, tmp, r, oids); e != nil {
+		if e = snapImportGroup(ctx, store, tmp, r, oids, syncRepo); e != nil {
 			return e
 		}
 	}
@@ -264,9 +268,10 @@ func snapImport(ctx context.Context, store, id, packet string) error {
 			return e
 		}
 	}
-	return snapImmutable(filepath.Join(store, "manifests", id+".json"), raw)
+	return publishImmutable(filepath.Join(store, "manifests", id+".json"), raw, filepath.Dir(store))
 }
-func snapImportGroup(ctx context.Context, store, tmp string, r SnapshotRepo, oids []string) error {
+
+func snapImportGroup(ctx context.Context, store, tmp string, r SnapshotRepo, oids []string, syncRepo func(string) error) error {
 	bare := r.bare(store)
 	if e := os.MkdirAll(filepath.Dir(bare), 0700); e != nil {
 		return e
@@ -277,14 +282,8 @@ func snapImportGroup(ctx context.Context, store, tmp string, r SnapshotRepo, oid
 	}
 	defer closeBestEffort(lock)
 	g := snapGit{ctx: ctx, dir: bare}
-	if _, e = os.Stat(bare); os.IsNotExist(e) {
-		format := "sha1"
-		if len(r.OID) == 64 {
-			format = "sha256"
-		}
-		if _, e = (snapGit{ctx: ctx, dir: tmp}).get("init", "-q", "--bare", "--object-format="+format, bare); e != nil {
-			return e
-		}
+	if e = initSnapshotBare(snapGit{ctx: ctx, dir: tmp}, r, bare); e != nil {
+		return e
 	}
 	if len(r.Shallow) > 0 {
 		if e = snapImmutable(filepath.Join(bare, "shallow"), []byte(strings.Join(r.Shallow, "\n")+"\n")); e != nil {
@@ -299,7 +298,7 @@ func snapImportGroup(ctx context.Context, store, tmp string, r SnapshotRepo, oid
 	} else if !os.IsNotExist(e) {
 		return e
 	}
-	if _, e = g.get(append([]string{"fsck", "--connectivity-only", "--no-dangling", "--no-reflogs"}, oids...)...); e != nil {
+	if e = snapVerifyObjects(g, oids); e != nil {
 		return e
 	}
 	var refs strings.Builder
@@ -317,8 +316,58 @@ func snapImportGroup(ctx context.Context, store, tmp string, r SnapshotRepo, oid
 		refs.WriteString(oid)
 		refs.WriteByte('\n')
 	}
-	_, e = g.input([]byte(refs.String()), "update-ref", "--stdin")
-	return e
+	if _, e = g.input([]byte(refs.String()), "update-ref", "--stdin"); e != nil {
+		return e
+	}
+	return syncRepo(bare)
+}
+
+func initSnapshotBare(g snapGit, r SnapshotRepo, bare string) error {
+	for _, name := range []string{"HEAD", "config", "objects", "refs"} {
+		if _, err := os.Stat(filepath.Join(bare, name)); os.IsNotExist(err) {
+			format := "sha1"
+			if len(r.OID) == 64 {
+				format = "sha256"
+			}
+			_, err := g.get("init", "-q", "--bare", "--object-format="+format, bare)
+			return err
+		} else if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func syncSnapshotRepo(bare string) error {
+	return syncSnapshotRepoWith(bare, syncJobFile, syncJobDir)
+}
+
+// Object packs, loose objects and refs live on the snapshot store volume.
+// Flush their files and directory entries before acknowledging the import.
+// The caller holds the bare repository lock throughout.
+func syncSnapshotRepoWith(bare string, syncFile func(*os.File) error, syncDir func(string) error) error {
+	syncPath := func(path string) error { return syncSnapshotFile(path, syncFile) }
+	for _, name := range []string{"objects", "refs"} {
+		if err := syncFileTree(filepath.Join(bare, name), syncDir, syncPath); err != nil {
+			return err
+		}
+	}
+	for _, name := range []string{"HEAD", "config", "shallow", "packed-refs"} {
+		err := syncPath(filepath.Join(bare, name))
+		if err != nil && !(os.IsNotExist(err) && (name == "shallow" || name == "packed-refs")) {
+			return err
+		}
+	}
+	// bare is <store>/repos/<id>.git. Persist the creation of the store too.
+	parent := filepath.Dir(filepath.Dir(filepath.Dir(bare)))
+	for dir := bare; ; dir = filepath.Dir(dir) {
+		if err := syncDir(dir); err != nil {
+			return err
+		}
+		if dir == parent {
+			return nil
+		}
+	}
 }
 
 // ReceiveSnapshot reads a snapshot packet. Its first stdout line is the durable
@@ -339,13 +388,7 @@ func ReceiveSnapshot(ctx context.Context, args []string) error {
 	if e != nil {
 		return e
 	}
-	// This node invocation owns stdin. Closing it unblocks a silent SSH pipe.
-	in := interruptibleStdin()
-	stop := context.AfterFunc(ctx, func() { _ = in.Close() })
-	defer stop()
-	watchdog := time.AfterFunc(idle, func() { _ = in.Close() })
-	defer watchdog.Stop()
-	return snapReceiveAt(ctx, store, args, snapActiveReader{in, watchdog, idle}, os.Stdout)
+	return snapReceiveAt(ctx, store, args, commandInput{ctx, idle}, os.Stdout)
 }
 func snapReceiveAt(ctx context.Context, store string, args []string, input io.Reader, reply io.Writer) error {
 	if len(args) != 3 || !snapHex(args[0], 64) || !snapHex(args[1], 64) {
@@ -365,10 +408,10 @@ func snapReceiveAt(ctx context.Context, store string, args []string, input io.Re
 		return e
 	}
 	defer closeBestEffort(lock)
-	if _, _, e = snapManifest(store, id); e == nil {
+	if ready, err := snapshotAvailable(ctx, store, id); err != nil {
+		return err
+	} else if ready {
 		_, e = fmt.Fprintln(reply, "done")
-		return e
-	} else if !os.IsNotExist(e) {
 		return e
 	}
 	p := filepath.Join(dir, args[1]+".part")
@@ -407,7 +450,7 @@ func receivePacket(p, digest string, size int64, input io.Reader, reply io.Write
 	if n < size {
 		z, streamErr := gzip.NewReader(input)
 		if streamErr != nil {
-			return streamErr
+			return receivePacketStreamError(streamErr)
 		}
 		defer closeBestEffort(z)
 		last := time.Time{}
@@ -420,7 +463,7 @@ func receivePacket(p, digest string, size int64, input io.Reader, reply io.Write
 		w := io.MultiWriter(f, &receiveProgress{}, meter)
 		written, streamErr := io.Copy(w, io.LimitReader(z, size-n+1))
 		if streamErr != nil {
-			return streamErr
+			return receivePacketStreamError(streamErr)
 		}
 		if written != size-n {
 			return fmt.Errorf("incomplete snapshot payload: got %d, expected %d", written, size-n)
@@ -438,6 +481,14 @@ func receivePacket(p, digest string, size int64, input io.Reader, reply io.Write
 		return errors.New("archive checksum mismatch")
 	}
 	return nil
+}
+
+func receivePacketStreamError(err error) error {
+	if errors.Is(err, context.DeadlineExceeded) {
+		diagnosticf("cx: receive packet: %v\n", err)
+		return errors.Join(ctlExit(9), err)
+	}
+	return err
 }
 
 type snapAck struct {
@@ -479,9 +530,9 @@ func snapSend(ctx context.Context, hub endpoint, args []string, p string, progre
 	return sendPacket(ctx, hub, append(append([]string{"snap-receive"}, args...), idle.String()), p, progress, idle)
 }
 func sendPacket(ctx context.Context, hub endpoint, args []string, p string, progress func(int64), idle time.Duration) error {
-	ctx, cancel := context.WithCancel(ctx)
+	attempt, cancel := context.WithCancel(ctx)
 	defer cancel()
-	cmd, e := hub.command(ctx, args)
+	cmd, e := hub.transportCommand(attempt, args, idle)
 	if e != nil {
 		return e
 	}
@@ -496,7 +547,7 @@ func sendPacket(ctx context.Context, hub endpoint, args []string, p string, prog
 	done := make(chan error, 1)
 	var diag bytes.Buffer
 	go func() {
-		err := runActive(cmd, cancel, hub.connectionBudget(idle), idle, a, &diag)
+		err := cmd.run(ctx, cancel, a, &diag)
 		_ = rd.Close()
 		done <- err
 	}()
@@ -563,13 +614,13 @@ func Publish(ctx context.Context, hub endpoint, sid SnapshotID, progress func(in
 		if hub.State != "" {
 			target = filepath.Join(hub.State, "snapshot")
 		}
-		if _, _, err := snapManifest(target, id); err == nil {
+		if ready, err := snapshotAvailable(ctx, target, id); err != nil {
+			return err
+		} else if ready {
 			if progress != nil {
 				progress(0)
 			}
 			return nil
-		} else if !os.IsNotExist(err) {
-			return err
 		}
 	}
 	dest, _ := json.Marshal(hub)
@@ -648,6 +699,15 @@ func (w *snapProgress) Write(b []byte) (int, error) {
 }
 
 func snapVerifyRepo(g snapGit, r SnapshotRepo) error {
+	if len(r.Shallow) > 0 {
+		boundary, err := readSharedFile(filepath.Join(g.dir, "shallow"))
+		if err != nil {
+			return err
+		}
+		if string(boundary) != strings.Join(r.Shallow, "\n")+"\n" {
+			return errors.New("snapshot shallow boundary mismatch")
+		}
+	}
 	for _, oid := range []string{r.OID, r.Base} {
 		if oid == "" {
 			continue
@@ -685,19 +745,46 @@ func snapVerifyRepo(g snapGit, r SnapshotRepo) error {
 	return nil
 }
 
-type snapActiveReader struct {
-	io.Reader
-	timer *time.Timer
-	idle  time.Duration
+func snapVerifyObjects(g snapGit, oids []string) error {
+	_, err := g.get(append([]string{"rev-list", "--quiet", "--objects", "--missing=error"}, oids...)...)
+	return err
 }
 
-func (r snapActiveReader) Read(b []byte) (int, error) {
-	n, e := r.Reader.Read(b)
-	if n > 0 {
-		r.timer.Reset(r.idle)
+func validateSnapshotRepos(ctx context.Context, store string, m Manifest) error {
+	groups := snapGroups(m)
+	for _, r := range m.Repositories {
+		g := snapGit{ctx: ctx, dir: r.bare(store)}
+		if err := snapVerifyRepo(g, r); err != nil {
+			return err
+		}
+		if oids := groups[r.key()]; len(oids) > 0 {
+			if err := snapVerifyObjects(g, oids); err != nil {
+				return err
+			}
+			delete(groups, r.key())
+		}
 	}
-	return n, e
+	return nil
 }
+
+// An immutable manifest can survive damage to its bare repository. A fresh
+// publication repairs the repository using the same manifest and object IDs.
+func snapshotAvailable(ctx context.Context, store, id string) (bool, error) {
+	m, _, err := snapManifest(store, id)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if err := validateSnapshotRepos(ctx, store, m); err != nil {
+		return false, ctx.Err()
+	}
+	// Confirm a manifest made visible by an importer which exited before
+	// its last directory flush. The Git dependencies preceded the link.
+	return true, syncJobTree(filepath.Join(store, "manifests"), filepath.Dir(store))
+}
+
 func snapIdle() (time.Duration, error) {
 	return transferSetting("CX_PUBLISH_IDLE", 120*time.Second, false)
 }

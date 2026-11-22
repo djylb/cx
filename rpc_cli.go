@@ -21,7 +21,8 @@ type options struct {
 	opID, params, method                           string
 	request, result, rpcErr, answers               string
 	scope, model, effort, target, delivery, before string
-	thread, turn, input, since, image, through     string
+	thread, turn, input, since, through            string
+	images                                         []string
 	generation                                     uint64
 }
 
@@ -36,11 +37,14 @@ func (o *options) flags(fs *flag.FlagSet, op string) {
 		{&o.request, "request", "reply say"}, {&o.result, "result", "reply"}, {&o.rpcErr, "error", "reply"}, {&o.answers, "answers", "say"},
 		{&o.target, "target", "review"}, {&o.delivery, "delivery", "review"}, {&o.before, "before", "undo"}, {&o.scope, "scope", "settings"}, {&o.model, "model", "settings"}, {&o.effort, "effort", "settings"},
 		{&o.method, "method", "events"}, {&o.thread, "thread", "events plan diff history"}, {&o.turn, "turn", "events plan diff history"}, {&o.since, "since", "events plan diff"},
-		{&o.input, "input-json", "start say"}, {&o.image, "image", "start say"}, {&o.through, "through", "fork"},
+		{&o.input, "input-json", "start say"}, {&o.through, "through", "fork"},
 	} {
 		if strings.Contains(" "+f.ops+" ", " "+op+" ") {
 			fs.StringVar(f.p, f.name, "", f.name)
 		}
+	}
+	if op == "start" || op == "say" {
+		fs.Func("image", "attach an image file (repeatable)", func(v string) error { o.images = append(o.images, v); return nil })
 	}
 	if op == "reply" || op == "say" {
 		fs.Uint64Var(&o.generation, "generation", 0, "expected connection generation")
@@ -50,7 +54,7 @@ func rawArg(v string) (json.RawMessage, error) {
 	b := []byte(v)
 	var err error
 	if strings.HasPrefix(v, "@") {
-		b, err = readStateFile(v[1:])
+		b, err = readSharedFile(v[1:])
 		if err != nil {
 			return nil, err
 		}
@@ -75,8 +79,8 @@ func (o *options) inputs(text string) ([]json.RawMessage, error) {
 		b, _ := json.Marshal(fields{"type": "text", "text": text})
 		a = append([]json.RawMessage{b}, a...)
 	}
-	if o.image != "" {
-		path, err := filepath.Abs(o.image)
+	for _, image := range o.images {
+		path, err := filepath.Abs(image)
 		if err != nil {
 			return nil, err
 		}
@@ -116,8 +120,8 @@ func (o *options) dispatch(ctx context.Context, dir, op string, args []string) (
 	if op != "say" && op != "reply" && op != "requests" && op != "rpc" && op != "settings" && op != "mcp" && aliases[op] == "" {
 		return false, nil
 	}
-	var s status
-	if err := readJSON(filepath.Join(dir, "status.json"), &s); err != nil {
+	identity, s, _, err := captureJobIdentity(dir)
+	if err != nil {
 		return true, err
 	}
 	if op == "requests" {
@@ -126,38 +130,53 @@ func (o *options) dispatch(ctx context.Context, dir, op string, args []string) (
 		}
 		return true, json.NewEncoder(os.Stdout).Encode(s.Approvals)
 	}
-	if op == "say" && o.request == "" && o.answers == "" && s.InputKind != "server_request" {
+	var original *envelope
+	if (op == "reply" || op == "say") && o.opID != "" {
+		original, err = publishedReply(dir, o.opID)
+		if err != nil {
+			return true, err
+		}
+	}
+	if op == "say" && original == nil && o.request == "" && o.answers == "" && s.InputKind != "server_request" {
 		return false, nil
 	}
 	e := envelope{Version: 1, Kind: "call"}
 	if op == "reply" || op == "say" {
 		e.Kind = "reply"
 		e.Generation = o.generation
-		if e.Generation == 0 {
-			e.Generation = s.Generation
-		}
 		var matched *approval
-		for i, a := range s.Approvals {
-			if op == "say" && !inputMethod(a.Method) {
-				continue
+		if original != nil {
+			if !matchesRequest(original.Request, o.request) {
+				return true, errors.New("op-id reused with a different request")
 			}
-			raw := string(a.ID)
-			var str string
-			if o.request != "" && raw != o.request && (json.Unmarshal(a.ID, &str) != nil || str != o.request) {
-				continue
+			e.Method, e.Request, e.Question = original.Method, original.Request, original.Question
+			if e.Generation == 0 {
+				e.Generation = original.Generation
 			}
-			if matched != nil {
-				return true, errors.New("ambiguous request ID")
+		} else {
+			if e.Generation == 0 {
+				e.Generation = s.Generation
 			}
-			matched = &s.Approvals[i]
+			for i, a := range s.Approvals {
+				if (op == "say" && !inputMethod(a.Method)) || !matchesRequest(a.ID, o.request) {
+					continue
+				}
+				if matched != nil {
+					return true, errors.New("ambiguous request ID")
+				}
+				matched = &s.Approvals[i]
+			}
+			if matched == nil {
+				return true, errors.New("no matching pending request")
+			}
+			e.Method, e.Request = matched.Method, matched.ID
+			if matched.Method == "item/tool/requestUserInput" && len(matched.Questions) == 1 {
+				e.Question = matched.Questions[0].ID
+			}
 		}
-		if matched == nil {
-			return true, errors.New("no matching pending request")
-		}
-		e.Request = matched.ID
 		var err error
 		switch {
-		case matched.Method == agentAsk && op == "say" && len(args) == 1 && o.answers == "":
+		case e.Method == agentAsk && op == "say" && len(args) == 1 && o.answers == "":
 			text := args[0]
 			if strings.HasPrefix(text, "@") {
 				text, err = readInputText(text[1:])
@@ -172,12 +191,12 @@ func (o *options) dispatch(ctx context.Context, dir, op string, args []string) (
 			e.Result, err = rawArg(o.result)
 		case o.answers != "":
 			e.Result, err = rawArg(o.answers)
-		case op == "say" && len(args) == 1 && matched.Method == "item/tool/requestUserInput" && len(matched.Questions) == 1:
+		case op == "say" && len(args) == 1 && e.Method == "item/tool/requestUserInput" && e.Question != "":
 			text := args[0]
 			if strings.HasPrefix(text, "@") {
 				text, err = readInputText(text[1:])
 			}
-			e.Result, _ = json.Marshal(fields{"answers": fields{matched.Questions[0].ID: fields{"answers": []string{text}}}})
+			e.Result, _ = json.Marshal(fields{"answers": fields{e.Question: fields{"answers": []string{text}}}})
 		default:
 			return true, errors.New("supply an explicit reply payload")
 		}
@@ -199,7 +218,7 @@ func (o *options) dispatch(ctx context.Context, dir, op string, args []string) (
 					return true, err
 				}
 			}
-			return true, o.publish(ctx, dir, s, e)
+			return true, o.publish(ctx, dir, identity, e)
 		}
 		if len(args) > 0 {
 			key += " " + strings.Join(args, " ")
@@ -268,9 +287,30 @@ func (o *options) dispatch(ctx context.Context, dir, op string, args []string) (
 		}
 		e.Params, _ = json.Marshal(p)
 	}
-	return true, o.publish(ctx, dir, s, e)
+	return true, o.publish(ctx, dir, identity, e)
 }
-func (o *options) publish(ctx context.Context, dir string, s status, e envelope) error {
+func matchesRequest(id json.RawMessage, option string) bool {
+	var decoded string
+	return option == "" || string(id) == option || (json.Unmarshal(id, &decoded) == nil && decoded == option)
+}
+
+func publishedReply(dir, id string) (*envelope, error) {
+	inbox := filepath.Join(dir, "inbox")
+	record, err := findMailboxID(inbox, filepath.Join(inbox, ".ids", snapSum([]byte(id))), id)
+	if err != nil || record.Kind != "rpc" {
+		return nil, err
+	}
+	var original envelope
+	if err := json.Unmarshal(record.Value, &original); err != nil {
+		return nil, err
+	}
+	if original.Kind != "reply" {
+		return nil, nil
+	}
+	return &original, nil
+}
+
+func (o *options) publish(ctx context.Context, dir string, identity jobIdentity, e envelope) error {
 	id := o.opID
 	if id == "" {
 		var b [16]byte
@@ -282,58 +322,84 @@ func (o *options) publish(ctx context.Context, dir string, s status, e envelope)
 	if _, err := jobPath(dir, id); err != nil {
 		return err
 	}
-	path := filepath.Join(dir, "inbox", id+".rpc")
-	out := filepath.Join(dir, "outbox", id+".json")
-	ctx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+	if id == initialForkOp {
+		return errors.New("operation ID is reserved")
+	}
+	ctx, cancel := context.WithTimeout(ctx, rpcLimit)
 	defer cancel()
-	lock, err := lockUntil(ctx, filepath.Join(dir, "inbox", ".rpc-publish.lock"))
+	record, err := newRecord("rpc", e)
 	if err != nil {
 		return err
 	}
-	err = func() error {
-		defer closeBestEffort(lock)
-		for _, sub := range []string{"", "pending", "done", "uncertain"} {
-			var old envelope
-			readErr := readJSON(filepath.Join(dir, "inbox", sub, id+".rpc"), &old)
-			if os.IsNotExist(readErr) {
-				continue
-			}
-			if readErr != nil {
-				return readErr
-			}
-			a, _ := json.Marshal(old)
-			b, _ := json.Marshal(e)
-			if string(a) != string(b) {
-				return errors.New("op-id reused with different payload")
-			}
+	record.ID = id
+	if _, err = appendJobMailbox(ctx, dir, "inbox", &identity, record, func(_ *stateRecord, previous stateRecord, s status) error {
+		if previous.Seq != 0 {
 			return nil
 		}
-		if isTerminal(s.State) || s.Engine == "cmd" {
-			return errors.New("RPC requires a live Codex job")
-		}
-		return writeJSON(path, e)
-	}()
-	if err != nil {
-		return err
-	}
-	for {
-		var res rpcReceipt
-		if err = readJSON(out, &res); err == nil {
-			if err = json.NewEncoder(os.Stdout).Encode(res); err != nil {
-				return err
-			}
-			if res.Error != nil {
-				return res.Error
-			}
-			return nil
-		} else if !os.IsNotExist(err) {
+
+		eng, err := liveAgentEngine(s)
+		if err != nil {
 			return err
 		}
-		if err = pause(ctx, 60*time.Millisecond); err != nil {
-			return fmt.Errorf("rpcReceipt %s: %w", id, err)
+		if !eng.caps().RPC {
+			return eng.unsupported("engine RPC")
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	receipt, err := waitReceipt(ctx, dir, identity, func(record receiptRecord) bool { return record.Op == id })
+	if err != nil {
+		return fmt.Errorf("RPC receipt %s: %w", id, err)
+	}
+	res := rpcReceipt{Op: receipt.Op, State: receipt.Status, Result: receipt.Answer,
+		Error: receipt.Error, Generation: receipt.Generation}
+	if err := json.NewEncoder(os.Stdout).Encode(res); err != nil {
+		return err
+	}
+	if res.Error != nil {
+		return res.Error
+	}
+	return nil
+}
+
+func waitReceipt(ctx context.Context, dir string, identity jobIdentity, match func(receiptRecord) bool) (receiptRecord, error) {
+	tail, err := openStateTail(dir, stateCursor{})
+	if err != nil {
+		return receiptRecord{}, err
+	}
+	defer closeBestEffort(tail)
+	for {
+		if err := identity.checkDir(dir); err != nil {
+			return receiptRecord{}, err
+		}
+		records, err := tail.Next()
+		if err != nil {
+			return receiptRecord{}, err
+		}
+		if err := identity.checkDir(dir); err != nil {
+			return receiptRecord{}, err
+		}
+		for _, record := range records {
+			if record.Kind == "receipt" {
+				var receipt receiptRecord
+				if err := json.Unmarshal(record.Value, &receipt); err != nil {
+					return receiptRecord{}, err
+				}
+				if match(receipt) {
+					return receipt, nil
+				}
+			}
+		}
+		if len(records) != 0 && records[len(records)-1].Final {
+			return receiptRecord{}, errors.New("job ended before receipt")
+		}
+		if err := pause(ctx, 60*time.Millisecond); err != nil {
+			return receiptRecord{}, err
 		}
 	}
 }
+
 func (o *options) events(dir, op string) error {
 	var since uint64
 	if o.since != "" {
@@ -346,14 +412,14 @@ func (o *options) events(dir, op string) error {
 	if op != "events" {
 		o.method = "turn/" + op + "/updated"
 		if o.thread == "" {
-			var s status
-			if err := readJSON(filepath.Join(dir, "status.json"), &s); err != nil {
+			s, _, err := loadJobStatus(dir)
+			if err != nil {
 				return err
 			}
 			o.thread = s.Thread
 		}
 	}
-	f, err := openShared(filepath.Join(dir, "events.jsonl"))
+	f, err := openJobFile(filepath.Join(dir, "events.jsonl"), jobFileRead)
 	if err != nil {
 		return err
 	}
@@ -400,13 +466,6 @@ func (o *options) events(dir, op string) error {
 }
 
 func structuredSay(dir string, o options, args []string) error {
-	var s status
-	if err := readJSON(filepath.Join(dir, "status.json"), &s); err != nil {
-		return err
-	}
-	if s.Engine == "cmd" || isTerminal(s.State) {
-		return errors.New("input requires a live Codex job")
-	}
 	text := ""
 	if len(args) > 1 {
 		return errors.New("expected at most one text argument")
@@ -436,7 +495,7 @@ func structuredSay(dir string, o options, args []string) error {
 		}
 		name = strings.TrimSuffix(v, ".msg") + ".input.msg"
 	}
-	if err = writeJSON(filepath.Join(dir, "inbox", name), input); err != nil {
+	if err = publishMessage(context.Background(), dir, name, inboxMessage{Input: input}); err != nil {
 		return err
 	}
 	fmt.Println(name)

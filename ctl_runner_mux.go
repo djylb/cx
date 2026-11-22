@@ -24,10 +24,7 @@ func runMuxWorker(ctx context.Context, path string) error {
 	if e := readJSON(path, &spec); e != nil {
 		return e
 	}
-	if e := os.Remove(path); e != nil {
-		return e
-	}
-	f, e := os.OpenFile(spec.Log, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	f, e := openJobFile(spec.Log, jobFileAppendCreate)
 	if e != nil {
 		return e
 	}
@@ -38,29 +35,49 @@ func runMuxWorker(ctx context.Context, path string) error {
 			return e
 		}
 	}
-	return runNode(ctx, spec.Args, true)
-}
-func launchMuxRunner(ctx context.Context, root, exe, dir, work string, argv []string, env map[string]string, resume bool) error {
-	var before status
-	if resume {
-		if e := readJSON(filepath.Join(dir, "status.json"), &before); e != nil {
-			return e
+	err := runNode(ctx, spec.Args, true)
+	var rejection string
+	switch {
+	case errors.Is(err, errJobOwnerBusy):
+		rejection = "owner-busy"
+	case errors.Is(err, errJobReplaced):
+		rejection = "job-replaced"
+	}
+	if rejection != "" {
+		// The launcher can already have removed this launch's directory.
+		if writeErr := writeJobBytes(path+".rejected", []byte(rejection)); !os.IsNotExist(writeErr) {
+			return errors.Join(err, writeErr)
 		}
 	}
+	return err
+}
+func launchMuxRunner(ctx context.Context, root, exe, dir, work string, argv []string, env map[string]string, runID, token string, release func()) error {
 	var nonce [12]byte
 	if _, e := rand.Read(nonce[:]); e != nil {
 		return e
 	}
 	session := fmt.Sprintf("cx-%x", nonce)
-	path := filepath.Join(work, "."+session+".json")
+	attempts := filepath.Join(work, ".cx-launches")
+	// A previous launcher may still be waiting for its acknowledgement.
+	// Each attempt owns its descriptor and removes it after waiting.
+	attempt := filepath.Join(attempts, session)
+	if err := os.MkdirAll(attempt, 0700); err != nil {
+		return err
+	}
+	defer func() { _ = os.RemoveAll(attempt) }()
+	path := filepath.Join(attempt, "worker.json")
 	// The session belongs to the existing psmux server, which may have
 	// started with a different CXRUN_STATE than this request.
 	workerEnv := make(map[string]string, len(env)+1)
 	maps.Copy(workerEnv, env)
 	workerEnv["CXRUN_STATE"] = root
 	spec := muxLaunch{Args: argv, Env: workerEnv, Log: filepath.Join(work, "launch.log")}
-	if e := writeJSON(path, spec); e != nil {
-		return e
+	data, err := json.Marshal(spec)
+	if err != nil {
+		return err
+	}
+	if err = snapImmutable(path, data); err != nil {
+		return err
 	}
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
@@ -70,17 +87,6 @@ func launchMuxRunner(ctx context.Context, root, exe, dir, work string, argv []st
 	if e := cmd.Run(); e != nil {
 		return errors.Join(e, ctx.Err())
 	}
-	for {
-		var s status
-		e := readJSON(filepath.Join(dir, "status.json"), &s)
-		if e == nil && (!resume || s.LastEvent.After(before.LastEvent) || s.PID != 0 && !isTerminal(s.State)) {
-			return json.NewEncoder(os.Stdout).Encode(s)
-		}
-		if e != nil && !os.IsNotExist(e) {
-			return e
-		}
-		if e = pause(ctx, 30*time.Millisecond); e != nil {
-			return fmt.Errorf("runner acknowledgement: %w", e)
-		}
-	}
+	release()
+	return awaitRunner(ctx, dir, runID, token, 0, nil, path+".rejected")
 }

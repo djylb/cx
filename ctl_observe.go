@@ -30,7 +30,7 @@ func mergeSubmissionRows(ctx context.Context, host, filter string, o ctlOptions,
 		return nil, err
 	}
 	projects, err := os.ReadDir(root)
-	if os.IsNotExist(err) {
+	if errors.Is(err, os.ErrNotExist) {
 		return rows, nil
 	}
 	if err != nil {
@@ -469,7 +469,7 @@ func ctlWaitAny(ctx context.Context, hs endpoints, o ctlOptions) error {
 			return e
 		}
 		var since int64
-		if e = readJSON(cursorPath, &since); e != nil && !os.IsNotExist(e) {
+		if e = readJSON(cursorPath, &since); e != nil && !errors.Is(e, os.ErrNotExist) {
 			return e
 		}
 		h, root, centerErr := channelCenter(hs)
@@ -491,8 +491,11 @@ func ctlWaitAny(ctx context.Context, hs endpoints, o ctlOptions) error {
 				Channel string `json:"channel"`
 				Project string `json:"project"`
 				channelRow
-				Code int `json:"code"`
-			}{channelRow: rows[0], Channel: channel, Project: p}
+				Code    int    `json:"code"`
+				Event   string `json:"event"`
+				EventID string `json:"event_id"`
+			}{channelRow: rows[0], Channel: channel, Project: p, Event: "chat",
+				EventID: waitEventID(p, "chat", fmt.Sprintf("%s/%d", key, rows[0].Seq))}
 			b, channelErr := json.Marshal(fields{"row": row, "cursor": rows[0].Seq})
 			return reply{data: b}, channelErr
 		})
@@ -504,11 +507,14 @@ func ctlWaitAny(ctx context.Context, hs endpoints, o ctlOptions) error {
 			return hostErr
 		}
 		file := filepath.Join(filepath.Dir(path), name+".json")
-		b, hostErr := readStateFile(file)
+		b, hostErr := readSharedFile(file)
 		if os.IsNotExist(hostErr) {
 			b = []byte("{}")
 		} else if hostErr != nil {
 			return hostErr
+		}
+		if _, hostErr = decodeWaitBaseline(b); hostErr != nil {
+			return fmt.Errorf("%s: %w", name, hostErr)
 		}
 		start(name, func() (reply, error) {
 			for ctx.Err() == nil {
@@ -543,6 +549,9 @@ func ctlWaitAny(ctx context.Context, hs endpoints, o ctlOptions) error {
 		}
 		file := chatFiles[v.name]
 		if file == "" {
+			if _, e = decodeWaitBaseline(report.Cursor); e != nil {
+				return fmt.Errorf("%s: %w", v.name, e)
+			}
 			report.Row["host"] = v.name
 			file = filepath.Join(filepath.Dir(path), v.name+".json")
 		}

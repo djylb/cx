@@ -14,7 +14,7 @@ func (c *config) nudgeText(fallback string) string {
 }
 
 // errStalled ends the runner after the last escalation step failed (status "stalled").
-var errStalled = errors.New("stalled: no progress after steer, interrupt and app-server restart")
+var errStalled = errors.New("stalled: no progress after steer, interrupt and engine restart")
 
 func isTerminal(state string) bool {
 	_, ok := terminalCodes[state]
@@ -23,7 +23,7 @@ func isTerminal(state string) bool {
 
 // watchdog escalates when a running turn produces no app-server event for --stall (longer while a command item
 // is in progress): 1 steer, 2 interrupt + new turn, 3 kill the app-server tree, resume the thread + new turn,
-// 4 stop with status stalled. Progress after an action resets the count. Every step is logged and in status.json.
+// 4 stop with status stalled. Progress after an action resets the count. Every step is logged and in the state log.
 func (r *runner) watchdog() error {
 	if r.c.Stall <= 0 || !r.active() || len(r.s.Approvals) > 0 {
 		return nil
@@ -58,21 +58,17 @@ func (r *runner) watchdog() error {
 		r.pending = r.c.nudgeText(defaultContinue)
 		err = r.interrupt()
 	case 3:
-		act = "restart app-server, resume thread, continue"
-		if r.s.Restarts >= r.c.RestartLimit {
+		act = r.c.driver().restartAction()
+		if r.s.EngineRestarts >= r.c.RestartLimit {
 			return errStalled
 		}
 		r.s.Restarts++
+		r.s.EngineRestarts++
 		if err = r.save(); err != nil {
 			return err
 		}
 		r.pending = r.c.nudgeText(defaultContinue)
-		if r.claude != nil {
-			r.claude.interrupt()
-		} else {
-			err = r.restartServer()
-		}
-		if err != nil {
+		if err = r.c.driver().restart(r); err != nil {
 			return errors.Join(errStalled, err)
 		}
 	default:
@@ -125,7 +121,7 @@ func (r *runner) restartServer() error {
 		return err
 	}
 	r.srv = srv
-	r.s.ServerPID = srv.cmd.Process.Pid
+	r.s.EnginePID = srv.cmd.Process.Pid
 	if err = r.save(); err != nil {
 		return err
 	}

@@ -27,23 +27,23 @@ var ctlCommands = map[string]ctlCommand{
 	"chat-wait":    {"CHANNEL", "Wait for matching channel messages.", "since cursor timeout mention max-bytes"},
 	"clean":        {"JOB", "Remove a terminal job's private state.", ""},
 	"close":        {"JOB", "Close a job and release its private checkout when unused.", ""},
-	"compact":      {"JOB", "Compact the Codex thread.", ""},
+	"compact":      {"JOB", "Compact the agent thread.", ""},
 	"deny":         {"JOB", "Deny a pending request.", ""},
 	"diff":         {"JOB", "Read recorded diff events.", ""},
 	"doctor":       {"[HOST ...]", "Check execution hosts.", "json"},
 	"events":       {"JOB", "Read recorded events.", ""},
 	"exec":         {"HOST [options] -- ARGV...\n  cx exec HOST --script FILE [--shell SHELL] [options]", "Submit a command job.", "project tag cwd timeout quiet-timeout queue-timeout wait session script shell reuse env profile"},
-	"fork":         {"JOB --job CHILD [--through TURN] [--profile NAME]", "Fork a Codex thread on its current host.", ""},
+	"fork":         {"JOB --job CHILD [--through TURN] [--profile NAME]", "Fork an agent thread on its current host.", ""},
 	"gate":         {"DIR [GATE-ARGS ...]", "Run the source directory's scripts/gate.sh.", ""},
-	"history":      {"JOB [read|turns|items]", "Read Codex thread history.", ""},
+	"history":      {"JOB [read|turns|items]", "Read agent thread history.", ""},
 	"host":         {"HOST", "Read or update node configuration.", "set"},
 	"hosts":        {"[HOST]", "Print current execution host facts.", ""},
 	"interrupt":    {"JOB", "Stop an active turn or command.", ""},
-	"limits":       {"JOB", "Read Codex account rate limits.", ""},
+	"limits":       {"JOB", "Read the engine account's rate limits.", ""},
 	"ls":           {"[JOB]", "List jobs.", "json watch interval project session role all all-hosts max-bytes"},
-	"mcp":          {"JOB list|reload|login|resource|call", "Call a Codex MCP operation.", ""},
+	"mcp":          {"JOB list|reload|login|resource|call", "Call an engine MCP operation.", ""},
 	"mirror":       {"[DIR | --project PROJECT]", "Publish a source baseline.", "project"},
-	"models":       {"JOB", "List available Codex models.", ""},
+	"models":       {"JOB", "List the engine's available models.", ""},
 	"node":         {"COMMAND [ARGS ...]", "Run an execution-node command.", ""},
 	"outbox":       {"JOB [--since N]\n  cx outbox --any [--project PROJECT] [--since N]", "Read job messages after a sequence.", "any project since"},
 	"overview":     {"", "Summarize jobs and project channels.", "json project session all max-bytes"},
@@ -54,26 +54,26 @@ var ctlCommands = map[string]ctlCommand{
 	"project-ls":   {"", "List configured projects.", ""},
 	"project-show": {"NAME", "Print project configuration.", ""},
 	"rebase":       {"JOB TEXT", "Submit a follow-up to resolve patch conflicts.", ""},
-	"reply":        {"JOB [--request ID] (--result JSON|@FILE | --error JSON|@FILE)", "Reply to a Codex request.", ""},
-	"requests":     {"JOB", "List pending Codex requests.", ""},
+	"reply":        {"JOB [--request ID] (--result JSON|@FILE | --error JSON|@FILE)", "Reply to a pending engine request.", ""},
+	"requests":     {"JOB", "List pending engine requests.", ""},
 	"result":       {"JOB", "Collect a sealed turn's report, JSON metadata, or full log.", "turn full json log wait refresh max-bytes"},
-	"resume":       {"JOB [--profile NAME]", "Restart a recoverable Codex job.", ""},
-	"review":       {"JOB --target JSON|@FILE", "Start a Codex review.", ""},
-	"rpc":          {"JOB METHOD", "Invoke a Codex RPC method.", ""},
+	"resume":       {"JOB [--profile NAME]", "Restart a recoverable agent job.", ""},
+	"review":       {"JOB --target JSON|@FILE", "Start an engine review.", ""},
+	"rpc":          {"JOB METHOD", "Invoke an engine RPC method.", ""},
 	"run":          {"HOST DIR TAG PROMPTFILE [options]\n  cx run HOST DIR TAG --cmd [options] -- ARGV...\n  cx run HOST DIR --batch FILE [options]", "Submit an agent or command job.", submitFlags + " batch cmd reuse timeout quiet-timeout"},
 	"say":          {"JOB [TEXT|@FILE]", "Send input or a reply to a job.", ""},
-	"settings":     {"JOB --scope turn|thread [--model MODEL] [--effort EFFORT]", "Update Codex turn or thread settings.", ""},
+	"settings":     {"JOB --scope turn|thread [--model MODEL] [--effort EFFORT]", "Update agent turn or thread settings.", ""},
 	"setup":        {"HOST", "Install or update cx on an execution host.", ""},
 	"show":         {"JOB", "Show a job or turn summary.", "full json turn max-bytes"},
 	"snapshot":     {"DIR", "Freeze and publish a source snapshot.", "with-history"},
 	"status":       {"JOB", "Print the current job status.", "json"},
 	"tail":         {"JOB", "Follow job progress, agent messages or raw output.", "raw messages cursor since from-start timeout"},
 	"test":         {"[TEST-ARGS ...]", "Run the executable configured by CX_TEST_COMMAND.", ""},
-	"threads":      {"JOB [loaded]", "List Codex threads.", ""},
-	"undo":         {"JOB --before TURN", "Revert a Codex thread to before a turn.", ""},
-	"usage":        {"JOB", "Read Codex account usage.", ""},
+	"threads":      {"JOB [loaded]", "List agent threads.", ""},
+	"undo":         {"JOB --before TURN", "Revert an agent thread to before a turn.", ""},
+	"usage":        {"JOB", "Read the engine account's usage.", ""},
 	"version":      {"", "Print the cx version.", ""},
-	"wait":         {"JOB [--timeout DURATION]\n  cx wait --any [options]", "Wait for a turn, job, or matching message.", "any timeout host project session cursor chat all"},
+	"wait":         {"JOB [--timeout DURATION]\n  cx wait --any [options]", "Wait for a turn, job, admission block, or matching message.", "any timeout host project session cursor chat all"},
 }
 
 func cliFlags(name string) *flag.FlagSet {
@@ -115,7 +115,11 @@ func printCtlHelp(w io.Writer, op string) {
 	if cmd.flags != "" && !strings.Contains(cmd.usage, "[options]") {
 		_, _ = fmt.Fprint(w, " [options]")
 	}
-	_, _ = fmt.Fprintf(w, "\n\n%s\n\nOptions:\n  -h, --help\n    \tShow this help and exit.\n", cmd.summary)
+	summary := cmd.summary
+	if needs, ok := commandNeeds[op]; ok {
+		summary += "\nEngines: " + strings.Join(enginesWith(needs), ", ")
+	}
+	_, _ = fmt.Fprintf(w, "\n\n%s\n\nOptions:\n  -h, --help\n    \tShow this help and exit.\n", summary)
 
 	var o ctlOptions
 	f := ctlFlags(op, &o)
@@ -157,10 +161,17 @@ func printCtlHelp(w io.Writer, op string) {
 			}
 			_, _ = fmt.Fprintf(w, "  %d %s\n", terminalCodes[state], name)
 		}
-		_, _ = fmt.Fprintln(w, "  6 waiting for input\n  8 submission failed\n  9 transport failure\n  11 job registration not found\n  124 observation timeout\n  130 observation canceled")
+		_, _ = fmt.Fprintln(w, "  6 waiting for input\n  8 submission failed\n  9 transport failure\n  11 job registration not found")
+		if op == "wait" {
+			_, _ = fmt.Fprintf(w, "  %d admission blocked (JSON with status=queued and queue_reason)\n", exitQueued)
+			_, _ = fmt.Fprintln(w, "  Check stdout JSON status=queued to identify an admission block. A command can also exit 13.")
+			_, _ = fmt.Fprintln(w, "  wait --any delivers at least once. Reuse a cursor and deduplicate retries by event_id.")
+		}
+		_, _ = fmt.Fprintln(w, "  124 observation timeout\n  130 observation canceled")
 		_, _ = fmt.Fprintln(w, "  Command jobs can return the command's exit code.")
 	case "agent":
-		_, _ = fmt.Fprintln(w, "  1 failed turn\n  6 waiting for input\n  7 duplicate job\n  9 transport failure\n  44 result unavailable\n  124 observation timeout")
+		_, _ = fmt.Fprintf(w, "  1 failed turn\n  6 waiting for input\n  7 duplicate job\n  9 transport failure\n  %d admission blocked (JSON with status=queued and queue_reason)\n  44 result unavailable\n  124 observation timeout\n", exitQueued)
+		_, _ = fmt.Fprintln(w, "  Check stdout JSON status=queued to identify an admission block.")
 	case "run":
 		_, _ = fmt.Fprintln(w, "  7 duplicate job\n  9 transport failure")
 	case "result", "patch", "apply", "rebase":
@@ -196,17 +207,17 @@ var ctlFlagDescriptions = map[string]string{
 	"clean-base": "require a clean Git baseline", "cmd": "run command arguments after --",
 	"continue": "continue an existing `JOB`", "cwd": "remote working `DIR` (node default when unset)",
 	"dir": "source `DIR` (defaults to the current directory)", "effort": "reasoning `LEVEL` (engine default, or high with --hard)",
-	"engine": "agent `ENGINE`: codex (default) or claude", "env": "set `NAME=VALUE` (repeatable)",
+	"engine": "agent `ENGINE`: " + strings.Join(engineNames(), " or ") + " (default " + defaultEngine + ")", "env": "set `NAME=VALUE` (repeatable)",
 	"messages": "follow complete agent messages from the event log",
 	"force":    "bypass duplicate detection", "from-start": "follow from the beginning, resetting any saved cursor",
 	"full": "show full output", "hard": "use high reasoning effort",
 	"host":  "limit to one or more `HOST` values (repeatable, defaults to all configured hosts)",
-	"image": "attach image `FILE`", "inplace": "run in the original directory on local",
+	"image": "attach image `FILE` (repeatable; png, jpeg, gif or webp)", "inplace": "run in the original directory on local",
 	"input-json": "use structured input from `JSON|@FILE`", "interactive": "recognize input questions",
 	"interval": "seconds between watch polls (defaults to 1)",
 	"json":     "emit JSON", "mention": "wait for a mention of `NAME`",
 	"model": "agent `MODEL` (engine default)", "network": "enable sandbox network access (enabled by default with workspace-write)",
-	"no-network": "disable sandbox network access", "no-tools": "omit Codex job-scoped messaging tools",
+	"no-network": "disable sandbox network access", "no-tools": "omit the job-scoped messaging tools",
 	"parent":  "parent `JOB` or session (defaults to CX_PARENT, then current session)",
 	"project": "select `PROJECT`", "raw": "show raw job output", "refresh": "refresh the cached result",
 	"repo": "select repository `PATH`", "reuse": "reuse matching successful command output",

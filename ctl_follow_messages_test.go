@@ -17,7 +17,7 @@ func TestTailMessages(t *testing.T) {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeJSON(filepath.Join(dir, "status.json"), status{State: "done", Finished: 2}); err != nil {
+	if err := writeFixtureStatus(dir, status{State: "done", Finished: 2}); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "progress.log"), nil, 0600); err != nil {

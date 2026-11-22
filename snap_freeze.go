@@ -362,11 +362,7 @@ func snapCapture(ctx context.Context, repo, store, tmp, history string, isGit bo
 		return r, e
 	}
 	defer closeBestEffort(l)
-	if _, e = os.Stat(bare); os.IsNotExist(e) {
-		if _, e = g.get("init", "-q", "--bare", "--object-format="+format, bare); e != nil {
-			return r, e
-		}
-	} else if e != nil {
+	if e = initSnapshotBare(g, r, bare); e != nil {
 		return r, e
 	}
 	if len(r.Shallow) > 0 {
@@ -384,8 +380,10 @@ func snapCapture(ctx context.Context, repo, store, tmp, history string, isGit bo
 			fetch = append(fetch, ref+":"+ref)
 		}
 	}
-	_, e = (snapGit{ctx: ctx, dir: bare}).get(fetch...)
-	return r, e
+	if _, e = (snapGit{ctx: ctx, dir: bare}).get(fetch...); e != nil {
+		return r, e
+	}
+	return r, syncSnapshotRepo(bare)
 }
 func Freeze(ctx context.Context, src string, opts FreezeOptions) (SnapshotID, Manifest, error) {
 	var m Manifest
@@ -462,7 +460,7 @@ func Freeze(ctx context.Context, src string, opts FreezeOptions) (SnapshotID, Ma
 		return "", m, errors.New("inputs changed while freezing")
 	}
 	id := snapSum(a)
-	return SnapshotID(id), m, snapImmutable(filepath.Join(store, "manifests", id+".json"), a)
+	return SnapshotID(id), m, publishImmutable(filepath.Join(store, "manifests", id+".json"), a, filepath.Dir(store))
 }
 
 func snapMatches(raw []byte, oid string) bool {

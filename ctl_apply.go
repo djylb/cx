@@ -410,7 +410,7 @@ func mergeApplyTrees(g snapGit, ancestor, ours, theirs string) (tree string, sta
 }
 
 func applyTurn(ctx context.Context, dir, patchDir, id, host string, since int64, o ctlOptions, m turnResult) error {
-	origin, store, manifest, e := applyOrigin(dir, host, id)
+	origin, store, manifest, e := applyOrigin(dir)
 	if e != nil {
 		return e
 	}
@@ -570,7 +570,7 @@ func outputProject(p string) (string, error) {
 	return dir, os.MkdirAll(dir, 0700)
 }
 
-func applyOrigin(dir, host, id string) (submissionOrigin, string, Manifest, error) {
+func applyOrigin(dir string) (submissionOrigin, string, Manifest, error) {
 	var origin submissionOrigin
 	var m Manifest
 	e := readJSON(filepath.Join(filepath.Dir(filepath.Dir(dir)), "origin.json"), &origin)
@@ -578,44 +578,7 @@ func applyOrigin(dir, host, id string) (submissionOrigin, string, Manifest, erro
 	if err != nil {
 		return origin, "", m, err
 	}
-	if os.IsNotExist(e) {
-		route, routeErr := legacyRouteFile(id)
-		if routeErr != nil {
-			return origin, "", m, routeErr
-		}
-		var old struct {
-			Host, Source, Parent, Role string
-			Rerun                      map[string]any
-			Snapshot                   SnapshotID `json:"snapshot_id"`
-			Command                    bool       `json:"command_job"`
-		}
-		if routeErr = readJSON(route, &old); routeErr != nil {
-			return origin, "", m, routeErr
-		}
-		if old.Host != host {
-			return origin, "", m, errors.New("job route differs from result host")
-		}
-		origin.Source, origin.Snapshot, origin.Command = old.Source, old.Snapshot, old.Command
-		origin.Role, origin.Parent = old.Role, old.Parent
-		origin.History, _ = old.Rerun["with_history"].(string)
-		origin.CleanBase, _ = old.Rerun["clean_base"].(bool)
-		for _, key := range []string{"engine", "model", "effort", "sandbox", "idle_exit", "turn_timeout", "approval_timeout", "stall", "queue_timeout"} {
-			if v, ok := old.Rerun[key].(string); ok && v != "" {
-				origin.JobOptions = append(origin.JobOptions, "--"+strings.ReplaceAll(key, "_", "-"), v)
-			}
-		}
-		for _, key := range []string{"network", "web_search", "interactive", "hard"} {
-			if old.Rerun[key] == true {
-				origin.JobOptions = append(origin.JobOptions, "--"+strings.ReplaceAll(key, "_", "-"))
-			}
-		}
-		if old.Rerun["no_tools"] != true && old.Rerun["engine"] != "claude" {
-			origin.JobOptions = append(origin.JobOptions, "--job-tools")
-		}
-		if _, statErr := os.Stat(filepath.Join(store, "manifests", string(old.Snapshot)+".json")); os.IsNotExist(statErr) {
-			store = filepath.Join(os.Getenv("CX_HOME"), "out", "snapshot")
-		}
-	} else if e != nil {
+	if e != nil {
 		return origin, "", m, e
 	}
 	if origin.Snapshot == "" {

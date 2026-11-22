@@ -222,7 +222,7 @@ func forwardMessage(id, number string) error {
 		return e
 	}
 	var s status
-	if e = readJSON(filepath.Join(dir, "status.json"), &s); e != nil {
+	if e = loadJobStatusInto(dir, &s); e != nil {
 		return e
 	}
 	work, e := workDir(dir, s)

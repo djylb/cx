@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -51,7 +50,7 @@ func hostSettings(ctx context.Context, root string, sets []string, init bool) er
 	}
 	// Preserve extension fields and explicit slot overrides in existing files.
 	var obj fields
-	b, e := readStateFile(dst)
+	b, e := readSharedFile(dst)
 	if os.IsNotExist(e) {
 		obj = fields{"load_cmd": h.LoadCmd, "slots": h.Slots}
 	} else if e != nil {
@@ -112,7 +111,7 @@ func hostSettings(ctx context.Context, root string, sets []string, init bool) er
 	return json.NewEncoder(os.Stdout).Encode(obj)
 }
 func writeProbe(dir string) bool {
-	f, e := os.CreateTemp(dir, ".cx-probe-")
+	f, e := createJobTemp(dir, ".cx-probe-")
 	if e != nil {
 		return false
 	}
@@ -126,17 +125,9 @@ func doctorNode(ctx context.Context, root string) error {
 		mux, socket = psmuxSettings(root)
 		f["psmux_session"] = probe(ctx, mux, "-L", socket, "list-sessions") != ""
 	}
-	for _, tool := range []string{"git", "ssh", mux, "codex", "claude"} {
+	for _, tool := range []string{"git", "ssh", mux} {
 		p, _ := exec.LookPath(tool)
 		f[tool] = stringOrNil(p)
-	}
-	var login struct {
-		LoggedIn bool `json:"loggedIn"`
-	}
-	if json.Unmarshal([]byte(probe(ctx, "claude", "auth", "status", "--json")), &login) == nil {
-		f["claude_logged_in"] = login.LoggedIn
-	} else {
-		f["claude_logged_in"] = nil
 	}
 	if exe, e := os.Executable(); e == nil {
 		sum, e := fileHash(exe)
@@ -152,6 +143,20 @@ func doctorNode(ctx context.Context, root string) error {
 	}
 	f["state_root"] = root
 	f["state_writable"] = writeProbe(root)
+	local, diskErr := stateDiskLocal(diskPath(root))
+	f["state_local"] = local
+	if diskErr != nil {
+		f["state_disk_error"] = diskErr.Error()
+	} else if !local {
+		f["state_disk_error"] = "job state requires a local volume"
+	}
+	if runtime.GOOS == "windows" && local {
+		indexErr := markStateNotIndexed(root)
+		f["state_not_content_indexed"] = indexErr == nil
+		if indexErr != nil {
+			f["state_index_error"] = indexErr.Error()
+		}
+	}
 	if runtime.GOOS == "linux" {
 		f["state_owner_uid"] = stringOrNil(probe(ctx, "stat", "-c", "%u", root))
 		f["effective_uid"] = os.Geteuid()
@@ -188,6 +193,9 @@ func nodeControl(ctx context.Context, a []string) error {
 	if e != nil {
 		return e
 	}
+	if _, e := checkNodeStateFormat(root); e != nil {
+		return e
+	}
 	switch a[0] {
 	case "follow":
 		if len(a) == 4 {
@@ -219,13 +227,21 @@ func nodeControl(ctx context.Context, a []string) error {
 			}
 			waitCtx, stop := context.WithTimeout(ctx, limit)
 			defer stop()
-			s, err := waitJob(waitCtx, dir)
-			if err == nil || errors.As(err, new(stateFailure)) || errors.Is(err, errStalled) {
+			s, err := waitJob(waitCtx, dir, false)
+			if err == nil || errors.As(err, new(stateFailure)) {
 				if e = json.NewEncoder(os.Stdout).Encode(s); e != nil {
 					return e
 				}
 			}
 			return err
+		}
+	case "wait-ack":
+		if len(a) == 5 {
+			dir, err := jobDir(root, a[1])
+			if err != nil {
+				return err
+			}
+			return confirmWaitNotice(ctx, dir, jobIdentity{run: a[2], key: a[3]}, a[4])
 		}
 	case "submit-if-version":
 		if len(a) > 4 {
@@ -273,16 +289,16 @@ func nodeControl(ctx context.Context, a []string) error {
 			if e != nil {
 				return e
 			}
-			return showNode(dir, a[2], full)
+			return showNode(ctx, dir, a[2], full)
 		}
 	case "submit-command":
 		if len(a) >= 4 {
-			lock, e := jobOperationLock(ctx, root, a[1])
+			cwd, unlock, e := lockCommandWorkspace(ctx, root, a[1], a[2])
 			if e != nil {
 				return e
 			}
-			defer closeBestEffort(lock)
-			return submitNodeCommand(ctx, root, a)
+			defer unlock()
+			return submitNodeCommand(ctx, a, cwd)
 		}
 	case "wait-poll":
 		if len(a) == 5 {
@@ -290,27 +306,17 @@ func nodeControl(ctx context.Context, a []string) error {
 			if e != nil || limit <= 0 {
 				return errors.New("invalid poll limit")
 			}
-			tmp, e := os.CreateTemp("", "cx-wait-*")
+			cursor, e := decodeWaitBaseline([]byte(a[3]))
 			if e != nil {
-				return e
-			}
-			defer removeBestEffort(tmp.Name())
-			_, e = tmp.WriteString(a[3])
-			if e = errors.Join(e, tmp.Close()); e != nil {
 				return e
 			}
 			callCtx, cancel := context.WithTimeout(ctx, limit)
 			defer cancel()
-			var b bytes.Buffer
-			e = waitAny(callCtx, root, a[1], a[2], tmp.Name(), &b)
-			if e != nil && !errors.Is(e, errQuestion) {
+			row, e := pollWaitAny(callCtx, root, a[1], a[2], cursor)
+			if e != nil {
 				return e
 			}
-			var cursor json.RawMessage
-			if e = readJSON(tmp.Name(), &cursor); e != nil {
-				return e
-			}
-			return json.NewEncoder(os.Stdout).Encode(fields{"row": json.RawMessage(b.Bytes()), "cursor": cursor})
+			return json.NewEncoder(os.Stdout).Encode(fields{"row": row, "cursor": cursor})
 		}
 	}
 	return errors.New("invalid node arguments")
@@ -318,11 +324,11 @@ func nodeControl(ctx context.Context, a []string) error {
 
 func checkSubmission(dir string, want config, profile string, args []string) error {
 	var s status
-	if err := readJSON(filepath.Join(dir, "status.json"), &s); err != nil {
+	if err := loadJobStatusInto(dir, &s); err != nil {
 		return err
 	}
 	var old config
-	if e := readJSON(filepath.Join(dir, "config.json"), &old); e != nil {
+	if e := readJobConfig(dir, &old); e != nil {
 		return e
 	}
 	if s.Profile != profile || !maps.Equal(old.Env, want.Env) || !slices.Equal(old.Argv, args) || old.Dir != want.Dir || old.Session != want.Session || old.Timeout != want.Timeout || old.Quiet != want.Quiet || old.Shell {
@@ -330,7 +336,7 @@ func checkSubmission(dir string, want config, profile string, args []string) err
 	}
 	return nil
 }
-func launchMuxCommand(ctx context.Context, root, p, j, runID string) error {
+func launchMuxCommand(ctx context.Context, root, p, j, runID, directory string) error {
 	exe, e := os.Executable()
 	if e != nil {
 		return e
@@ -338,27 +344,36 @@ func launchMuxCommand(ctx context.Context, root, p, j, runID string) error {
 	ctx, cancel := context.WithTimeout(ctx, 8*time.Second)
 	defer cancel()
 	program, socket := psmuxSettings(root)
-	cmd := exec.CommandContext(ctx, program, "-L", socket, "new-session", "-d", "-s", "cx-"+runID, "--", exe, "_command", "--state", root, "--project", p, "--job", j)
+	cmd := exec.CommandContext(ctx, program, "-L", socket, "new-session", "-d", "-s", "cx-"+runID, "--", exe, "_command", "--state", root, "--project", p, "--job", j, "--expect-run", runID, "--expect-dir", directory)
 	cmd.Stderr = os.Stderr
 	err := cmd.Run()
 	return errors.Join(err, ctx.Err())
 }
 
-func submitNodeCommand(ctx context.Context, root string, a []string) error {
-	dir, e := jobDir(root, a[1])
+func lockCommandWorkspace(ctx context.Context, root, id, cwd string) (string, func(), error) {
+	bound, e := bindWorkspace(root, cwd)
 	if e != nil {
-		return e
+		return "", nil, e
 	}
-	cwd := a[2]
-	if cwd == "" {
-		cwd = filepath.Join(root, ".work", filepath.Base(filepath.Dir(dir)), filepath.Base(dir))
-		if e = os.MkdirAll(cwd, 0700); e != nil {
-			return e
+	unlock, e := bound.lock(ctx, root, id)
+	if e != nil {
+		return "", nil, e
+	}
+	if bound.path == "" {
+		cwd, e = jobDir(filepath.Join(root, ".work"), id)
+		if e != nil {
+			unlock()
+			return "", nil, e
 		}
+		if e = os.MkdirAll(cwd, 0700); e != nil {
+			unlock()
+			return "", nil, e
+		}
+		return cwd, unlock, nil
 	}
-	abs, e := filepath.Abs(cwd)
-	if e != nil {
-		return e
-	}
-	return runNode(ctx, append([]string{"start", "--cmd", "--job", a[1], "--dir", abs}, a[3:]...), true)
+	return bound.path, unlock, nil
+}
+
+func submitNodeCommand(ctx context.Context, a []string, cwd string) error {
+	return runNode(ctx, append([]string{"start", "--cmd", "--job", a[1], "--dir", cwd}, a[3:]...), true)
 }

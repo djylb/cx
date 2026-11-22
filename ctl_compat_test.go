@@ -70,7 +70,7 @@ func TestControllerCompatibilityViews(t *testing.T) {
 			t.Fatal(err)
 		}
 		state := status{Job: fixture.job, Project: "p", Engine: fixture.engine, Session: fixture.session, State: "done"}
-		if err := writeJSON(filepath.Join(dir, "status.json"), state); err != nil {
+		if err := writeFixtureStatus(dir, state); err != nil {
 			t.Fatal(err)
 		}
 		if err := writeJSON(filepath.Join(dir, "request.json"), fields{"role": fixture.role}); err != nil {
@@ -141,7 +141,7 @@ func TestControllerListSubmissionReceipts(t *testing.T) {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeJSON(filepath.Join(dir, "status.json"), status{
+	if err := writeFixtureStatus(dir, status{
 		Job: "registered", Project: "p", State: "done", Session: "suite",
 	}); err != nil {
 		t.Fatal(err)

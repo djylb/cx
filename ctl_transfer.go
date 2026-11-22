@@ -13,6 +13,48 @@ import (
 	"time"
 )
 
+// commandInput only charges the idle budget while a read is outstanding.
+// A completed read cannot time out a later read or close inherited stdin.
+type commandInput struct {
+	ctx  context.Context
+	idle time.Duration
+}
+
+func (r commandInput) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	ctx := r.ctx
+	if r.idle > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, r.idle)
+		defer cancel()
+	}
+	return readStdin(ctx, p)
+}
+
+// With sole ownership of the pipe, a read of at most the buffered bytes
+// cannot block waiting for a sender. This also bounds a receive if the
+// sender disconnected while its transport retained a write handle.
+func readReadyPipe(ctx context.Context, p []byte, peek func() (uint32, error), read func([]byte) (int, error)) (int, error) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+		available, err := peek()
+		if err != nil {
+			return 0, err
+		}
+		if available > 0 {
+			n := min(uint64(len(p)), uint64(available))
+			return read(p[:int(n)])
+		}
+		if err := pause(ctx, 10*time.Millisecond); err != nil {
+			return 0, err
+		}
+	}
+}
+
 func transferSetting(key string, fallback time.Duration, zero bool) (time.Duration, error) {
 	raw := os.Getenv(key)
 	if raw == "" {
@@ -108,12 +150,7 @@ func receiveTask(ctx context.Context, a []string) error {
 		return e
 	}
 	part := filepath.Join(filepath.Dir(p), "."+a[1]+".part")
-	in := interruptibleStdin()
-	stop := context.AfterFunc(ctx, func() { _ = in.Close() })
-	defer stop()
-	timer := time.AfterFunc(idle, func() { _ = in.Close() })
-	defer timer.Stop()
-	if e = receivePacket(part, a[1], size, snapActiveReader{in, timer, idle}, os.Stdout); e != nil {
+	if e = receivePacket(part, a[1], size, commandInput{ctx, idle}, os.Stdout); e != nil {
 		return e
 	}
 	return os.Rename(part, p)
@@ -127,7 +164,7 @@ func startInstalledTask(ctx context.Context, id, hash string) error {
 	if e != nil {
 		return e
 	}
-	b, e := readStateFile(p)
+	b, e := readSharedFile(p)
 	if e != nil {
 		return e
 	}
@@ -138,7 +175,7 @@ func startInstalledTask(ctx context.Context, id, hash string) error {
 }
 
 func transferLock(ctx context.Context, path string) (*os.File, error) {
-	ctx, cancel := context.WithTimeout(ctx, 6*time.Hour)
+	ctx, cancel := context.WithTimeout(ctx, transferLimit)
 	defer cancel()
 	for {
 		lock, e := lockPath(path, os.O_CREATE)

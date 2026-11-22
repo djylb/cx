@@ -19,13 +19,15 @@ type rateLimitStatus struct {
 	RateLimited bool             `json:"rate_limited"`
 }
 
-// account/rateLimits/updated is a sparse snapshot. Null windows do not
+type rateLimitReading struct {
+	ResetsAt    *int64
+	UsedPercent int
+}
+
+// A rate limit snapshot is sparse. Null windows do not
 // invalidate recent readings, but windows from different meters cannot mix.
 type rateLimitSnapshot struct {
-	Primary, Secondary *struct {
-		ResetsAt    *int64
-		UsedPercent int
-	}
+	Primary, Secondary   *rateLimitReading
 	SpendControlReached  *bool
 	LimitID              string
 	RateLimitReachedType string
@@ -76,12 +78,15 @@ func (s *rateLimitStatus) update(snapshot rateLimitSnapshot, now int64) {
 }
 
 func (e turnError) rateLimited() bool {
+	if e.RateLimited {
+		return true
+	}
 	var kind string
-	if json.Unmarshal(e.CodexErrorInfo, &kind) == nil && kind != "" {
+	if json.Unmarshal(e.ErrorInfo, &kind) == nil && kind != "" {
 		return kind == "usageLimitExceeded" || kind == "rateLimitExceeded"
 	}
 	var variants map[string]struct{ HTTPStatusCode int }
-	if json.Unmarshal(e.CodexErrorInfo, &variants) == nil {
+	if json.Unmarshal(e.ErrorInfo, &variants) == nil {
 		for _, v := range variants {
 			if v.HTTPStatusCode == 429 {
 				return true
@@ -89,7 +94,7 @@ func (e turnError) rateLimited() bool {
 		}
 	}
 	// Older app-server versions may send a message without an error type.
-	if len(e.CodexErrorInfo) == 0 || string(e.CodexErrorInfo) == "null" {
+	if len(e.ErrorInfo) == 0 || string(e.ErrorInfo) == "null" {
 		msg := strings.ToLower(e.Message)
 		return strings.Contains(msg, "rate limit exceeded") || strings.Contains(msg, "usage limit exceeded")
 	}

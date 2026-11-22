@@ -30,33 +30,17 @@ func usage(f fields, raw json.RawMessage) {
 	}
 }
 func workDir(dir string, s status) (string, error) {
-	var work string
-	e := readJSON(filepath.Join(dir, "cx-work.json"), &work)
-	if os.IsNotExist(e) {
-		root := filepath.Dir(dir)
-		if s.Project != "" {
-			root = filepath.Dir(root)
-		}
-		private := filepath.Join(root, ".work", s.Project, s.Job)
-		if _, err := os.Stat(filepath.Join(private, "request.json")); err == nil {
-			return private, nil
-		} else if !os.IsNotExist(err) {
-			return "", err
-		}
-		for _, base := range []string{os.Getenv("CX_HOME"), filepath.Dir(filepath.Dir(filepath.Dir(dir)))} {
-			if base == "" {
-				continue
-			}
-			for _, prefix := range []string{filepath.Join(".locks", "cx-executor", "cx-v2", "jobs"), filepath.Join("cx-v2", "jobs")} {
-				candidate := filepath.Join(base, prefix, s.Project, s.Job)
-				if fi, statErr := os.Stat(candidate); statErr == nil && fi.IsDir() {
-					return candidate, nil
-				}
-			}
-		}
-		return dir, nil
+	root := filepath.Dir(dir)
+	if s.Project != "" {
+		root = filepath.Dir(root)
 	}
-	return work, e
+	private := filepath.Join(root, ".work", s.Project, s.Job)
+	if _, err := os.Stat(filepath.Join(private, "request.json")); err == nil {
+		return private, nil
+	} else if !os.IsNotExist(err) {
+		return "", err
+	}
+	return dir, nil
 }
 func nodeRows(ctx context.Context, root, p, session string, chatProject string) error {
 	overview := chatProject != ""
@@ -161,7 +145,7 @@ func nodeRows(ctx context.Context, root, p, session string, chatProject string) 
 var decisionHeading = regexp.MustCompile(`(?m)^(?:#{1,6}[ \t]+)?(?:\*\*)?(?:Pending decisions|Decisions to confirm|待确认决策)(?:\*\*)?[：:]?[ \t]*$`)
 var nextHeading = regexp.MustCompile(`(?m)^#{1,2}[ \t]+`)
 
-func showNode(dir, raw string, full bool) error {
+func showNode(ctx context.Context, dir, raw string, full bool) error {
 	clip := func(s string) string {
 		r := []rune(s)
 		if full || len(r) <= 240 {
@@ -171,7 +155,7 @@ func showNode(dir, raw string, full bool) error {
 	}
 
 	var s status
-	if e := readJSON(filepath.Join(dir, "status.json"), &s); e != nil {
+	if e := loadJobStatusInto(dir, &s); e != nil {
 		return e
 	}
 	current := s.Finished
@@ -195,17 +179,24 @@ func showNode(dir, raw string, full bool) error {
 		TurnID       string `json:"turn_id"`
 		Repositories []struct{ Files int }
 	}
-	e = readJSON(filepath.Join(archive, "result.json"), &manifest)
-	sealed := e == nil
-	if e != nil && !os.IsNotExist(e) {
-		return e
+	var sealed bool
+	currentID := currentTurnID(s)
+	if raw != "" || currentID != "" {
+		e = readJSON(filepath.Join(archive, "result.json"), &manifest)
+		sealed = e == nil && (raw != "" || manifest.TurnID == currentID)
+		if e != nil && !os.IsNotExist(e) {
+			return e
+		}
+	}
+	if !sealed {
+		manifest.TurnID, manifest.Repositories = "", nil
 	}
 	if !sealed && n != current {
 		return fmt.Errorf("turn %d unavailable", n)
 	}
 	id := manifest.TurnID
 	if id == "" && n == current {
-		id = s.Turn
+		id = currentID
 	}
 	// Preserve empty JSON arrays when the turn has no recorded plan or commands.
 	plan := make([]fields, 0)
@@ -213,7 +204,7 @@ func showNode(dir, raw string, full bool) error {
 	index := map[string]int{}
 	paths := map[string]bool{}
 	changed := 0
-	f, e := openShared(filepath.Join(dir, "events.jsonl"))
+	f, e := openJobFile(filepath.Join(dir, "events.jsonl"), jobFileRead)
 	if e == nil {
 		defer closeBestEffort(f)
 		rd := bufio.NewReader(f)
@@ -281,29 +272,22 @@ func showNode(dir, raw string, full bool) error {
 		return e
 	}
 	report := ""
-	if sealed || n == s.Finished {
-		folder := dir
-		if sealed {
-			folder = archive
-		}
-		b, readErr := readStateFile(filepath.Join(folder, "last.md"))
-		if readErr != nil && !os.IsNotExist(readErr) {
-			return readErr
+	if sealed {
+		b, err := readSharedFile(filepath.Join(archive, "last.md"))
+		if err != nil {
+			return err
 		}
 		report = string(b)
-		if !sealed {
-			var after status
-			if readErr = readJSON(filepath.Join(dir, "status.json"), &after); readErr != nil {
-				return readErr
-			}
-			if s.Turn != after.Turn || s.Finished != after.Finished || s.TurnStatus != after.TurnStatus {
-				return errors.New("turn advanced during show")
-			}
+	} else if n == s.Finished && id == s.LastCompleted {
+		b, err := readTurnReport(ctx, dir, s.LastCompleted)
+		if err != nil {
+			return err
 		}
+		report = string(b)
 	}
 	if s.Engine == "cmd" {
 		var conf config
-		if e = readJSON(filepath.Join(dir, "config.json"), &conf); e != nil {
+		if e = readJobConfig(dir, &conf); e != nil {
 			return e
 		}
 		var spec struct {
@@ -328,7 +312,7 @@ func showNode(dir, raw string, full bool) error {
 		}
 		argv := "[" + strings.Join(parts, ", ") + "]"
 		cmd := fields{"command": clip(argv), "exit_code": s.ExitCode}
-		if b, e := readStateFile(filepath.Join(dir, "output.log")); e == nil {
+		if b, e := readSharedFile(filepath.Join(dir, "output.log")); e == nil {
 			cmd["output"] = clip(string(b))
 		} else if !os.IsNotExist(e) {
 			return e
@@ -412,19 +396,6 @@ func channelCursorPath(p, ch, name string) (string, error) {
 		if _, e := jobPath("", v); e != nil {
 			return "", e
 		}
-	}
-	base := os.Getenv("CX_HOME")
-	if base == "" {
-		base, _ = os.Getwd()
-	}
-	legacy := filepath.Join(base, ".locks", "cx-jobs", ".chat", p, ch, name+".json")
-	if os.Getenv("CX_HOME") != "" {
-		return legacy, nil
-	}
-	if _, e := os.Stat(legacy); e == nil {
-		return legacy, nil
-	} else if !os.IsNotExist(e) {
-		return "", e
 	}
 	return cursorFile("chat", p, ch, name)
 }

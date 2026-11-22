@@ -17,7 +17,13 @@ func lockPath(path string, flags int) (*os.File, error) {
 }
 
 func lockFile(path string, flags int, lock func(*os.File) (bool, error)) (*os.File, error) {
-	f, err := os.OpenFile(path, flags|os.O_RDWR, 0600)
+	mode := jobFileLockExisting
+	if flags&os.O_EXCL != 0 {
+		mode = jobFileNew
+	} else if flags&os.O_CREATE != 0 {
+		mode = jobFileLock
+	}
+	f, err := openJobFile(path, mode)
 	if err != nil {
 		return nil, err
 	}
@@ -54,7 +60,7 @@ type queueTicket struct{ file *os.File }
 
 func (r *runner) pool() string {
 	base := filepath.Join(r.root, ".admit")
-	if r.c.SlotClass == "" || r.c.SlotClass == codexSlotClass {
+	if r.c.SlotClass == "" || r.c.SlotClass == agentSlotClass {
 		return base
 	}
 	return filepath.Join(base, "classes", r.c.SlotClass)
@@ -161,6 +167,12 @@ func (r *runner) pauseRuntime() error {
 var errQueueTimeout = fmt.Errorf("queue_timeout: %w", context.DeadlineExceeded)
 var errQueuedClose = errors.New("closed while queued")
 
+const (
+	slotQueueGrace       = 2 * time.Second
+	loadInterval         = 15 * time.Second
+	diskRecoveryInterval = 15 * time.Second
+)
+
 func (r *runner) releaseSlot() {
 	if r.slot != nil {
 		_ = r.slot.Close()
@@ -214,6 +226,23 @@ func (r *runner) setQueueReason(reason string) error {
 	if r.s.QueueReason == reason {
 		return nil
 	}
+	if reason != "" {
+		if r.s.QueueGeneration == ^uint64(0) {
+			return errors.New("queue generation exhausted")
+		}
+		// Persist the reservation before any observer can acknowledge this
+		// reason. Recovery keeps the generation even if the next frame is lost.
+		reserved := r.s
+		reserved.QueueReason = ""
+		reserved.QueueGeneration++
+		if err := r.stateLog.Append("status", reserved); err != nil {
+			return err
+		}
+		if err := r.stateLog.sync(); err != nil {
+			return err
+		}
+		r.s.QueueGeneration++
+	}
 	r.s.QueueReason = reason
 	return r.save()
 }
@@ -223,7 +252,6 @@ func (r *runner) reserve(ctx context.Context, t *queueTicket, controls bool, rep
 	if err != nil {
 		return err
 	}
-	slots := host.slotCount(r.c.SlotClass)
 	if t == nil {
 		guard, err := registryLock(ctx, r.root)
 		if err != nil {
@@ -236,8 +264,12 @@ func (r *runner) reserve(ctx context.Context, t *queueTicket, controls bool, rep
 		}
 		defer t.release()
 	}
-	var checked, diskChecked, nextMaintenance time.Time
-	allowed := host.LoadCmd == ""
+	maintenanceCtx, stopMaintenance := context.WithCancel(ctx)
+	defer stopMaintenance()
+	var maintenanceDone chan struct{}
+	var loadChecked, diskChecked, slotBlockedSince time.Time
+	var diskReason, slotReason string
+	allowed := false
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -249,66 +281,109 @@ func (r *runner) reserve(ctx context.Context, t *queueTicket, controls bool, rep
 				if err := r.reclaim(); err != nil {
 					return err
 				}
+				r.closeCompleted = true
 				return errQueuedClose
 			}
-		}
-		if host.LoadCmd != "" && time.Since(checked) >= 15*time.Second {
-			allowed = loadOK(ctx, host.LoadCmd)
-			checked = time.Now()
-			continue
 		}
 		if time.Since(diskChecked) >= time.Second {
 			policy, err := readHostConfig(r.root)
 			if err != nil {
 				return err
 			}
-			host.MinFreeBytes, host.CacheMaxBytes = policy.MinFreeBytes, policy.CacheMaxBytes
-			_, _, warning := host.diskStatus(r.root)
-			if err := report(warning); err != nil {
-				return err
+			if policy.LoadCmd != host.LoadCmd {
+				loadChecked = time.Time{}
 			}
+			host = policy
+			disk := host.diskStatus(r.root)
+			select {
+			case <-maintenanceDone:
+				maintenanceDone = nil
+			default:
+			}
+			if disk.belowMinimum() && maintenanceDone == nil {
+				maintenanceDone = make(chan struct{})
+				go func(policy *hostConfig, done chan struct{}) {
+					defer close(done)
+					scanCtx, cancel := context.WithTimeout(maintenanceCtx, transferLimit)
+					defer cancel()
+					if err := maintainCaches(scanCtx, r.root, policy, false); err != nil && scanCtx.Err() == nil {
+						diagnosticf("cache maintenance: %v\n", err)
+					}
+				}(host, maintenanceDone)
+			}
+			diskReason = disk.queueReason()
 			diskChecked = time.Now()
 		}
-		if allowed && !time.Now().Before(nextMaintenance) {
-			guard, err := registryLock(ctx, r.root)
-			if err != nil {
-				return err
+		reason := diskReason
+		if reason == "" && host.LoadCmd != "" {
+			if time.Since(loadChecked) >= loadInterval {
+				allowed = loadOK(ctx, host.LoadCmd)
+				loadChecked = time.Now()
 			}
-			first, err := t.first()
-			var slot *os.File
-			if first && err == nil {
-				for i := 0; i < slots; i++ {
-					slot, err = lockPath(filepath.Join(r.pool(), fmt.Sprintf("slot-%d.lock", i)), os.O_CREATE)
-					if slot != nil || err != nil {
-						break
-					}
-				}
+			if !allowed {
+				reason = "host load check did not pass"
 			}
-			_ = guard.Close()
+		}
+		if reason != "" {
+			slotBlockedSince, slotReason = time.Time{}, ""
+		} else {
+			slot, blocked, err := r.trySlot(ctx, t, host.slotCount(r.c.SlotClass))
 			if err != nil {
 				return err
 			}
 			if slot != nil {
-				reason, err := maintainBuildCache(ctx, r.root, host)
-				if err == nil {
-					err = report(reason)
-				}
-				if reason != "" || err != nil {
-					_ = slot.Close()
-					if err != nil {
-						return err
+				diskReason = host.diskStatus(r.root).queueReason()
+				diskChecked = time.Now()
+				if diskReason == "" {
+					if err = report(""); err == nil {
+						r.slot = slot
+						return nil
 					}
-					nextMaintenance = time.Now().Add(time.Second)
-				} else {
-					r.slot = slot
-					return nil
+				}
+				closeBestEffort(slot)
+				if err != nil {
+					return err
+				}
+				reason = diskReason
+				slotBlockedSince, slotReason = time.Time{}, ""
+			} else {
+				if slotReason != blocked {
+					slotBlockedSince, slotReason = time.Now(), blocked
+				}
+				if time.Since(slotBlockedSince) >= slotQueueGrace {
+					reason = slotReason
 				}
 			}
+		}
+		if err := report(reason); err != nil {
+			return err
 		}
 		if err := pause(ctx, 100*time.Millisecond); err != nil {
 			return err
 		}
 	}
+}
+
+func (r *runner) trySlot(ctx context.Context, ticket *queueTicket, slots int) (*os.File, string, error) {
+	guard, err := registryLock(ctx, r.root)
+	if err != nil {
+		return nil, "", err
+	}
+	defer closeBestEffort(guard)
+	first, err := ticket.first()
+	if err != nil {
+		return nil, "", err
+	}
+	if !first {
+		return nil, "waiting for earlier FIFO tickets", nil
+	}
+	for i := 0; i < slots; i++ {
+		slot, err := lockPath(filepath.Join(r.pool(), fmt.Sprintf("slot-%d.lock", i)), os.O_CREATE)
+		if slot != nil || err != nil {
+			return slot, "", err
+		}
+	}
+	return nil, "all slots in the admission class are occupied", nil
 }
 
 type slotResult struct {

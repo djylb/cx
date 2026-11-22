@@ -46,18 +46,14 @@ func stageResultDetails(ctx context.Context, dir, folder, extra string, s status
 		return err
 	}
 	latest := s.Finished == m.Turn && readyResult(s)
-	engine := s.Engine
-	if engine == "" {
-		engine = "codex"
-	}
 	log, err := copyResultLog(ctx, dir, extra, s.logName(), m.TurnID, latest, progress)
 	if err != nil {
 		return err
 	}
-	m.ResultDetails = &ResultDetails{Engine: engine, Log: log}
+	m.ResultDetails = &ResultDetails{Engine: s.Engine, Log: log}
 	if latest {
 		var after status
-		if err = readJSON(filepath.Join(dir, "status.json"), &after); err != nil {
+		if err = loadJobStatusInto(dir, &after); err != nil {
 			return err
 		}
 		if s.RunID != after.RunID || s.Finished != after.Finished || s.Turn != after.Turn || !readyResult(after) {
@@ -65,14 +61,18 @@ func stageResultDetails(ctx context.Context, dir, folder, extra string, s status
 		}
 		m.Status, m.ExitCode = &after.State, after.ExitCode
 	}
-	return writeJSON(filepath.Join(extra, "result.json"), m)
+	data, err := json.Marshal(m)
+	if err != nil {
+		return err
+	}
+	return snapImmutable(filepath.Join(extra, "result.json"), data)
 }
 
 func copyResultLog(ctx context.Context, dir, stage, name, turnID string, latest bool, progress io.Writer) (string, error) {
 	if (name == "output.log" || turnID == "") && !latest {
 		return "", nil
 	}
-	in, err := os.Open(filepath.Join(dir, name))
+	in, err := openJobFile(filepath.Join(dir, name), jobFileRead)
 	if os.IsNotExist(err) {
 		return "", nil
 	}
@@ -92,7 +92,7 @@ func copyResultLog(ctx context.Context, dir, stage, name, turnID string, latest 
 			return "", err
 		}
 	}
-	out, err := os.OpenFile(filepath.Join(stage, name), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	out, err := openJobFile(filepath.Join(stage, name), jobFileNew)
 	if err != nil {
 		return "", err
 	}
@@ -185,7 +185,7 @@ func displayResultDetails(out io.Writer, dir, id string, logOnly bool) error {
 			diagnosticf("cx: result log unavailable\n")
 			return ctlExit(9)
 		}
-		log, err := os.Open(*logPath)
+		log, err := openJobFile(*logPath, jobFileRead)
 		if err != nil {
 			return err
 		}

@@ -48,7 +48,7 @@ func TestHostCLI(t *testing.T) {
 	if err := json.Unmarshal([]byte(out), &effective); err != nil {
 		t.Fatal(err, out)
 	}
-	if len(effective.Slots) != 3 || effective.Slots["codex"] != platformSlots || effective.Slots["test"] != platformSlots ||
+	if len(effective.Slots) != 3 || effective.Slots["agent"] != platformSlots || effective.Slots["test"] != platformSlots ||
 		effective.Slots["system"] != 1 || effective.LoadCmd != "" {
 		t.Fatal(out)
 	}
@@ -57,13 +57,13 @@ func TestHostCLI(t *testing.T) {
 	}
 
 	override := t.TempDir()
-	setTestHost(t, override, map[string]int{"codex": 2, "custom": 4}, "exit 1")
+	setTestHost(t, override, map[string]int{"agent": 2, "custom": 4}, "exit 1")
 	out = fixtureCLI(t, 0, "host", "--state", override)
 	effective = hostConfig{}
 	if err := json.Unmarshal([]byte(out), &effective); err != nil {
 		t.Fatal(err, out)
 	}
-	if len(effective.Slots) != 4 || effective.Slots["codex"] != 2 || effective.Slots["test"] != platformSlots ||
+	if len(effective.Slots) != 4 || effective.Slots["agent"] != 2 || effective.Slots["test"] != platformSlots ||
 		effective.Slots["system"] != 1 || effective.Slots["custom"] != 4 || effective.LoadCmd != "exit 1" {
 		t.Fatal(out)
 	}

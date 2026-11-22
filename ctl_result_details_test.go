@@ -57,17 +57,14 @@ func TestCodexResultDetailsFromSealedTurn(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := status{
-		Job: "codex-log", Project: "p", State: "done", RunID: "fixture",
+		Job: "codex-log", Project: "p", State: "done", RunID: "fixture", Engine: "codex",
 		Turn: "second", LastCompleted: "second", CompletedStatus: "completed", Finished: 2,
 	}
-	if err := writeJSON(filepath.Join(dir, "status.json"), s); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "last.md"), []byte("second report\n"), 0600); err != nil {
+	if err := writeFixtureStatus(dir, s, "second report\n"); err != nil {
 		t.Fatal(err)
 	}
 	cliOutput(t, 0, nil, f.cx, "result", job, "--wait")
-	first := "time\tturn/started\tfirst\ntime\tturn/completed\tfirst completed\n"
+	first := "1\ttime\tturn/started\tfirst\n2\ttime\tturn/completed\tfirst completed\n"
 	second := "3\ttime\tturn/start\treply → second\r\n4\ttime\tturn/completed\tsecond completed\r\n"
 	trailing := "5\ttime\tdone\tagent exited\n"
 	if err := os.WriteFile(filepath.Join(dir, "progress.log"), []byte(first+second+trailing), 0600); err != nil {
@@ -95,14 +92,12 @@ func TestResultOutputClarity(t *testing.T) {
 	}
 	state := status{Job: "report", Project: "p", RunID: "fixture", State: "done",
 		Turn: "turn-id", LastCompleted: "turn-id", Finished: 1, CompletedStatus: "completed"}
-	if err := writeJSON(filepath.Join(dir, "status.json"), state); err != nil {
+	const report = "STATUS: DONE\nSummary.\n\n## Details\nExpanded report.\n"
+	if err := writeFixtureStatus(dir, state, report); err != nil {
 		t.Fatal(err)
 	}
-	const report = "STATUS: DONE\nSummary.\n\n## Details\nExpanded report.\n"
-	for name, data := range map[string]string{"last.md": report, "progress.log": ""} {
-		if err := os.WriteFile(filepath.Join(dir, name), []byte(data), 0600); err != nil {
-			t.Fatal(err)
-		}
+	if err := os.WriteFile(filepath.Join(dir, "progress.log"), nil, 0600); err != nil {
+		t.Fatal(err)
 	}
 
 	dest, err := resultDest("local", job, state.RunID, "1")

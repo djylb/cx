@@ -319,7 +319,7 @@ func deployFromCenter(ctx context.Context, h endpoint, plat string) (handled boo
 	if e != nil {
 		return true, e
 	}
-	r, e := center.invoke(ctx, 6*time.Minute, false, "compiler-install", string(sid), plat, string(b))
+	r, e := center.invoke(ctx, compilerInstallLimit, false, "compiler-install", string(sid), plat, string(b))
 	if e != nil {
 		return true, e
 	}

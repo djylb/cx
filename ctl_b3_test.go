@@ -59,18 +59,12 @@ func TestB3ControllerContract(t *testing.T) {
 	if got := cliOutput(t, 17, nil, f.cx, "exec", "local", "--tag", "script", "--wait", "--script", script, "--shell", "sh"); string(got) != "literal $HOME\n" {
 		t.Fatal(string(got))
 	}
-	for _, op := range []string{"requests", "plan", "diff", "events", "outbox"} {
-		args := []string{op, "local:p/script"}
-		goOut := cliOutput(t, 0, nil, f.cx, args...)
-		if f.python == "" {
-			continue
-		}
-		pyOut := cliOutput(t, 0, nil, "python3", append([]string{f.python}, args...)...)
-		if !bytes.Equal(goOut, pyOut) {
-			var a, b any
-			if json.Unmarshal(goOut, &a) != nil || json.Unmarshal(pyOut, &b) != nil || !reflect.DeepEqual(a, b) {
-				t.Fatalf("%s: %q / %q", op, goOut, pyOut)
-			}
+	for _, tc := range []struct{ op, want string }{
+		{"requests", "[]"}, {"plan", `{"event":null,"observed":false}`},
+		{"diff", `{"event":null,"observed":false}`}, {"events", ""}, {"outbox", ""},
+	} {
+		if got := cliOutput(t, 0, nil, f.cx, tc.op, "local:p/script"); string(bytes.TrimSpace(got)) != tc.want {
+			t.Fatalf("%s: %q", tc.op, got)
 		}
 	}
 }
@@ -276,9 +270,7 @@ func TestB3ChatInteroperability(t *testing.T) {
 		t.Fatal(string(data))
 	}
 	if f.python != "" {
-		if data := cliOutput(t, 0, nil, "python3", f.python, "chat", "read", "reports", "--cursor", "default"); len(data) > 0 {
-			t.Fatal(string(data))
-		}
+		checkRead("python3", f.python, "chat", "read", "reports", "--cursor", "default")
 	}
 	waitBoth := func(want int, limit string) {
 		t.Helper()
@@ -298,6 +290,17 @@ func TestB3ChatInteroperability(t *testing.T) {
 		var goRow, pyRow fields
 		if err := json.Unmarshal(goOut, &goRow); err != nil {
 			t.Fatalf("Go wait output %q: %v", goOut, err)
+		}
+		event := "terminal"
+		if goRow["channel"] != nil {
+			event = "chat"
+		}
+		if id, ok := goRow["event_id"].(string); !ok || id == "" || goRow["event"] != event {
+			t.Fatalf("wait event identity missing: %s", goOut)
+		}
+		if event == "chat" {
+			delete(goRow, "event")
+			delete(goRow, "event_id")
 		}
 		if f.python == "" {
 			return
@@ -490,7 +493,7 @@ func TestB3ResumeResultStream(t *testing.T) {
 		t.Fatal(err)
 	}
 	var s status
-	if err = readJSON(filepath.Join(dir, "status.json"), &s); err != nil {
+	if err = loadJobStatusInto(dir, &s); err != nil {
 		t.Fatal(err)
 	}
 	ssh := filepath.Join(f.home, "ssh")
@@ -526,32 +529,26 @@ func TestB3ResumeResultStream(t *testing.T) {
 	}
 }
 
-func TestB3LegacySubmitAndClean(t *testing.T) {
+func TestControllerIgnoresLegacyRouteAndCleanMetadata(t *testing.T) {
 	f := newControllerFixture(t)
 	root := os.Getenv("CXRUN_STATE")
 	work := filepath.Join(f.home, ".locks", "cx-executor", "cx-v2", "jobs", "p", "old")
-	token := snapSum([]byte("fixture registration"))
-	legacy := fields{"host": "local", "state": root, "work": work, "project": "p", "tag": "old", "request": token, "submit_status": "submit_failed", "submit_reason": "fixture", "submit_rc": 8}
-	route, e := legacyRouteFile("p/old")
-	if e != nil {
-		t.Fatal(e)
-	}
+	legacy := fields{"host": "unconfigured-host", "state": root, "work": work, "project": "p", "tag": "old",
+		"request": snapSum([]byte("fixture registration")), "submit_status": "submit_failed", "submit_rc": 8}
+	route := filepath.Join(os.Getenv("CX_HOME"), ".locks", "cx-jobs", "p", "old.env")
 	for _, path := range []string{route, filepath.Join(work, "request.json")} {
-		if e = os.MkdirAll(filepath.Dir(path), 0700); e != nil {
-			t.Fatal(e)
+		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+			t.Fatal(err)
 		}
-		if e = writeJSON(path, legacy); e != nil {
-			t.Fatal(e)
+		if err := writeJSON(path, legacy); err != nil {
+			t.Fatal(err)
 		}
 	}
-	var view submissionProgress
-	if e = json.Unmarshal(cliOutput(t, 0, nil, f.cx, "show", "p/old"), &view); e != nil || view.State != "submit_failed" || view.Code == nil || *view.Code != 8 {
-		t.Fatal(view, e)
-	}
+	cliOutput(t, 11, nil, f.cx, "show", "p/old")
 	cliOutput(t, 0, nil, f.cx, "clean", "p/old")
-	for _, path := range []string{route, work} {
-		if _, e = os.Stat(path); !os.IsNotExist(e) {
-			t.Fatal(path, e)
+	for _, path := range []string{route, filepath.Join(work, "request.json")} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatal(path, err)
 		}
 	}
 }

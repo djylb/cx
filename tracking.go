@@ -29,6 +29,9 @@ type inventory struct {
 }
 
 func (c *config) mark(cmd *exec.Cmd, dir string) {
+	if c.cacheUse != nil {
+		inheritCacheLeases(cmd, c.cacheUse.leases)
+	}
 	env := cmd.Environ()
 	for k, v := range c.Env {
 		env = append(env, k+"="+v)
@@ -41,7 +44,7 @@ func sameProcess(start, current uint64) bool { return start != 0 && start == cur
 func (r *runner) inventory() inventory {
 	v := inventory{Processes: []process{}}
 	if r.c.RunID == "" {
-		v.Warning = "legacy job has no recorded process identity"
+		v.Warning = "job has no recorded process identity"
 		return v
 	}
 	all := scanProcesses(r.c.RunID, &v)
@@ -72,10 +75,10 @@ func (r *runner) inventory() inventory {
 }
 func printProcesses(dir string) error {
 	r := runner{dir: dir}
-	if err := readJSON(filepath.Join(dir, "config.json"), &r.c); err != nil {
+	if _, err := readJobStatus(dir, &r.s); err != nil {
 		return err
 	}
-	if err := readJSON(filepath.Join(dir, "status.json"), &r.s); err != nil {
+	if err := readJobConfig(dir, &r.c); err != nil {
 		return err
 	}
 	return json.NewEncoder(os.Stdout).Encode(r.inventory())
@@ -88,7 +91,7 @@ func (r *runner) reclaim() error {
 		return nil
 	}
 	if r.log == nil {
-		f, err := os.OpenFile(filepath.Join(r.dir, "progress.log"), os.O_APPEND|os.O_WRONLY, 0600)
+		f, err := openJobFile(filepath.Join(r.dir, "progress.log"), jobFileAppend)
 		if err != nil {
 			return err
 		}

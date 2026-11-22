@@ -87,7 +87,7 @@ func TestInteractiveAndThreadControls(t *testing.T) {
 	if err := h.ctl("undo", "job", "--before", "first"); err != nil {
 		t.Fatal(err)
 	}
-	b, err := os.ReadFile(filepath.Join(h.root, "job", "last.md"))
+	b, err := readTurnReport(h.ctx, filepath.Join(h.root, "job"), "prior")
 	if err != nil || string(b) != "restored" {
 		t.Fatalf("last=%q err=%v", b, err)
 	}
@@ -118,13 +118,20 @@ func TestLostControlReceipt(t *testing.T) {
 	if err := <-done; err == nil {
 		t.Fatal("fixture unexpectedly survived")
 	}
-	var receipt rpcReceipt
-	if err := readJSON(filepath.Join(h.root, "job", "outbox", "lost.json"), &receipt); err != nil || receipt.State != "uncertain" || receipt.Generation != 1 {
-		t.Fatal(receipt, err)
-	}
-	if _, err := os.Stat(filepath.Join(h.root, "job", "inbox", "uncertain", "lost.rpc")); err != nil {
+	in, err := readInboxState(filepath.Join(h.root, "job"))
+	if err != nil {
 		t.Fatal(err)
 	}
+	receipt := in.receipts["lost"]
+	if receipt.Status != "uncertain" || receipt.Generation != 1 {
+		t.Fatal(receipt)
+	}
+	for _, ack := range in.acks {
+		if ack.ID == "lost" && ack.Result == "uncertain" {
+			return
+		}
+	}
+	t.Fatal("missing uncertain acknowledgement", in.acks)
 }
 
 func TestLocalHandshake(t *testing.T) {
@@ -136,6 +143,7 @@ func TestLocalHandshake(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 	defer cancel()
 	r := runner{dir: dir, c: config{Dir: dir}, ctx: ctx}
+	startFixtureWriter(t, &r)
 	for name, ptr := range map[string]**os.File{"events.jsonl": &r.events, "progress.log": &r.log} {
 		f, err := os.Create(filepath.Join(dir, name))
 		if err != nil {

@@ -39,7 +39,7 @@ type jobSubmission struct {
 	Options, Command                                []string
 	Context                                         map[string][]byte
 	Preamble, Nudge                                 string
-	Image                                           []byte
+	Images                                          []attachment
 }
 
 func defaultSubmitHost() string {
@@ -132,7 +132,7 @@ func ctlSubmit(ctx context.Context, hs endpoints, op string, o ctlOptions) error
 			if o.profile != "" {
 				argv = append(argv, o.profile)
 			}
-			r, continueErr := h.invoke(ctx, 185*time.Second, false, argv...)
+			r, continueErr := h.invoke(ctx, controlCallIdle, false, argv...)
 			if continueErr != nil {
 				return continueErr
 			}
@@ -240,36 +240,50 @@ func ctlSubmit(ctx context.Context, hs endpoints, op string, o ctlOptions) error
 	if o.reuse && !o.command {
 		return errors.New("--reuse requires a command job")
 	}
-	if o.command && (o.engine != "" || o.interactive || o.web || o.input != "" || o.image != "") {
+	if o.command && (o.engine != "" || o.interactive || o.web || o.input != "" || len(o.images) > 0) {
 		return errors.New("agent options on command job")
 	}
-	if !o.command && strings.TrimSpace(prompt) == "" && o.input == "" && o.image == "" {
+	if !o.command && strings.TrimSpace(prompt) == "" && o.input == "" && len(o.images) == 0 {
 		return errors.New("empty prompt")
-	}
-	if o.engine != "" && o.engine != "codex" && o.engine != "claude" {
-		return errors.New("unsupported engine")
 	}
 	if !o.command && o.quiet != "" {
 		return errors.New("quiet timeout requires --cmd")
 	}
 	if o.sandbox == "" {
-		o.sandbox = "workspace-write"
+		o.sandbox = defaultSandbox
 	}
 	if o.network && o.noNetwork {
 		return errors.New("conflicting network options")
 	}
-	if o.network || o.sandbox == "workspace-write" && !o.noNetwork {
+	network := o.network || o.sandbox == "workspace-write" && !o.noNetwork
+	if network {
 		req.Options = append(req.Options, "--network")
+	} else {
+		req.Options = append(req.Options, "--no-network")
 	}
 	if o.hard && o.effort == "" {
 		o.effort = "high"
+	}
+	jobTools := false
+	if !o.command {
+		// Check the engine's capabilities here so an unsupported option fails before any upload.
+		eng, engineErr := lookupEngine(o.engine)
+		if engineErr != nil {
+			return engineErr
+		}
+		o.engine = eng.name
+		c := config{Effort: o.effort, Network: network, Sandbox: o.sandbox, JobTools: !o.noTools && eng.caps().JobTools}
+		if engineErr = c.checkEngineOptions(eng, options{input: o.input, images: o.images}, o.approval != ""); engineErr != nil {
+			return engineErr
+		}
+		jobTools = c.JobTools
 	}
 	for _, kv := range [][2]string{{"profile", o.profile}, {"sandbox", o.sandbox}, {"model", o.model}, {"effort", o.effort}, {"engine", o.engine}, {"idle-exit", o.idle}, {"turn-timeout", o.turnLimit}, {"stall", o.stall}, {"approval-timeout", o.approval}, {"queue-timeout", o.queue}, {"timeout", o.timeout}, {"quiet-timeout", o.quiet}} {
 		if kv[1] != "" {
 			req.Options = append(req.Options, "--"+kv[0], kv[1])
 		}
 	}
-	if !o.command && o.engine != "claude" && !o.noTools {
+	if jobTools {
 		req.Options = append(req.Options, "--job-tools")
 	}
 	if o.web {
@@ -286,11 +300,12 @@ func ctlSubmit(ctx context.Context, hs endpoints, op string, o ctlOptions) error
 		warnInputCredentials(b)
 		req.Options = append(req.Options, "--input-json", string(b))
 	}
-	if o.image != "" {
-		req.Image, e = os.ReadFile(o.image)
-		if e != nil {
-			return e
+	for _, image := range o.images {
+		data, readErr := os.ReadFile(image)
+		if readErr != nil {
+			return readErr
 		}
+		req.Images = append(req.Images, attachment{Ext: filepath.Ext(image), Data: data})
 	}
 	if o.profile != "" {
 		// Check before snapshot preparation; the runner validates again at registration.
@@ -459,7 +474,7 @@ func attachContext(req *jobSubmission, p string, interactive bool) error {
 }
 
 func legacyGate(ctx context.Context, args []string) error {
-	ctx, cancel := context.WithTimeout(ctx, 90*time.Minute)
+	ctx, cancel := context.WithTimeout(ctx, submitLimit)
 	defer cancel()
 	mode := os.Getenv("LAN_SOURCE_MODE")
 	if mode == "" {

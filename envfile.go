@@ -17,10 +17,11 @@ import (
 	"unicode/utf8"
 )
 
+// hostProfile selects an execution account. EngineHomes maps an engine name to its account
+// directory, exported through that engine's home variable (CODEX_HOME, CLAUDE_CONFIG_DIR, ...).
 type hostProfile struct {
-	CodexHome       string `json:"codex_home,omitempty"`
-	ClaudeConfigDir string `json:"claude_config_dir,omitempty"`
-	EnvFile         string `json:"env_file,omitempty"`
+	EngineHomes map[string]string `json:"engine_homes,omitempty"`
+	EnvFile     string            `json:"env_file,omitempty"`
 }
 
 // Empty is a valid recorded selection. Only a new submission uses the default.
@@ -28,6 +29,11 @@ func (h *hostConfig) profile(name string) (hostProfile, error) {
 	p, ok := h.Profiles[name]
 	if name != "" && !ok {
 		return p, fmt.Errorf("unknown profile %q", name)
+	}
+	for engine := range p.EngineHomes {
+		if _, err := lookupEngine(engine); err != nil || engine == "" {
+			return p, fmt.Errorf("profile %q: engine_homes: unknown engine %q", name, engine)
+		}
 	}
 	if name == "" {
 		p = hostProfile{}
@@ -59,11 +65,10 @@ func stateRelative(root, path string) string {
 
 func (p hostProfile) accountEnv(root string) []string {
 	var env []string
-	if p.CodexHome != "" {
-		env = append(env, "CODEX_HOME="+stateRelative(root, p.CodexHome))
-	}
-	if p.ClaudeConfigDir != "" {
-		env = append(env, "CLAUDE_CONFIG_DIR="+stateRelative(root, p.ClaudeConfigDir))
+	for _, e := range engines {
+		if dir := p.EngineHomes[e.name]; dir != "" {
+			env = append(env, e.homeEnv+"="+stateRelative(root, dir))
+		}
 	}
 	return env
 }
@@ -112,7 +117,7 @@ func (r *runner) loadCredentials() error {
 		}
 		var data []byte
 		if err == nil {
-			data, err = os.ReadFile(path)
+			data, err = readSharedFile(path)
 		}
 		if err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("read env_file: %w", err)
@@ -134,7 +139,7 @@ func (r *runner) loadCredentials() error {
 			}
 			method, _ := json.Marshal("env_file/loaded")
 			params, _ := json.Marshal(fields{"keys": keys})
-			f, err := os.OpenFile(filepath.Join(r.dir, "events.jsonl"), os.O_APPEND|os.O_WRONLY, 0600)
+			f, err := openJobFile(filepath.Join(r.dir, "events.jsonl"), jobFileAppend)
 			if err != nil {
 				return err
 			}

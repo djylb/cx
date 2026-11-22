@@ -28,7 +28,7 @@ func resultTree(g snapGit, snapshot, dir string, row turnPatch) (string, error) 
 	return g.get("write-tree")
 }
 
-func incrementalResult(ctx context.Context, host, id, previous, latest, output string, baseTurn int64, current turnResult) (turnResult, error) {
+func incrementalResult(ctx context.Context, previous, latest, output string, baseTurn int64, current turnResult) (turnResult, error) {
 	var old turnResult
 	if err := readJSON(filepath.Join(previous, "result.json"), &old); err != nil {
 		return current, err
@@ -36,7 +36,7 @@ func incrementalResult(ctx context.Context, host, id, previous, latest, output s
 	if old.Turn != baseTurn || current.Turn <= old.Turn {
 		return current, errors.New("sealed turn numbers do not match requested range")
 	}
-	_, store, manifest, err := applyOrigin(latest, host, id)
+	_, store, manifest, err := applyOrigin(latest)
 	if err != nil {
 		return current, err
 	}

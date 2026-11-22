@@ -52,6 +52,7 @@ func TestControlTargetAndDuplicate(t *testing.T) {
 	}
 	defer func() { _ = f.Close() }()
 	r := runner{dir: dir, log: f, s: status{Turn: "new", TurnStatus: "inProgress"}}
+	startFixtureWriter(t, &r)
 	for i, target := range []string{"old", "new", "new"} {
 		id := "key"
 		if i == 0 {
@@ -185,7 +186,7 @@ func TestRegistryAndReapDeadlines(t *testing.T) {
 }
 func TestFollowupQueueHandlesInterruptAndIdle(t *testing.T) {
 	h := newRuns(t, "manual")
-	setTestHost(t, h.root, map[string]int{"codex": 1}, "")
+	setTestHost(t, h.root, map[string]int{"agent": 1}, "")
 	a := h.start("a", "--idle-exit", "2s")
 	h.await("a", func(s status) bool { return s.Turn == "first" })
 	b := h.start("b")
@@ -252,6 +253,7 @@ func TestStallContinuationRetainsSlot(t *testing.T) {
 	}
 	defer func() { _ = slot.Close() }()
 	r := runner{slot: slot, dir: root, pending: defaultContinue}
+	startFixtureWriter(t, &r)
 	if err = r.finish(turn{ID: "t", Status: "interrupted"}); err != nil || r.slot != slot {
 		t.Fatal(err, r.slot)
 	}
@@ -274,6 +276,7 @@ func TestRejectedStartReleasesSlot(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	r := runner{dir: root, srv: s, slot: slot, ctx: ctx}
+	startFixtureWriter(t, &r)
 	if err = r.input("hello", "msg", false); err == nil || r.slot != nil {
 		t.Fatal(err, r.slot)
 	}
@@ -296,6 +299,7 @@ func TestLateReplyDuringNextCall(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	r := runner{dir: dir, ctx: ctx, srv: s, log: log}
+	startFixtureWriter(t, &r)
 	if err = r.call("first", nil, nil); err == nil {
 		t.Fatal("RPC did not expire")
 	}
@@ -332,20 +336,14 @@ func TestPendingControlSurvivesNextPublisher(t *testing.T) {
 	if err := publishMarker(dir, "interrupt", markerOptions{ID: "first"}, nil); err != nil {
 		t.Fatal(err)
 	}
-	done := make(chan error, 1)
-	go func() { done <- publishMarker(dir, "interrupt", markerOptions{ID: "second"}, nil) }()
-	select {
-	case err := <-done:
-		t.Fatalf("overwrote pending command: %v", err)
-	case <-time.After(50 * time.Millisecond):
+	if err := publishMarker(dir, "interrupt", markerOptions{ID: "second"}, nil); err != nil {
+		t.Fatal(err)
 	}
 	r := runner{dir: dir}
+	startFixtureWriter(t, &r)
 	first, ok, err := r.takeMarker("interrupt")
 	if err != nil || !ok || first.ID != "first" {
 		t.Fatal(first, ok, err)
-	}
-	if err = <-done; err != nil {
-		t.Fatal(err)
 	}
 	second, ok, err := r.takeMarker("interrupt")
 	if err != nil || !ok || second.ID != "second" {

@@ -43,7 +43,7 @@ func preinstallDoctor(ctx context.Context, h endpoint) (fields, error) {
 	script := `root=$1
 [ -n "$root" ] || root="${CXRUN_STATE:-$HOME/` + defaultStateDir + `}"
 printf 'root\t%s\n' "$root"
-for tool in git ssh tmux codex claude; do printf '%s\t%s\n' "$tool" "$(command -v "$tool")"; done
+for tool in git ssh tmux; do printf '%s\t%s\n' "$tool" "$(command -v "$tool")"; done
 printf 'cx_path\t%s\n' "$(command -v "$2")"
 test -d "$root" && test -w "$root" && echo state_writable
 test -f "$root/host.json" && echo host_json_present
@@ -55,16 +55,24 @@ if test "$(uname -s)" = Linux; then
  test -r /proc/loadavg && awk '{print "load1\t" $1}' /proc/loadavg
 else sysctl -n vm.loadavg 2>/dev/null | awk '{print "load1\t" $2}'; fi
 df -Pk "$HOME" | awk 'NR==2{printf "disk_free_bytes\t%.0f\n",$4*1024}'
-if command -v codex >/dev/null; then if codex login status >/dev/null 2>&1; then echo codex_logged_in; else echo codex_logged_out; fi; fi
-if command -v claude >/dev/null; then claude auth status --json 2>/dev/null | tr -d '[:space:]' | grep -q '"loggedIn":true' && echo claude_logged_in; fi
-exit 0
+` + engineDoctorSh() + `exit 0
 `
 	b, e := h.rawSSH(ctx, "ssh", []string{"--", h.SSH, "sh -s -- " + shellQuote(h.State) + " " + shellQuote(h.CX)}, script, 25*time.Second)
 	if e != nil {
 		return nil, e
 	}
-	f := fields{"cx_version": nil, "platform": plat, "node_available": false, "state_writable": false, "gocache_writable": false, "host_json_present": false, "claude_logged_in": nil, "codex_login_status": nil}
+	f := fields{"cx_version": nil, "platform": plat, "node_available": false, "state_writable": false, "gocache_writable": false, "host_json_present": false}
+	engineRows := fields{}
+	for _, e := range engines {
+		engineRows[e.name] = fields{"path": nil, "login_status": nil}
+	}
+	f["engines"] = engineRows
 	for _, line := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+		if name, rest, ok := strings.Cut(strings.TrimPrefix(line, "engine\t"), "\t"); ok && strings.HasPrefix(line, "engine\t") {
+			path, login, _ := strings.Cut(rest, "\t")
+			engineRows[name] = fields{"path": stringOrNil(path), "login_status": stringOrNil(login)}
+			continue
+		}
 		k, v, ok := strings.Cut(line, "\t")
 		if ok {
 			switch k {
@@ -81,11 +89,7 @@ exit 0
 			continue
 		}
 		switch k {
-		case "codex_logged_in":
-			f["codex_login_status"] = "logged_in"
-		case "codex_logged_out":
-			f["codex_login_status"] = "logged_out"
-		case "state_writable", "host_json_present", "gocache_writable", "state_owned_by_user", "claude_logged_in":
+		case "state_writable", "host_json_present", "gocache_writable", "state_owned_by_user":
 			f[k] = true
 		}
 	}
@@ -95,12 +99,11 @@ exit 0
 	return f, nil
 }
 func preinstallWindows(ctx context.Context, h endpoint) (fields, error) {
-	code := "$root=" + psQuote(h.State) + ";" + `if(!$root){$root=$env:CXRUN_STATE};if(!$root){$root=Join-Path $HOME ` + psQuote(defaultStateDir) + `}
- $f=@{platform='windows';state_root=$root;cx_version=$null;node_available=$false;host_json_present=(Test-Path (Join-Path $root host.json));codex_login_status=$null;claude_logged_in=$null}
- foreach($tool in ('git','ssh','psmux','codex','claude')){$f[$tool]=(Get-Command $tool -ErrorAction SilentlyContinue).Source}
+	code := "$root=" + psQuote(h.State) + ";" + `if(!$root){$root=$env:CXRUN_STATE};if(!$root){$root=Join-Path $env:LOCALAPPDATA ` + psQuote(defaultWindowsStateDir) + `}
+ $f=@{platform='windows';state_root=$root;cx_version=$null;node_available=$false;host_json_present=(Test-Path (Join-Path $root host.json))}
+ foreach($tool in ('git','ssh','psmux')){$f[$tool]=(Get-Command $tool -ErrorAction SilentlyContinue).Source}
+ ` + engineDoctorPS() + `$f.engines=$engines
  if($f.psmux){$socket=$env:CXRUN_TMUX_SOCKET;if(!$socket){$socket='cx'};$f.psmux_session=[bool](& $f.psmux -L $socket list-sessions 2>$null)}
- if($f.codex){$null=& $f.codex login status 2>&1;if($LASTEXITCODE -eq 0){$f.codex_login_status='logged_in'}else{$f.codex_login_status='logged_out'}}
- if($f.claude){try{$f.claude_logged_in=((& $f.claude auth status --json 2>$null)|ConvertFrom-Json).loggedIn}catch{}}
  $cache=$env:GOCACHE;if(!$cache -and (Get-Command go -ErrorAction SilentlyContinue)){$cache=go env GOCACHE}
  $f.gocache=$cache;foreach($item in @(@('state_writable',$root),@('gocache_writable',$cache))){$f[$item[0]]=$false;if($item[1] -and (Test-Path -LiteralPath $item[1] -PathType Container)){try{$temp=Join-Path $item[1] ([Guid]::NewGuid());$s=[IO.File]::Open($temp,'CreateNew','Write','None');$s.Dispose();[IO.File]::Delete($temp);$f[$item[0]]=$true}catch{}}}
  $f.disk_free_bytes=(Get-PSDrive -Name ([IO.Path]::GetPathRoot($HOME).Substring(0,1))).Free

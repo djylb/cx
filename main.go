@@ -21,8 +21,7 @@ import (
 )
 
 const (
-	defaultSandbox          = "read-only"
-	defaultNetwork          = false
+	defaultSandbox          = "workspace-write"
 	defaultRestartLimit     = 3
 	defaultCmdStall         = 30 * time.Minute
 	defaultQuiet            = 15 * time.Minute
@@ -37,7 +36,7 @@ const (
 	defaultWindowsSlots     = 6
 	defaultOtherSlots       = 3
 	defaultSystemSlots      = 1
-	codexSlotClass          = "codex"
+	agentSlotClass          = "agent"
 	testSlotClass           = "test"
 	appServerApprovalPolicy = "never"
 	defaultStallNudge       = "No progress detected. Report status, abandon any stuck command, and continue the task."
@@ -60,6 +59,7 @@ type config struct {
 	StallNudge                          string            `json:"stall_nudge,omitempty"`
 	Dir, Model, Effort, Sandbox, Prompt string
 	localEnv                            []string
+	cacheUse                            *cacheUse
 	Input                               []json.RawMessage `json:"input,omitempty"`
 	Argv                                []string          `json:"argv,omitempty"`
 	Roots                               []string          `json:"roots,omitempty"` // extra writable roots (workspace-write), e.g. a Go build cache
@@ -86,14 +86,15 @@ type status struct {
 	rateLimitStatus
 	turnSummary
 
-	Project     string `json:"project,omitempty"`
-	Session     string `json:"session,omitempty"`
-	Job         string `json:"job"`
-	State       string `json:"status"`
-	QueueReason string `json:"queue_reason,omitempty"`
-	Profile     string `json:"profile,omitempty"`
-	Engine      string `json:"engine,omitempty"`
-	RunID       string `json:"run_id,omitempty"`
+	Project         string `json:"project,omitempty"`
+	Session         string `json:"session,omitempty"`
+	Job             string `json:"job"`
+	State           string `json:"status"`
+	QueueReason     string `json:"queue_reason,omitempty"`
+	QueueGeneration uint64 `json:"queue_generation,omitempty"`
+	Profile         string `json:"profile,omitempty"`
+	Engine          string `json:"engine,omitempty"`
+	RunID           string `json:"run_id,omitempty"`
 
 	Thread          string `json:"thread_id"`
 	Turn            string `json:"turn_id"`
@@ -110,18 +111,20 @@ type status struct {
 	Usage     json.RawMessage `json:"token_usage"`
 	Approvals []approval      `json:"pending_requests,omitempty"`
 
-	OutboxSeq    uint64 `json:"outbox_seq,omitempty"`
-	Generation   uint64 `json:"generation,omitempty"`
-	CompactAfter int64  `json:"compact_after_seq,omitempty"`
-	CompactSeq   int64  `json:"compact_event_seq,omitempty"`
-	RunnerStart  uint64 `json:"runner_start,omitempty"`
-	Restarts     int    `json:"restarts,omitempty"`
-	CommandPID   int    `json:"command_pid,omitempty"`
-	PID          int    `json:"pid,omitempty"`
-	ServerPID    int    `json:"server_pid,omitempty"`
-	Finished     int64  `json:"completed_turns"`
-	StallCount   int    `json:"stall_count,omitempty"`
-	Privileged   bool   `json:"privileged,omitempty"`
+	Generation     uint64 `json:"generation,omitempty"`
+	CompactAfter   int64  `json:"compact_after_seq,omitempty"`
+	CompactSeq     int64  `json:"compact_event_seq,omitempty"`
+	RunnerStart    uint64 `json:"runner_start,omitempty"`
+	Restarts       int    `json:"restarts,omitempty"`
+	LaunchID       string `json:"launch_id,omitempty"`
+	EngineRestarts int    `json:"engine_restarts,omitempty"`
+	CommandPID     int    `json:"command_pid,omitempty"`
+	PID            int    `json:"pid,omitempty"`
+	EnginePID      int    `json:"engine_pid,omitempty"`
+	Finished       int64  `json:"completed_turns"`
+	StallCount     int    `json:"stall_count,omitempty"`
+	Privileged     bool   `json:"privileged,omitempty"`
+	final          bool
 }
 
 // diagnosticf writes advisory text or reports an existing failure. A broken
@@ -135,6 +138,7 @@ func closeBestEffort(c io.Closer) { _ = c.Close() }
 func removeBestEffort(path string)     { _ = os.Remove(path) }
 func removeTreeBestEffort(path string) { _ = os.RemoveAll(path) }
 
+// atomicWrite replaces private files. Shared job state uses the state log.
 func atomicWrite(path string, b []byte) error {
 	return atomicWriteSync(path, b, (*os.File).Sync)
 }
@@ -154,7 +158,7 @@ func atomicWriteSync(path string, b []byte, syncFile func(*os.File) error) error
 	if err != nil {
 		return err
 	}
-	if err = replaceFile(f.Name(), path); err != nil || runtime.GOOS == "windows" {
+	if err = os.Rename(f.Name(), path); err != nil || runtime.GOOS == "windows" {
 		return err
 	}
 	dir, err := os.Open(filepath.Dir(path))
@@ -172,17 +176,8 @@ func writeJSON(path string, v any) error {
 	return atomicWrite(path, append(b, '\n'))
 }
 
-// writeJSONVolatile replaces path atomically without flushing it; a crash keeps either
-// the old or the new contents, a power loss may lose the update.
-func writeJSONVolatile(path string, v any) error {
-	b, err := json.MarshalIndent(v, "", "  ")
-	if err != nil {
-		return err
-	}
-	return atomicWriteSync(path, append(b, '\n'), func(*os.File) error { return nil })
-}
 func readJSON(path string, v any) error {
-	b, err := readStateFile(path)
+	b, err := readSharedFile(path)
 	if err != nil {
 		return err
 	}
@@ -190,7 +185,7 @@ func readJSON(path string, v any) error {
 }
 
 func readInputText(path string) (string, error) {
-	b, err := readStateFile(path)
+	b, err := readSharedFile(path)
 	if err != nil {
 		return "", err
 	}
@@ -200,11 +195,22 @@ func readInputText(path string) (string, error) {
 	return string(b), nil
 }
 
-const defaultStateDir = ".local/share/cx/state"
+// Default state roots: under the home directory on Unix, under %LOCALAPPDATA% on Windows.
+const (
+	defaultStateDir        = ".local/share/cx/state"
+	defaultWindowsStateDir = `cx\state`
+)
 
 func stateRoot() (string, error) {
 	if s := os.Getenv("CXRUN_STATE"); s != "" {
 		return filepath.Abs(s)
+	}
+	if runtime.GOOS == "windows" {
+		local := os.Getenv("LOCALAPPDATA")
+		if local == "" {
+			return "", errors.New("LOCALAPPDATA is unset; set CXRUN_STATE")
+		}
+		return filepath.Join(local, defaultWindowsStateDir), nil
 	}
 	home, err := os.UserHomeDir()
 	return filepath.Join(home, defaultStateDir), err
@@ -219,45 +225,161 @@ func jobPath(root, job string) (string, error) {
 	}
 	return filepath.Join(root, job), nil
 }
-func printStatus(dir string) error {
-	b, err := readStateFile(filepath.Join(dir, "status.json"))
+
+func trashJobDir(root, project, job string) string {
+	if project == "" {
+		return filepath.Join(root, ".trash", "flat", job)
+	}
+	return filepath.Join(root, ".trash", "projects", project, job)
+}
+
+// The registry lock covers detachment only. Trash paths are never reused.
+func detachCleanJob(root, dir string, s status) error {
+	trash := trashJobDir(root, s.Project, s.Job)
+	if err := os.MkdirAll(trash, 0700); err != nil {
+		return err
+	}
+	if err := os.Rename(dir, filepath.Join(trash, rand.Text())); err != nil {
+		return err
+	}
+	return errors.Join(syncJobDir(filepath.Dir(dir)), syncJobTree(trash, root))
+}
+
+func reapDetachedJobs(root, project, job string) error {
+	trash := trashJobDir(root, project, job)
+	entries, err := os.ReadDir(trash)
+	if os.IsNotExist(err) {
+		return nil
+	}
 	if err != nil {
 		return err
 	}
-	_, err = os.Stdout.Write(b)
+	for _, entry := range entries {
+		err = errors.Join(err, os.RemoveAll(filepath.Join(trash, entry.Name())))
+	}
 	return err
 }
 
-// Publish config, mailbox and initial status together. Concurrent starters see a complete job.
-func register(root, dir string, c config, s status) error {
-	s.RunID = c.RunID
-	s.Privileged = c.privileged()
-	stage, err := os.MkdirTemp(root, ".register-*")
+func printStatus(dir string) error {
+	record, _, err := jobStatusRecord(dir)
 	if err != nil {
 		return err
 	}
-	defer removeTreeBestEffort(stage)
-	for _, p := range []string{"inbox/done", "inbox/pending"} {
-		if err = os.MkdirAll(filepath.Join(stage, p), 0700); err != nil {
+	_, err = os.Stdout.Write(append(record.Value, '\n'))
+	return err
+}
+
+// The caller holds the registry lock. The first status record publishes the job.
+func register(parent, dir string, c config, s status) error {
+	return registerJob(context.Background(), parent, dir, c, s, (*stateWriter).sync)
+}
+
+func registerJob(ctx context.Context, parent, dir string, c config, s status, syncConfig func(*stateWriter) error) error {
+	if err := os.MkdirAll(parent, 0700); err != nil {
+		return err
+	}
+	if err := os.Mkdir(dir, 0700); err != nil {
+		if !os.IsExist(err) {
 			return err
 		}
+		entries, readErr := os.ReadDir(dir)
+		if readErr != nil {
+			return readErr
+		}
+		for _, entry := range entries {
+			switch entry.Name() {
+			case "owner.lock", "owner-probe.lock", "state":
+				continue
+			case "output.log", "progress.log", "events.jsonl", "handoff.lock":
+				// A staged registration has published its config before any
+				// mutable streams are created.
+				if cfg, err := jobConfigRecord(dir); err == nil && cfg.Seq != 0 {
+					continue
+				}
+			}
+			return fmt.Errorf("%w: retire incompatible or populated job directory %s", os.ErrExist, dir)
+		}
 	}
-	if err = writeJSON(filepath.Join(stage, "config.json"), c); err != nil {
+
+	owner, err := openJobOwner(ctx, dir, jobFileLock)
+	if err != nil {
 		return err
 	}
-	if err = writeJSON(filepath.Join(stage, "status.json"), s); err != nil {
+	if owner == nil {
+		return &os.PathError{Op: "register", Path: dir, Err: os.ErrExist}
+	}
+	defer closeBestEffort(owner)
+	if record, _, err := latestState(dir); err != nil {
+		return err
+	} else if record.Seq != 0 {
+		return &os.PathError{Op: "register", Path: dir, Err: os.ErrExist}
+	}
+	s.RunID = c.RunID
+	s.Privileged = c.privileged()
+	r := runner{dir: dir, c: c, s: s}
+	if err := r.openState(); err != nil {
 		return err
 	}
-	files := []string{"progress.log", "owner.lock", "events.jsonl"}
+	defer closeBestEffort(r.stateLog)
+	// The durable config distinguishes an incomplete registration from a
+	// legacy directory even if later stream creation is interrupted.
+	if err := syncConfig(r.stateLog); err != nil {
+		return err
+	}
+	files := []string{"progress.log", "events.jsonl", "handoff.lock", "owner-probe.lock"}
 	if len(c.Argv) > 0 {
-		files = append(files, "output.log", "last.md")
+		files = append(files, "output.log")
 	}
 	for _, name := range files {
-		if err = os.WriteFile(filepath.Join(stage, name), nil, 0600); err != nil {
+		f, err := openJobFile(filepath.Join(dir, name), jobFileNew)
+		if os.IsExist(err) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if err := f.Close(); err != nil {
 			return err
 		}
 	}
-	return os.Rename(stage, dir)
+	if err := initMailboxLocks(dir); err != nil {
+		return err
+	}
+	// Persist the directory chain before the registration can yield an owner.
+	root := parent
+	if s.Project != "" {
+		root = filepath.Dir(parent)
+	}
+	if err := syncJobTree(dir, root); err != nil {
+		return err
+	}
+	if isTerminal(s.State) {
+		return r.saveTerminal()
+	}
+	return errors.Join(r.save(), r.stateLog.Close())
+}
+
+// The submitter holds the registry lock. A worker that acquired owner.lock
+// before the launch acknowledgement failed remains responsible for its state.
+func recordLaunchFailure(ctx context.Context, dir string, c config, launchErr error) error {
+	owner, err := openJobFile(filepath.Join(dir, "owner.lock"), jobFileLock)
+	if err != nil {
+		return errors.Join(launchErr, err)
+	}
+	defer closeBestEffort(owner)
+	owned, err := tryAcquireJobOwner(ctx, dir, owner)
+	if err != nil || !owned {
+		return errors.Join(launchErr, err)
+	}
+	r := runner{dir: dir, c: c}
+	record, err := readJobStatus(dir, &r.s)
+	if err != nil || record.Final || r.s.PID != 0 || r.s.RunID != c.RunID {
+		return errors.Join(launchErr, err)
+	}
+	if err := r.openState(); err != nil {
+		return errors.Join(launchErr, err)
+	}
+	return r.failStart(launchErr)
 }
 
 func run(ctx context.Context, args []string) error { return runNode(ctx, args, false) }
@@ -292,6 +414,17 @@ func runNode(ctx context.Context, args []string, directSubmit bool) error {
 		return json.NewEncoder(os.Stdout).Encode(host)
 	}
 	job := fs.String("job", "", "job ID")
+	var expectedRun, expectedDir, expectedWorkspace, launchID string
+	if op == "_command" || op == "resume" || op == "fork" || op == "mcp-tools" {
+		fs.StringVar(&expectedRun, "expect-run", "", "expected job run for worker handoff")
+	}
+	if op == "_command" || op == "resume" || op == "fork" {
+		fs.StringVar(&expectedDir, "expect-dir", "", "expected directory identity for worker handoff")
+	}
+	if op == "start" || op == "fork" || op == "resume" {
+		fs.StringVar(&launchID, "launch-id", "", "runner handoff identifier")
+		fs.StringVar(&expectedWorkspace, "expect-workspace", "", "expected working directory identity for runner handoff")
+	}
 	var c config
 	var since string
 	var outSince uint64
@@ -319,7 +452,7 @@ func runNode(ctx context.Context, args []string, directSubmit bool) error {
 	if op == "list" {
 		fs.StringVar(&listFields, "fields", "", "brief for compact status")
 	}
-	var force, command bool
+	var force, command, network, noNetwork bool
 	var requestedProfile string
 	if op == "start" || op == "resume" || op == "fork" {
 		fs.StringVar(&requestedProfile, "profile", "", "execution host profile")
@@ -341,12 +474,13 @@ func runNode(ctx context.Context, args []string, directSubmit bool) error {
 		fs.StringVar(&prompt, "prompt-file", "", "UTF-8 prompt file")
 		fs.StringVar(&preamblePath, "preamble-file", os.Getenv("CXRUN_PREAMBLE_FILE"), "UTF-8 first-turn preamble file")
 		fs.StringVar(&stallNudgePath, "stall-nudge-file", "", "UTF-8 stall and recovery message file")
-		fs.StringVar(&c.Engine, "engine", "", "codex or claude")
+		fs.StringVar(&c.Engine, "engine", "", "agent engine: "+strings.Join(engineNames(), " or ")+" (default "+defaultEngine+")")
 		fs.BoolVar(&c.WebSearch, "web-search", false, "enable live web search")
 		fs.StringVar(&c.Model, "model", "", "model (engine default)")
 		fs.StringVar(&c.Effort, "effort", "", "reasoning effort")
 		fs.StringVar(&c.Sandbox, "sandbox", defaultSandbox, "read-only, workspace-write, or danger-full-access")
-		fs.BoolVar(&c.Network, "network", defaultNetwork, "sandbox network access")
+		fs.BoolVar(&network, "network", false, "allow sandbox network access (default for workspace-write)")
+		fs.BoolVar(&noNetwork, "no-network", false, "deny sandbox network access (default for read-only)")
 		fs.Func("writable-root", "extra writable directory for workspace-write (repeatable)", func(v string) error {
 			c.Roots = append(c.Roots, v)
 			return nil
@@ -354,20 +488,31 @@ func runNode(ctx context.Context, args []string, directSubmit bool) error {
 		fs.DurationVar(&c.Idle, "idle-exit", defaultIdle, "idle lifetime")
 		fs.DurationVar(&c.Approval, "approval-timeout", defaultApproval, "approval deadline")
 		fs.DurationVar(&c.TurnLimit, "turn-timeout", defaultTurnLimit, "turn deadline")
-		fs.IntVar(&c.RestartLimit, "max-restarts", defaultRestartLimit, "app-server restart budget per job")
+		fs.IntVar(&c.RestartLimit, "max-restarts", defaultRestartLimit, "engine restart budget per job")
 		fs.DurationVar(&c.CmdStall, "cmd-stall", defaultCmdStall, "command silence window")
-		fs.DurationVar(&c.Stall, "stall", defaultStall, "no app-server event for this long: steer, interrupt, restart, stalled (0 disables)")
+		fs.DurationVar(&c.Stall, "stall", defaultStall, "no engine event for this long: steer, interrupt, restart, stalled (0 disables)")
 	}
 	var opts options
 	opts.flags(fs, op)
 	if op == "start" {
-		fs.BoolVar(&c.JobTools, "job-tools", false, "configure job-scoped Codex message tools")
+		fs.BoolVar(&c.JobTools, "job-tools", false, "give the agent job-scoped messaging tools")
 		fs.BoolVar(&c.Interactive, "interactive", false, "recognize STATUS: QUESTION")
 	}
 	var prefix []string
 	rest := args[1:]
 	if err = fs.Parse(rest); err != nil {
 		return err
+	}
+	if _, err := checkNodeStateFormat(root); err != nil {
+		return err
+	}
+	explicitApproval := false
+	fs.Visit(func(f *flag.Flag) { explicitApproval = explicitApproval || f.Name == "approval-timeout" })
+	if network && noNetwork {
+		return errors.New("--network and --no-network are exclusive")
+	}
+	if op == "start" {
+		c.Network = network || !noNetwork && c.Sandbox == "workspace-write"
 	}
 	switch op {
 	case "rpc", "fork", "mcp", "history", "threads":
@@ -436,15 +581,14 @@ func runNode(ctx context.Context, args []string, directSubmit bool) error {
 			return errors.New("unexpected arguments")
 		}
 		if op == "mcp-tools" {
-			in := interruptibleStdin()
-			stopRead := context.AfterFunc(ctx, func() { _ = in.Close() })
-			defer stopRead()
-			return serveTools(ctx, dir, in, os.Stdout)
+			return serveToolsFor(ctx, dir, expectedRun, commandInput{ctx: ctx}, os.Stdout)
 		}
 		enc := json.NewEncoder(os.Stdout)
 		return readMail(dir, outSince, func(m agentMail) error { return enc.Encode(m) })
 	}
 	profile := requestedProfile
+	var sourceID, sourceDir string
+	var sourceIdentity jobIdentity
 	if op == "fork" {
 		if len(pos) != 1 {
 			return errors.New("fork SOURCE --job NEW")
@@ -457,23 +601,34 @@ func runNode(ctx context.Context, args []string, directSubmit bool) error {
 				return err
 			}
 			source = name
+			sourceID = proj + "/" + name
+		} else {
+			sourceID = source
+			if *project != "" {
+				sourceID = *project + "/" + source
+			}
 		}
 		src, sourceErr := jobPath(sourceParent, source)
 		if sourceErr != nil {
 			return sourceErr
 		}
-		if sourceErr = readJSON(filepath.Join(src, "config.json"), &c); sourceErr != nil {
+		id, from, _, sourceErr := captureJobIdentity(src)
+		if sourceErr != nil {
 			return sourceErr
 		}
-		var from status
-		if sourceErr = readJSON(filepath.Join(src, "status.json"), &from); sourceErr != nil {
+		if expectedRun != "" && expectedRun != id.run || expectedDir != "" && expectedDir != id.key {
+			return errJobReplaced
+		}
+		sourceIdentity, sourceDir = id, src
+		expectedRun, expectedDir = "", ""
+		if sourceErr = readJobConfig(src, &c); sourceErr != nil {
 			return sourceErr
 		}
 		if from.Thread == "" {
 			return errors.New("source has no thread")
 		}
 		if !c.driver().capabilities().Fork {
-			return errors.New("driver does not support fork")
+			return fmt.Errorf("fork not supported by engine %s", c.Engine)
 		}
 		if profile == "" {
 			profile = from.Profile
@@ -482,6 +637,11 @@ func runNode(ctx context.Context, args []string, directSubmit bool) error {
 		c.Through = opts.through
 		c.DedupKey = ""
 		op = "start"
+	}
+	if need, ok := commandNeeds[op]; ok && op != "fork" && op != "resume" {
+		if err = checkJobCapability(dir, op, need); err != nil {
+			return err
+		}
 	}
 	if handled, dispatchErr := opts.dispatch(ctx, dir, op, pos); handled {
 		return dispatchErr
@@ -495,13 +655,25 @@ func runNode(ctx context.Context, args []string, directSubmit bool) error {
 		}
 		return observe(ctx, op, dir)
 	}
-	terminalClose := op == "close"
-	if terminalClose {
-		terminalClose, err = deliverClose(ctx, dir, marker, fs.Args())
-		if err != nil || !terminalClose {
+	var closing *closeConfirmation
+	if op == "close" {
+		closing, err = deliverClose(ctx, dir, marker, fs.Args())
+		if err != nil || closing == nil {
 			return err
 		}
+		work, err := workDir(dir, closing.status)
+		if err != nil {
+			return err
+		}
+		if id := privateWorkspaceID(root, work); id != "" {
+			lock, err := jobOperationLock(ctx, root, id)
+			if err != nil {
+				return err
+			}
+			defer closeBestEffort(lock)
+		}
 	}
+	terminalClose := closing != nil
 	if !terminalClose && op != "start" && op != "resume" && op != "clean" && op != "_command" {
 		if since != "" {
 			if fs.NArg() != 0 {
@@ -518,7 +690,7 @@ func runNode(ctx context.Context, args []string, directSubmit bool) error {
 		if isMarker(op) {
 			return publishMarker(dir, op, marker, fs.Args())
 		}
-		if op == "say" && (opts.input != "" || opts.image != "") {
+		if op == "say" && (opts.input != "" || len(opts.images) > 0) {
 			return structuredSay(dir, opts, fs.Args())
 		}
 		return control(ctx, op, dir, fs.Args())
@@ -526,10 +698,52 @@ func runNode(ctx context.Context, args []string, directSubmit bool) error {
 	if fs.NArg() != 0 && c.ForkThread == "" && !command && !c.Shell {
 		return errors.New("unexpected positional arguments")
 	}
-	var guard *os.File
-	if op != "_command" {
-		guard, err = registryLock(ctx, root)
+	releaseWorkspace := func() {}
+	var startingIdentity jobIdentity
+	if (op == "start" || op == "resume") && (!directSubmit || launchID != "") {
+		cwd := c.Dir
+		jobs := []string{*job}
+		if *project != "" {
+			jobs[0] = *project + "/" + *job
+		}
+		if sourceID != "" {
+			jobs = append(jobs, sourceID)
+		}
+		if op == "resume" {
+			startingIdentity, _, _, err = captureJobIdentity(dir)
+			if err != nil {
+				return err
+			}
+			var saved config
+			if err := readJobConfig(dir, &saved); err != nil {
+				return err
+			}
+			cwd = saved.Dir
+		} else if cwd == "" && (command || c.Shell) {
+			cwd = "."
+		}
+		bound, err := bindWorkspace(root, cwd)
+		if err != nil {
+			return err
+		}
+		if expectedWorkspace != "" && bound.key != expectedWorkspace {
+			return errJobReplaced
+		}
+		releaseWorkspace, err = bound.lock(ctx, root, jobs...)
+		if err != nil {
+			return err
+		}
+		defer releaseWorkspace()
+		if sourceID != "" {
+			if err := sourceIdentity.checkDir(sourceDir); err != nil {
+				return err
+			}
+		}
+		if op == "start" && bound.path != "" {
+			c.Dir = bound.path
+		}
 	}
+	guard, err := registryLock(ctx, root)
 	if err != nil {
 		return err
 	}
@@ -538,8 +752,13 @@ func runNode(ctx context.Context, args []string, directSubmit bool) error {
 			_ = guard.Close()
 		}
 	}()
+	if op == "start" || op == "resume" {
+		if err := ensureNodeStateFormat(ctx, root); err != nil {
+			return err
+		}
+	}
 	if *project != "" {
-		if fi, e := os.Stat(filepath.Join(parent, "config.json")); (e != nil && !os.IsNotExist(e)) || (e == nil && fi.Mode().IsRegular()) {
+		if fi, e := os.Stat(filepath.Join(parent, "owner.lock")); (e != nil && !os.IsNotExist(e)) || (e == nil && fi.Mode().IsRegular()) {
 			return fmt.Errorf("project collides with flat job or inaccessible: %s", *project)
 		}
 	}
@@ -550,21 +769,15 @@ func runNode(ctx context.Context, args []string, directSubmit bool) error {
 		if err != nil {
 			return err
 		}
-		if _, err = os.Stat(dir); err == nil {
+		if _, _, err = jobStatusRecord(dir); err == nil {
 			if directSubmit {
 				if err = checkSubmission(dir, c, s.Profile, fs.Args()); err != nil {
 					return err
 				}
 			}
 			return printStatus(dir)
-		} else if !os.IsNotExist(err) {
+		} else if !errors.Is(err, errNotRegistered) {
 			return err
-		}
-		if c.Engine != "" && c.Engine != "codex" && c.Engine != "claude" {
-			return errors.New("unknown engine")
-		}
-		if c.Engine == "claude" {
-			s.Engine = c.Engine
 		}
 		if command || c.Shell {
 			if c.Engine != "" || c.WebSearch {
@@ -586,6 +799,14 @@ func runNode(ctx context.Context, args []string, directSubmit bool) error {
 			s.Engine = "cmd"
 		} else {
 			c.Quiet = 0
+			eng, engineErr := lookupEngine(c.Engine)
+			if engineErr != nil {
+				return engineErr
+			}
+			c.Engine, s.Engine = eng.name, eng.name
+			if engineErr = c.checkEngineOptions(eng, opts, explicitApproval); engineErr != nil {
+				return engineErr
+			}
 		}
 		if c.SlotClass != "" {
 			if _, err = jobPath(root, c.SlotClass); err != nil {
@@ -621,7 +842,7 @@ func runNode(ctx context.Context, args []string, directSubmit bool) error {
 			if startErr != nil {
 				return startErr
 			}
-			if c.ForkThread == "" && opts.input == "" && opts.image == "" && strings.TrimSpace(c.Prompt) == "" {
+			if c.ForkThread == "" && opts.input == "" && len(opts.images) == 0 && strings.TrimSpace(c.Prompt) == "" {
 				return errors.New("empty prompt")
 			}
 			if preamblePath != "" {
@@ -633,7 +854,7 @@ func runNode(ctx context.Context, args []string, directSubmit bool) error {
 					c.Prompt = strings.TrimRight(prefix, "\r\n") + "\n\n" + c.Prompt
 				}
 			}
-			if opts.input != "" || opts.image != "" {
+			if opts.input != "" || len(opts.images) > 0 {
 				c.Input, startErr = opts.inputs(c.Prompt)
 				if startErr != nil {
 					return startErr
@@ -648,125 +869,177 @@ func runNode(ctx context.Context, args []string, directSubmit bool) error {
 				}
 			}
 		}
-		if startErr = os.MkdirAll(parent, 0700); startErr != nil {
-			return startErr
-		}
 		if force {
 			c.DedupKey = ""
+		}
+		if startErr = c.newRunID(); startErr != nil {
+			return startErr
 		}
 		if c.DedupKey != "" {
 			if startErr = claimKey(root, c, s); startErr != nil {
 				return startErr
 			}
 		}
-		if startErr = c.newRunID(); startErr != nil {
-			return startErr
-		}
-		if startErr = register(parent, dir, c, s); startErr != nil {
-			if _, e := os.Stat(dir); e == nil {
-				return printStatus(dir)
-			}
+		s.LaunchID = launchID
+		if startErr = registerJob(ctx, parent, dir, c, s, (*stateWriter).sync); startErr != nil {
 			return startErr
 		}
 		if len(c.Argv) > 0 {
+			key, err := jobDirectoryKey(dir)
+			if err != nil {
+				return err
+			}
+			handoff, err := lockPath(filepath.Join(dir, "handoff.lock"), 0)
+			if err != nil {
+				return err
+			}
+			if handoff == nil {
+				return errors.New("command handoff already active")
+			}
+			defer closeBestEffort(handoff)
+			_ = guard.Close()
+			guard = nil
 			var done <-chan error
 			if directSubmit && runtime.GOOS == "windows" {
-				startErr = launchMuxCommand(ctx, root, *project, *job, c.RunID)
+				startErr = launchMuxCommand(ctx, root, *project, *job, c.RunID, key)
 			} else {
-				done, startErr = launchCommand(root, *project, *job)
+				done, startErr = launchCommand(root, *project, *job, c.RunID, key)
 			}
 			if startErr != nil {
 				if directSubmit && runtime.GOOS == "windows" && (errors.Is(startErr, context.DeadlineExceeded) || errors.Is(startErr, context.Canceled)) {
 					return fmt.Errorf("psmux launch acknowledgement unavailable: %w", startErr)
 				}
-				return errors.Join(startErr, os.RemoveAll(dir))
+				guard, err = registryLock(ctx, root)
+				if err != nil {
+					return errors.Join(startErr, err)
+				}
+				return recordLaunchFailure(ctx, dir, c, startErr)
 			}
-			ready, cancel := context.WithTimeout(ctx, 10*time.Second)
-			defer cancel()
-			for {
-				if startErr = readJSON(filepath.Join(dir, "status.json"), &s); startErr != nil {
-					return startErr
-				}
-				if s.PID != 0 || isTerminal(s.State) {
-					return printStatus(dir)
-				}
-				select {
-				case workerErr := <-done:
-					return errors.Join(errors.New("worker exited before acquiring ownership"), workerErr)
-				case <-ready.Done():
-					return fmt.Errorf("worker registration acknowledgement: %w", ready.Err())
-				case <-time.After(20 * time.Millisecond):
-				}
-			}
+			return awaitRunner(ctx, dir, c.RunID, "", 0, done, "")
 		}
 	}
-	if op == "resume" {
-		if err = readJSON(filepath.Join(dir, "status.json"), &s); err != nil {
+
+	identity, current, cursor, err := captureJobIdentity(dir)
+	if err != nil {
+		if op == "clean" && errors.Is(err, os.ErrNotExist) {
+			_ = guard.Close()
+			guard = nil
+			return reapDetachedJobs(root, *project, *job)
+		}
+		return err
+	}
+	if startingIdentity.key != "" && startingIdentity != identity {
+		return errJobReplaced
+	}
+	if (op == "_command" && (expectedRun == "" || expectedDir == "")) || (expectedRun != "" && current.RunID != expectedRun) {
+		return errJobReplaced
+	}
+	if expectedDir != "" {
+		key, err := jobDirectoryKey(dir)
+		if err != nil {
 			return err
 		}
+		if key != expectedDir {
+			return errJobReplaced
+		}
+	}
+	if closing != nil {
+		if err := closing.check(dir, current, cursor); err != nil {
+			return err
+		}
+	}
+	s = current
+	if op == "resume" {
 		if err = checkResumeProfile(root, s.Profile, requestedProfile); err != nil {
 			return err
 		}
 	}
-	f, err := os.OpenFile(filepath.Join(dir, "owner.lock"), os.O_RDWR, 0600)
+	f, err := openJobFile(filepath.Join(dir, "owner.lock"), jobFileLockExisting)
 	if err != nil {
 		return err
 	}
-	defer closeBestEffort(f)
-	owned, err := tryLock(f)
+	maintainCacheOnExit := false
+	defer func() {
+		if maintainCacheOnExit {
+			maintainReleasedCaches(ctx, root)
+		}
+	}()
+	defer func() { _ = f.Close() }()
+	owned, err := tryAcquireJobOwner(ctx, dir, f)
 	if err != nil {
 		return err
 	}
-	if !owned && terminalClose {
-		_ = guard.Close()
-		guard = nil
-		// Terminal status is published just before the runner releases ownership.
+	resumeTerminal := op == "resume" && s.final
+	if !owned && (terminalClose || resumeTerminal) {
+		// The final status is visible before the previous runner releases
+		// ownership. Let its teardown finish without blocking the registry.
 		deadline, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
 		for !owned {
+			if guard != nil {
+				closeBestEffort(guard)
+				guard = nil
+			}
 			if err = pause(deadline, 20*time.Millisecond); err != nil {
 				return err
 			}
-			owned, err = tryLock(f)
+			if resumeTerminal {
+				// Resume publishes a new generation under the registry lock.
+				guard, err = registryLock(deadline, root)
+				if err != nil {
+					return err
+				}
+			}
+			owned, err = tryAcquireJobOwner(deadline, dir, f)
 			if err != nil {
 				return err
 			}
 		}
 	}
-	if !owned && op == "clean" {
-		return errors.New("job has a live owner")
-	}
 	if !owned {
+		if op == "clean" || launchID != "" || op == "_command" {
+			return errJobOwnerBusy
+		}
 		return printStatus(dir)
 	}
-	if err = readJSON(filepath.Join(dir, "config.json"), &c); err != nil {
+	if err := checkJobHandle(f, filepath.Join(dir, "owner.lock")); err != nil {
 		return err
 	}
-	if err = readJSON(filepath.Join(dir, "status.json"), &s); err != nil {
+	s, cursor, err = loadJobStatus(dir)
+	if err != nil {
 		return err
+	}
+	if err := identity.check(dir, s); err != nil {
+		return err
+	}
+	if resumeTerminal && !s.final {
+		return errJobOwnerBusy
+	}
+	if closing != nil {
+		if err := closing.check(dir, s, cursor); err != nil {
+			return err
+		}
+	}
+	if err = readJobConfig(dir, &c); err != nil {
+		return err
+	}
+	if c.RunID != s.RunID {
+		return errJobReplaced
 	}
 	if op == "_command" {
 		if len(c.Argv) == 0 {
 			return errors.New("expected command job")
 		}
-		if s.State != "queued" {
-			return printStatus(dir)
-		}
-		s.PID = os.Getpid()
-		if err = writeJSON(filepath.Join(dir, "status.json"), s); err != nil {
-			return err
-		}
-		guard, err = registryLock(ctx, root)
-		if err != nil {
-			return err
+		if s.final || s.PID != 0 || s.State != "queued" {
+			return errors.New("command handoff is no longer pending")
 		}
 	}
+
 	r := runner{root: root, dir: dir, c: c, s: s, ctx: ctx}
 	if op == "clean" || terminalClose {
-		if !isTerminal(s.State) {
+		if !s.final {
 			return errors.New("job is not terminal")
 		}
-		// Keep owner.lock throughout the grace period; other jobs can register.
 		if guard != nil {
 			_ = guard.Close()
 			guard = nil
@@ -777,91 +1050,110 @@ func runNode(ctx context.Context, args []string, directSubmit bool) error {
 		if terminalClose {
 			return r.releaseClosedWorkspace()
 		}
+		// Reacquire locks in registry -> owner order and pin the terminal
+		// cursor that was actually reclaimed.
+		if err = f.Close(); err != nil {
+			return err
+		}
 		guard, err = registryLock(ctx, root)
 		if err != nil {
 			return err
 		}
-		if err = archiveReceipt(root, c, r.s); err != nil {
+		confirmed, confirmedCursor, err := loadJobStatus(dir)
+		if err != nil {
 			return err
 		}
-		if err = f.Close(); err != nil {
+		if err = identity.check(dir, confirmed); err != nil {
 			return err
 		}
-		// Detach the complete directory before recursive deletion, so a
-		// partial filesystem failure cannot leave a half-registered job.
-		trash, tempErr := os.MkdirTemp(parent, ".clean-*")
-		if tempErr != nil {
-			return tempErr
+		if !confirmed.final || confirmedCursor != cursor {
+			return errJobReplaced
 		}
-		if tempErr = os.Rename(dir, filepath.Join(trash, "job")); tempErr != nil {
-			_ = os.Remove(trash)
-			return tempErr
+		owner, err := openJobOwner(ctx, dir, jobFileLockExisting)
+		if err != nil {
+			return err
 		}
-		return os.RemoveAll(trash)
+		if owner == nil {
+			return errJobOwnerBusy
+		}
+		if err := archiveAndDetachJob(ctx, root, dir, owner, c, r.s, syncJobTree); err != nil {
+			return err
+		}
+		_ = guard.Close()
+		guard = nil
+		return reapDetachedJobs(root, s.Project, s.Job)
 	}
 
 	if len(c.Argv) > 0 && op != "_command" {
 		return errors.New("command jobs cannot be replayed by resume")
 	}
 
+	if op != "_command" {
+		r.s.LaunchID = launchID
+	}
 	r.s.RunnerStart = processStart(os.Getpid())
+	r.s.PID = os.Getpid()
+	r.s.EnginePID = 0
+	r.s.CommandPID = 0
+	r.s.QueueReason = ""
+	if op == "resume" {
+		r.s.Restarts++
+		r.s.Error = ""
+		r.s.Approvals = nil
+	}
+	needsTicket := s.Thread == "" || r.active()
+	if needsTicket {
+		r.s.State = "queued"
+	} else {
+		r.s.State = "running"
+	}
 	if r.c.RunID == "" {
 		if err = r.c.newRunID(); err != nil {
 			return err
 		}
-		if err = writeJSON(filepath.Join(dir, "config.json"), r.c); err != nil {
-			return err
-		}
 	}
 	r.s.RunID = r.c.RunID
+	if err = r.openState(); err != nil {
+		return err
+	}
+	defer closeBestEffort(r.stateLog)
+	if damage := r.stateLog.RecoveryError(); damage != nil {
+		return fmt.Errorf("cannot resume with damaged state checkpoints: %w", damage)
+	}
+	if err = r.save(); err != nil {
+		return err
+	}
 	defer r.releaseSlot()
 	// Register the first ticket under the publication lock to preserve start order.
 	var ticket *queueTicket
-	if s.Thread == "" || r.active() {
+	if needsTicket {
 		ticket, err = r.newTicket()
 		if err != nil {
-			r.s.State = "failed"
-			r.s.PID = 0
-			r.s.Error = err.Error()
-			return errors.Join(err, r.save())
+			return r.failStart(err)
 		}
 	}
 	_ = guard.Close()
 	guard = nil
+	releaseWorkspace()
 	if ticket != nil {
-		r.s.PID = os.Getpid()
-		r.s.ServerPID = 0
 		if err = r.admit(ticket); err != nil {
-			r.s.PID = 0
 			if errors.Is(err, errQueuedClose) {
+				r.s.PID = 0
 				r.s.State = "done"
 				r.s.CompletedStatus = "interrupted"
-				return r.save()
+				return r.saveTerminal()
 			}
-			r.s.State = "failed"
-			if errors.Is(err, errQueueTimeout) {
-				r.s.State = "queue_timeout"
-			}
-			r.s.Error = err.Error()
-			return errors.Join(err, r.save())
+			return r.failStart(err)
 		}
 	}
-	if err = r.prepareBuildCache(); err != nil {
-		r.s.State = "failed"
-		r.s.PID = 0
-		r.s.Error = err.Error()
-		return errors.Join(err, r.save())
-	}
-	defer r.releaseBuildCache()
 	if err = r.loadCredentials(); err == nil {
-		err = r.preparePackageCaches()
+		err = r.prepareCaches()
 	}
 	if err != nil {
-		r.s.State = "failed"
-		r.s.PID = 0
-		r.s.Error = err.Error()
-		return errors.Join(err, r.save())
+		return r.failStart(err)
 	}
+	maintainCacheOnExit = true
+	defer r.releaseCaches()
 	return r.c.driver().run(&r)
 }
 func main() {
@@ -886,6 +1178,9 @@ func main() {
 			os.Exit(124)
 		case errors.Is(err, errNotRegistered):
 			os.Exit(11)
+		case errors.Is(err, errStateHistoryBusy):
+			diagnosticf("cxrun: %v\n", err)
+			os.Exit(9)
 		}
 		var result stateFailure
 		if errors.As(err, &result) {

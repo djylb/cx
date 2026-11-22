@@ -67,6 +67,18 @@ func commandFixture(args []string) int {
 			return 2
 		}
 		return 0
+	case "cache-parent":
+		if err := launchCacheFixture(len(args) > 1); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 2
+		}
+		return 0
+	case "cache-child":
+		if err := useCacheFixture(); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 2
+		}
+		return 0
 	case "tree":
 		exe, err := os.Executable()
 		if err != nil {
@@ -107,8 +119,9 @@ func commands(t *testing.T) *commandHarness {
 	}
 	root := t.TempDir()
 	t.Setenv("CXRUN_STATE", root)
-	setTestHost(t, root, map[string]int{"codex": 1, "test": 1}, "")
+	setTestHost(t, root, map[string]int{"agent": 1, "test": 1}, "")
 	t.Setenv("GORACE", "atexit_sleep_ms=0")
+	joinFixtureWorkers(t, root)
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	t.Cleanup(cancel)
 	return &commandHarness{root: root, work: t.TempDir(), exe: exe, ctx: ctx, t: t}
@@ -117,7 +130,7 @@ func commands(t *testing.T) *commandHarness {
 // running blocks until job owns its slot (start returns before admission, so queue-order tests need this).
 func (h *commandHarness) running(job string) {
 	h.t.Helper()
-	for deadline := time.Now().Add(10 * time.Second); !strings.Contains(h.cli(0, "status", "--job", "p/"+job), `"status": "running"`); {
+	for deadline := time.Now().Add(10 * time.Second); h.status(job).State != "running"; {
 		if time.Now().After(deadline) {
 			h.t.Fatalf("%s never started", job)
 		}
@@ -144,7 +157,7 @@ func (h *commandHarness) start(id string, opts []string, helper ...string) {
 func (h *commandHarness) status(id string) status {
 	h.t.Helper()
 	var s status
-	if err := readJSON(filepath.Join(h.root, "p", id, "status.json"), &s); err != nil {
+	if err := loadJobStatusInto(filepath.Join(h.root, "p", id), &s); err != nil {
 		h.t.Fatal(err)
 	}
 	return s
@@ -180,7 +193,7 @@ func TestCommandArgvExitAndLog(t *testing.T) {
 	if got := h.cli(0, "tail", "--job", "p/args"); got != want {
 		t.Fatal(got)
 	}
-	b, err := os.ReadFile(filepath.Join(h.root, "p", "args", "last.md"))
+	b, err := readTurnReport(t.Context(), filepath.Join(h.root, "p", "args"), "1")
 	if err != nil || string(b) != want {
 		t.Fatal(string(b), err)
 	}
@@ -189,6 +202,15 @@ func TestCommandAfterSubmitterExits(t *testing.T) {
 	h := commands(t)
 	h.start("detach", []string{"--timeout", "12s", "--dedup-key", "receipt"}, "after-parent")
 	// cli has waited for the actual submitter to exit and for its stdout/stderr EOF.
+	if runtime.GOOS != "windows" {
+		barrier, err := lockPath(os.Getenv(fixtureWorkerLock), 0)
+		if barrier != nil {
+			closeBestEffort(barrier)
+		}
+		if err != nil || barrier != nil {
+			t.Fatalf("detached worker must still hold the fixture lease: %v", err)
+		}
+	}
 	if out := h.cli(124, "wait", "--job", "p/detach", "--timeout", "80ms"); !strings.Contains(out, "wait_timeout=true") {
 		t.Fatal(out)
 	}
@@ -254,6 +276,12 @@ func TestCommandClassQueueAndClose(t *testing.T) {
 	h.cli(1, "wait", "--job", "p/queued")
 	h.cli(0, "close", "--job", "p/holder")
 	h.cli(1, "wait", "--job", "p/holder")
+	for _, name := range []string{"queued", "holder"} {
+		in, err := readInboxState(filepath.Join(h.root, "p", name))
+		if err != nil || in.acks[1].Result != "delivered" {
+			t.Fatalf("%s did not acknowledge the completed close: %+v (%v)", name, in, err)
+		}
+	}
 }
 func TestExplicitCommandShell(t *testing.T) {
 	h := commands(t)

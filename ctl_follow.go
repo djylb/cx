@@ -11,7 +11,6 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -20,6 +19,9 @@ import (
 
 type tailPosition struct {
 	Mode          string `json:"mode"`
+	DirectoryID   string `json:"directory_id,omitempty"`
+	StateCursor   string `json:"state_cursor,omitempty"`
+	RunID         string `json:"run_id,omitempty"`
 	LastCompleted string `json:"last_completed,omitempty"`
 	Next          int64  `json:"next"`
 	Since         int64  `json:"since,omitempty"`
@@ -30,6 +32,58 @@ type tailFrame struct {
 	Terminal *status      `json:"terminal,omitempty"`
 	Data     []byte       `json:"data,omitempty"`
 	Position tailPosition `json:"position"`
+}
+
+func (pos *tailPosition) openObservation(dir string) (*jobStateObserver, error) {
+	if pos.Next < 0 || pos.Since < 0 {
+		return nil, errors.New("invalid follow position")
+	}
+	var cursor stateCursor
+	if pos.StateCursor != "" {
+		var err error
+		cursor, err = parseCursor(pos.StateCursor)
+		if err != nil {
+			return nil, err
+		}
+	}
+	observer, err := openJobObservation(dir, cursor, pos.RunID)
+	if err != nil {
+		return nil, err
+	}
+	key := observer.identity.key
+	if pos.RunID != "" && (pos.RunID != observer.s.RunID || pos.DirectoryID != key) {
+		// Replace the old anchor on the already pinned observer. The status
+		// and log positions must all start on the same directory identity.
+		tail, err := openStateTail(dir, observer.cursor)
+		if err != nil {
+			closeBestEffort(observer)
+			return nil, err
+		}
+		closeBestEffort(observer.tail)
+		observer.tail = tail
+		mode := pos.Mode
+		if mode != "messages" {
+			mode = "since"
+		}
+		*pos = tailPosition{Mode: mode, Raw: pos.Raw}
+	}
+	pos.DirectoryID = key
+	return observer, nil
+}
+
+func (pos *tailPosition) readState(observer *jobStateObserver) error {
+	if err := observer.read(); err != nil {
+		return err
+	}
+	if observer.s.State == "" {
+		return os.ErrNotExist
+	}
+	if pos.DirectoryID == "" {
+		pos.DirectoryID = observer.identity.key
+	}
+	pos.StateCursor = observer.cursor.String()
+	pos.RunID = observer.s.RunID
+	return nil
 }
 
 // Frame complete records with their successor cursor. A partial SSH frame
@@ -76,30 +130,30 @@ func streamLog(ctx context.Context, dir string, pos tailPosition) error {
 	if pos.Mode == "messages" {
 		return streamMessages(ctx, dir, pos)
 	}
-	var s status
-	if e := readJSON(filepath.Join(dir, "status.json"), &s); e != nil {
+	observer, e := pos.openObservation(dir)
+	if e != nil {
 		return e
 	}
-	if pos.Mode == "since" {
-		pos.Mode = "seq"
-		if pos.Raw && s.Engine == "cmd" {
-			pos.Mode = "offset"
-		}
-	}
+	defer closeBestEffort(observer)
 	w := frameWriter{enc: json.NewEncoder(os.Stdout), pos: pos}
 	for ctx.Err() == nil {
-		var e error
-		v := strconv.FormatInt(w.pos.Next, 10)
+		if e = w.pos.readState(observer); e != nil {
+			return e
+		}
+		s := observer.s
+		if w.pos.Mode == "since" {
+			w.pos.Mode = "seq"
+			if w.pos.Raw && s.Engine == "cmd" {
+				w.pos.Mode = "offset"
+			}
+		}
 		if w.pos.Mode == "seq" {
-			e = writeLogSince(&w, dir, v)
+			e = writeJobProgress(&w, dir, uint64(w.pos.Next), s, &observer.identity)
 		} else {
-			e = writeLogFrom(&w, dir, []string{v})
+			e = writeJobLog(&w, dir, w.pos.Next, s, &observer.identity)
 		}
 		frame := tailFrame{Position: w.pos}
 		if errors.Is(e, errDrained) {
-			if e = readJSON(filepath.Join(dir, "status.json"), &s); e != nil {
-				return e
-			}
 			frame.Terminal = &s
 			return w.enc.Encode(frame)
 		}
@@ -154,7 +208,11 @@ func follow(ctx context.Context, h endpoint, name, id string, o ctlOptions) erro
 		}
 		defer closeBestEffort(lock)
 		if o.since == "" && !o.fromStart {
-			if e = readJSON(path, &pos); e != nil && !os.IsNotExist(e) {
+			if e = readJSON(path, &pos); e == nil {
+				if _, e = parseCursor(pos.StateCursor); e != nil {
+					return fmt.Errorf("read follow position: %w", e)
+				}
+			} else if !os.IsNotExist(e) {
 				return e
 			}
 		}
@@ -242,6 +300,11 @@ func follow(ctx context.Context, h endpoint, name, id string, o ctlOptions) erro
 // streamMessages follows the same framed, resumable observation protocol as
 // progress tail. Flush each frame so an idle job does not delay delivery.
 func streamMessages(ctx context.Context, dir string, pos tailPosition) (err error) {
+	observer, err := pos.openObservation(dir)
+	if err != nil {
+		return err
+	}
+	defer closeBestEffort(observer)
 	compressed := gzip.NewWriter(os.Stdout)
 	defer func() { err = errors.Join(err, compressed.Close()) }()
 	enc := json.NewEncoder(compressed)
@@ -252,17 +315,16 @@ func streamMessages(ctx context.Context, dir string, pos tailPosition) (err erro
 		return compressed.Flush()
 	}
 	for ctx.Err() == nil {
-		var s status
-		if e := readJSON(filepath.Join(dir, "status.json"), &s); e != nil {
+		if e := pos.readState(observer); e != nil {
 			return e
 		}
-		drained, e := readMessageEvents(ctx, dir, &pos, emit)
+		drained, e := readMessageEvents(ctx, dir, &pos, &observer.identity, emit)
 		if e != nil {
 			return e
 		}
 		frame := tailFrame{Position: pos}
-		if drained && isTerminal(s.State) {
-			frame.Terminal = &s
+		if drained && observer.s.final {
+			frame.Terminal = &observer.s
 			return emit(frame)
 		}
 		if e = emit(frame); e != nil {
@@ -273,8 +335,8 @@ func streamMessages(ctx context.Context, dir string, pos tailPosition) (err erro
 	return errObserveTimeout
 }
 
-func readMessageEvents(ctx context.Context, dir string, pos *tailPosition, emit func(tailFrame) error) (bool, error) {
-	f, err := openShared(filepath.Join(dir, "events.jsonl"))
+func readMessageEvents(ctx context.Context, dir string, pos *tailPosition, identity *jobIdentity, emit func(tailFrame) error) (bool, error) {
+	f, err := openObservedFile(dir, "events.jsonl", identity)
 	if os.IsNotExist(err) {
 		return true, nil
 	}

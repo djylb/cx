@@ -5,87 +5,96 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
-	"strconv"
-	"strings"
 	"time"
 )
 
 const agentAsk = "agent_ask"
+const outboxSeenKind = "outbox_seen"
+const outboxRequestKind = "outbox_request"
+
+type pendingAgentAsk struct {
+	Request    string `json:"request_id"`
+	Generation uint64 `json:"generation"`
+}
 
 type agentMail struct {
-	Deadline   *time.Time `json:"deadline,omitempty"`
-	Time       time.Time  `json:"time"`
-	Type       string     `json:"type"`
-	To         string     `json:"to"`
-	Text       string     `json:"text,omitempty"`
-	Question   string     `json:"question,omitempty"`
-	Request    string     `json:"request_id,omitempty"`
-	RunID      string     `json:"run_id"`
-	Options    []string   `json:"options,omitempty"`
-	Seq        uint64     `json:"seq"`
-	Generation uint64     `json:"generation"`
-	Blocking   bool       `json:"blocking,omitempty"`
+	Timeout    time.Duration `json:"timeout_ns,omitempty"`
+	Deadline   *time.Time    `json:"deadline,omitempty"`
+	Time       time.Time     `json:"time"`
+	Type       string        `json:"type"`
+	To         string        `json:"to"`
+	Text       string        `json:"text,omitempty"`
+	Question   string        `json:"question,omitempty"`
+	Request    string        `json:"request_id,omitempty"`
+	RunID      string        `json:"run_id"`
+	Options    []string      `json:"options,omitempty"`
+	Seq        uint64        `json:"seq"`
+	Generation uint64        `json:"generation"`
+	Blocking   bool          `json:"blocking,omitempty"`
 }
 
-func mailPath(dir string, seq uint64) string {
-	return filepath.Join(dir, "outbox", "messages", fmt.Sprintf("%020d.json", seq))
-}
-
-// The append lock covers sequence allocation and atomic publication. The log itself is the counter.
-func appendMail(ctx context.Context, dir string, m *agentMail) error {
-	var s status
-	if err := readJSON(filepath.Join(dir, "status.json"), &s); err != nil {
-		return err
-	}
-	if isTerminal(s.State) || s.Engine == "cmd" {
-		return errors.New("messaging requires a live agent job")
-	}
-	folder := filepath.Dir(mailPath(dir, 0))
-	if err := os.MkdirAll(folder, 0700); err != nil {
-		return err
-	}
-	lock, err := lockUntil(ctx, filepath.Join(folder, "append.lock"))
-	if err != nil {
-		return err
-	}
-	defer closeBestEffort(lock)
-	// The runner's cursor is a lower bound; unpublished gaps cannot exist under the append lock.
-	m.Seq = s.OutboxSeq + 1
-	for {
-		exists, err := fileExists(mailPath(dir, m.Seq))
-		if err != nil {
+func appendMail(ctx context.Context, dir string, identity jobIdentity, operation string, m *agentMail) error {
+	_, err := appendJobMailbox(ctx, dir, "outbox", &identity, stateRecord{Kind: m.Type, ID: operation},
+		func(record *stateRecord, previous stateRecord, s status) error {
+			if s.Engine == "cmd" {
+				return errors.New("messaging requires an agent job")
+			}
+			if previous.Seq != 0 {
+				var original agentMail
+				if err := json.Unmarshal(previous.Value, &original); err != nil {
+					return err
+				}
+				m.Seq, m.Time, m.Deadline = original.Seq, original.Time, original.Deadline
+				m.Request, m.Generation, m.RunID = original.Request, original.Generation, original.RunID
+			} else {
+				m.Seq, m.Time = record.Seq, record.Time
+				m.Generation, m.RunID = s.Generation, s.RunID
+				if m.Type == "ask" {
+					m.Request = fmt.Sprintf("ask-%d", m.Seq)
+				}
+				if m.Blocking {
+					deadline := m.Time.Add(m.Timeout)
+					m.Deadline = &deadline
+				}
+			}
+			var err error
+			record.Value, err = json.Marshal(m)
 			return err
-		}
-		if !exists {
-			break
-		}
-		m.Seq++
-	}
-	m.Generation = s.Generation
-	m.RunID = s.RunID
-	m.Time = time.Now().UTC()
-	if m.Type == "ask" {
-		m.Request = fmt.Sprintf("ask-%d", m.Seq)
-	}
-	return writeJSON(mailPath(dir, m.Seq), m)
+		})
+	return err
+}
+
+func openOutboxTail(dir string, from stateCursor) (*stateTail, error) {
+	return openMailboxTail(filepath.Join(dir, "outbox"), from)
 }
 
 func readMail(dir string, since uint64, visit func(agentMail) error) error {
-	for seq := since + 1; seq > 0; seq++ {
+	tail, err := openOutboxTail(dir, stateCursor{})
+	if err != nil {
+		return err
+	}
+	defer closeBestEffort(tail)
+	return readMailTail(tail, since, visit)
+}
+
+func readMailTail(tail *stateTail, since uint64, visit func(agentMail) error) error {
+	records, err := tail.Next()
+	if err != nil {
+		return err
+	}
+	for _, record := range records {
+		if record.Seq <= since {
+			continue
+		}
 		var m agentMail
-		err := readJSON(mailPath(dir, seq), &m)
-		if os.IsNotExist(err) {
-			return nil
+		if err := json.Unmarshal(record.Value, &m); err != nil {
+			return fmt.Errorf("%w: invalid outbox record %d: %w", errLogDamage, record.Seq, err)
 		}
-		if err != nil {
-			return err
+		if m.Seq != record.Seq || m.Type != record.Kind {
+			return fmt.Errorf("%w: invalid outbox record %d", errLogDamage, record.Seq)
 		}
-		if m.Seq != seq {
-			return errors.New("invalid outbox sequence")
-		}
-		if err = visit(m); err != nil {
+		if err := visit(m); err != nil {
 			return err
 		}
 	}
@@ -93,57 +102,106 @@ func readMail(dir string, since uint64, visit func(agentMail) error) error {
 }
 
 func (r *runner) pollAgentMail() error {
-	return readMail(r.dir, r.s.OutboxSeq, func(m agentMail) error {
-		if m.Blocking && m.RunID == r.s.RunID && m.Generation == r.s.Generation && m.Deadline != nil && time.Now().Before(*m.Deadline) {
-			id, _ := json.Marshal(m.Request)
-			r.s.Approvals = append(r.s.Approvals, approval{Generation: m.Generation, ID: id, Method: agentAsk, Summary: m.Question, Requested: m.Time, Deadline: *m.Deadline})
-			r.deriveState()
+	if r.inbox == nil {
+		if err := r.refreshInbox(); err != nil {
+			return err
 		}
-		r.s.OutboxSeq = m.Seq
+	}
+	in := r.inbox
+	if in.outboxTail == nil {
+		tail, err := openOutboxTail(r.dir, in.outbox)
+		if err != nil {
+			return err
+		}
+		in.outboxTail = tail
+	}
+	var arrived []agentMail
+	if err := readMailTail(in.outboxTail, in.outbox.Seq, func(m agentMail) error {
+		if m.RunID != r.s.RunID {
+			return errJobReplaced
+		}
+		arrived = append(arrived, m)
+		return nil
+	}); err != nil || len(arrived) == 0 {
+		return err
+	}
+	at := in.outboxTail.Cursor()
+	// The checkpoint can outlive the current owner. Persist the source
+	// frames before publishing a durable state that can skip them.
+	if err := syncMailboxPrefix(filepath.Join(r.dir, "outbox"), in.outbox, at); err != nil {
+		return err
+	}
+	for _, m := range arrived {
+		if m.Blocking && !in.answered[m.Request] {
+			ask := pendingAgentAsk{Request: m.Request, Generation: m.Generation}
+			if err := r.stateLog.Append(outboxRequestKind, ask); err != nil {
+				return err
+			}
+			in.pendingAsks[m.Request] = ask
+			if m.Generation == r.s.Generation && m.Deadline != nil && time.Now().Before(*m.Deadline) {
+				id, _ := json.Marshal(m.Request)
+				r.s.Approvals = append(r.s.Approvals, approval{Generation: m.Generation, ID: id, Method: agentAsk, Summary: m.Question, Requested: m.Time, Deadline: *m.Deadline})
+				r.deriveState()
+			}
+		}
 		if err := r.note("agent/"+m.Type, fmt.Sprintf("seq=%d %s", m.Seq, brief(m.Question))); err != nil {
 			return err
 		}
-		return r.save()
+		if err := r.save(); err != nil {
+			return err
+		}
+	}
+	if err := r.stateLog.Append(outboxSeenKind, at); err != nil {
+		return err
+	}
+	in.outbox = at
+	return nil
+}
+
+func waitAgentAnswer(ctx context.Context, dir string, identity jobIdentity, request string) (fields, error) {
+	receipt, err := waitReceipt(ctx, dir, identity, func(record receiptRecord) bool {
+		return record.AgentReply != nil && record.AgentReply.Request == request
 	})
+	if err != nil {
+		return nil, err
+	}
+	return fields{"answer": receipt.AgentReply.Answer, "error": receipt.AgentReply.Error}, nil
 }
 
-func answerPath(dir string, id json.RawMessage) (string, error) {
-	var request string
-	if err := json.Unmarshal(id, &request); err != nil {
-		return "", err
-	}
-	n, err := strconv.ParseUint(strings.TrimPrefix(request, "ask-"), 10, 64)
-	if err != nil || request != fmt.Sprintf("ask-%d", n) {
-		return "", errors.New("invalid agent request")
-	}
-	return filepath.Join(dir, "inbox", "done", request+".answer"), nil
-}
-
-// Include archived messages because the runner may already have steered the turn.
+// Expose bodies only after delivery is acknowledged. Queued messages can
+// still be withdrawn and must never be visible to the agent.
 func agentInbox(dir string) (fields, error) {
+	tail, err := inboxTail(dir, stateCursor{})
+	if err != nil {
+		return nil, err
+	}
+	defer closeBestEffort(tail)
+	records, err := tail.Next()
+	if err != nil {
+		return nil, err
+	}
+	in, err := readInboxState(dir)
+	if err != nil {
+		return nil, err
+	}
 	messages := fields{}
-	for _, sub := range []string{"", "pending", "done", "uncertain", "withdrawn"} {
-		folder := filepath.Join(dir, "inbox", sub)
-		entries, err := os.ReadDir(folder)
-		if os.IsNotExist(err) {
+	for _, record := range records {
+		ack := in.acks[record.Seq]
+		if record.Kind != "msg" || ack.ID != record.ID || ack.Result != "delivered" {
 			continue
 		}
-		if err != nil {
+		var msg inboxMessage
+		if err := json.Unmarshal(record.Value, &msg); err != nil {
 			return nil, err
 		}
-		for _, e := range entries {
-			if !e.Type().IsRegular() || !strings.HasSuffix(e.Name(), ".msg") {
-				continue
-			}
-			b, err := readStateFile(filepath.Join(folder, e.Name()))
-			if os.IsNotExist(err) {
-				continue
-			}
+		if len(msg.Input) > 0 {
+			body, err := json.Marshal(msg.Input)
 			if err != nil {
 				return nil, err
 			}
-			messages[e.Name()] = string(b)
+			msg.Text = string(body)
 		}
+		messages[record.ID] = msg.Text
 	}
 	return messages, nil
 }

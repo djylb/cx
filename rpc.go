@@ -5,9 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
-	"strings"
 	"time"
 )
 
@@ -16,6 +14,7 @@ type envelope struct {
 	Method     string          `json:"method,omitempty"`
 	Params     json.RawMessage `json:"params,omitempty"`
 	Request    json.RawMessage `json:"request_id,omitempty"`
+	Question   string          `json:"question_id,omitempty"`
 	Result     json.RawMessage `json:"result,omitempty"`
 	Error      json.RawMessage `json:"error,omitempty"`
 	Version    int             `json:"version"`
@@ -29,127 +28,147 @@ type rpcReceipt struct {
 	Generation uint64          `json:"generation"`
 }
 
-func (r *runner) receiptPath(id string) string { return filepath.Join(r.dir, "outbox", id+".json") }
-func (r *runner) commitReceipt(name string, res rpcReceipt) error {
-	if err := writeJSON(r.receiptPath(res.Op), res); err != nil {
-		return err
-	}
-	sub := "done"
-	if res.State == "uncertain" {
-		sub = "uncertain"
-	}
-	if err := os.MkdirAll(r.mail(sub), 0700); err != nil {
-		return err
-	}
-	return os.Rename(r.mail(filepath.Join("pending", name)), r.mail(filepath.Join(sub, name)))
+// receiptRecord is the state-log payload. rpcReceipt preserves the CLI
+// response fields used by controllers.
+type receiptRecord struct {
+	Op         string          `json:"op"`
+	Answer     json.RawMessage `json:"answer,omitempty"`
+	Error      *rpcError       `json:"error,omitempty"`
+	Status     string          `json:"status"`
+	Generation uint64          `json:"generation"`
+	AgentReply *agentReply     `json:"agent_reply,omitempty"`
 }
+
+type agentReply struct {
+	Request string          `json:"request"`
+	Answer  json.RawMessage `json:"answer"`
+	Error   json.RawMessage `json:"error"`
+}
+
+func (r *runner) commitReceipt(receipt receiptRecord) error {
+	if err := r.stateLog.Append("receipt", receipt); err != nil {
+		return err
+	}
+	r.inbox.applyReceipt(receipt)
+	return nil
+}
+
 func (r *runner) recoverRPC() error {
-	if err := os.MkdirAll(filepath.Join(r.dir, "outbox"), 0700); err != nil {
+	if err := r.refreshInbox(); err != nil {
 		return err
 	}
-	entries, err := os.ReadDir(r.mail("pending"))
-	if err != nil {
-		return err
-	}
-	for _, e := range entries {
-		name := e.Name()
-		id, ok := strings.CutSuffix(name, ".rpc")
-		if !ok {
-			continue
-		}
-		var res rpcReceipt
-		if err := readJSON(r.receiptPath(id), &res); os.IsNotExist(err) {
-			res = rpcReceipt{Op: id, Generation: r.s.Generation - 1, State: "uncertain", Error: &rpcError{Code: -32002, Message: "connection ended before receipt"}}
-		} else if err != nil {
+	if claim, ok := r.inbox.claims[0]; ok {
+		if err := r.commitReceipt(uncertainReceipt(claim)); err != nil {
 			return err
 		}
-		if err := r.commitReceipt(name, res); err != nil {
+	}
+	for _, record := range r.inbox.queue {
+		if record.Kind != "rpc" {
+			continue
+		}
+		claim, claimed := r.inbox.claims[record.Seq]
+		receipt, done := r.inbox.receipts[record.ID]
+		if !claimed && !done {
+			continue
+		}
+		if !done {
+			receipt = uncertainReceipt(claim)
+			if err := r.commitReceipt(receipt); err != nil {
+				return err
+			}
+		}
+		if err := r.ackInbox(record, receipt.inboxResult()); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func uncertainReceipt(claim inboxClaim) receiptRecord {
+	return receiptRecord{Op: claim.ID, Generation: claim.Generation, Status: "uncertain",
+		Error: &rpcError{Code: -32002, Message: "connection ended before receipt"}}
+}
+
+func (receipt receiptRecord) inboxResult() string {
+	if receipt.Status == "uncertain" {
+		return "uncertain"
+	}
+	return "delivered"
 }
 
 // Nested calls may pump replies, but never start another client call.
 func (r *runner) rpcFiles(repliesOnly bool) error {
-	entries, err := os.ReadDir(r.mail(""))
-	if err != nil {
+	if err := r.refreshInbox(); err != nil {
 		return err
 	}
-	for _, e := range entries {
-		name := e.Name()
-		id, ok := strings.CutSuffix(name, ".rpc")
-		if !ok || !e.Type().IsRegular() {
+	for _, record := range r.inbox.queue {
+		if record.Kind != "rpc" {
 			continue
 		}
-		if _, err := jobPath(r.dir, id); err != nil {
+		if _, claimed := r.inbox.claims[record.Seq]; claimed {
 			continue
 		}
-		path := r.mail(name)
+		if receipt, done := r.inbox.receipts[record.ID]; done {
+			return r.ackInbox(record, receipt.inboxResult())
+		}
 		var env envelope
-		parseErr := readJSON(path, &env)
+		parseErr := json.Unmarshal(record.Value, &env)
 		if repliesOnly && env.Kind != "reply" {
 			continue
 		}
-		if seen, err := fileExists(r.receiptPath(id)); err != nil {
-			return err
-		} else if seen {
-			return os.Remove(path)
-		}
-		pending := r.mail(filepath.Join("pending", name))
-		if busy, err := fileExists(pending); err != nil {
-			return err
-		} else if busy {
-			continue
-		}
-		if err := os.Rename(path, pending); err != nil {
+		if err := r.claimInbox(record, "deliver"); err != nil {
 			return err
 		}
-		return r.finishRPC(name, id, env, parseErr)
+		receipt, err := r.finishRPC(record.ID, env, parseErr)
+		if receipt.Op == "" {
+			return err
+		}
+		return errors.Join(err, r.ackInbox(record, receipt.inboxResult()))
 	}
 	return nil
 }
 
-func (r *runner) finishRPC(name, id string, env envelope, parseErr error) error {
-	res := rpcReceipt{Op: id, Generation: r.s.Generation, State: "completed"}
+func (r *runner) finishRPC(id string, env envelope, parseErr error) (receiptRecord, error) {
+	receipt := receiptRecord{Op: id, Generation: r.s.Generation, Status: "completed"}
 	if parseErr == nil {
-		res.Result, parseErr = r.executeRPC(id, env)
+		receipt.Answer, parseErr = r.executeRPC(id, env, &receipt.AgentReply)
 	}
-	if len(res.Result) != 0 {
-		filtered, err := r.c.secret.jsonOutput(res.Result)
+	if len(receipt.Answer) != 0 {
+		filtered, err := r.c.secret.jsonOutput(receipt.Answer)
 		if err != nil {
-			return err
+			return receiptRecord{}, err
 		}
-		res.Result = filtered
+		receipt.Answer = filtered
 	}
 	if parseErr != nil {
-		res.State = "error"
+		receipt.AgentReply = nil
+		receipt.Status = "error"
 		var remote *rpcError
 		if errors.As(parseErr, &remote) {
-			res.Error = remote
+			receipt.Error = remote
 		} else {
-			res.Error = &rpcError{Code: -32000, Message: parseErr.Error()}
+			receipt.Error = &rpcError{Code: -32000, Message: parseErr.Error()}
 		}
 		if errors.Is(parseErr, errServerClosed) || errors.Is(parseErr, errRPCUncertain) || r.ctx.Err() != nil {
-			res.State = "uncertain"
+			receipt.Status = "uncertain"
 		}
 	}
-	if err := r.commitReceipt(name, res); err != nil {
-		return err
+	if err := r.commitReceipt(receipt); err != nil {
+		return receiptRecord{}, err
 	}
 	if errors.Is(parseErr, errServerClosed) {
-		return parseErr
+		return receipt, parseErr
 	}
-	return nil
+	return receipt, nil
 }
 
 const detachedReview = "cxrun/reviewDetached"
 
 var errRPCUncertain = errors.New("RPC outcome uncertain")
 
-func (r *runner) executeRPC(id string, e envelope) (json.RawMessage, error) {
-	if r.claude != nil {
-		return nil, errors.New("app-server RPC unavailable with Claude")
+func (r *runner) executeRPC(id string, e envelope, reply **agentReply) (json.RawMessage, error) {
+	if !r.c.driver().capabilities().RPC {
+		return nil, fmt.Errorf("engine RPC not supported by engine %s", r.c.Engine)
 	}
 	if e.Version != 1 {
 		return nil, errors.New("unsupported envelope version")
@@ -165,13 +184,11 @@ func (r *runner) executeRPC(id string, e envelope) (json.RawMessage, error) {
 		for _, a := range r.s.Approvals {
 			if bytes.Equal(a.ID, e.Request) && time.Now().Before(a.Deadline) {
 				if a.Method == agentAsk {
-					path, err := answerPath(r.dir, a.ID)
-					if err != nil {
+					var request string
+					if err := json.Unmarshal(a.ID, &request); err != nil {
 						return nil, err
 					}
-					if err = writeJSON(path, fields{"answer": e.Result, "error": e.Error}); err != nil {
-						return nil, err
-					}
+					*reply = &agentReply{Request: request, Answer: e.Result, Error: e.Error}
 					return json.RawMessage("null"), r.removeApproval(a.ID)
 				}
 				p := fields{"id": a.ID}
@@ -268,6 +285,11 @@ func (r *runner) refreshHistory() error {
 	if len(page.Data) > 0 {
 		return r.finish(page.Data[0])
 	}
+	r.clearCurrentTurn()
+	return nil
+}
+
+func (r *runner) clearCurrentTurn() {
 	r.s.Turn = ""
 	r.s.LastCompleted = ""
 	r.s.CompletedStatus = ""
@@ -276,35 +298,51 @@ func (r *runner) refreshHistory() error {
 	r.s.turnSummary = turnSummary{}
 	r.deriveState()
 	r.idleSince = time.Now()
-	return atomicWrite(filepath.Join(r.dir, "last.md"), nil)
 }
+
+func (r *runner) hasUncertainRevert() bool {
+	inbox := filepath.Join(r.dir, "inbox")
+	for id, receipt := range r.inbox.receipts {
+		if receipt.Status != "uncertain" {
+			continue
+		}
+		frame, err := findMailboxID(inbox, filepath.Join(inbox, ".ids", snapSum([]byte(id))), id)
+		var env envelope
+		if err == nil && frame.Kind == "rpc" && json.Unmarshal(frame.Value, &env) == nil && env.Method == "thread/revert" {
+			var target struct{ ThreadID string }
+			if json.Unmarshal(env.Params, &target) == nil && target.ThreadID == r.s.Thread {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+const initialForkOp = "initial-fork"
 
 // Registration holds the source thread. The child owns the call and its receipt,
 // so reconnecting after a lost response cannot create a second fork.
 func (r *runner) fork(params fields, dst any) error {
-	const id = "initial-fork"
-	var res rpcReceipt
-	if err := readJSON(r.receiptPath(id), &res); os.IsNotExist(err) {
-		raw, marshalErr := json.Marshal(params)
-		if marshalErr != nil {
-			return marshalErr
-		}
-		e := envelope{Version: 1, Kind: "call", Method: "thread/fork", Params: raw}
-		name := id + ".rpc"
-		if writeErr := writeJSON(r.mail(filepath.Join("pending", name)), e); writeErr != nil {
-			return writeErr
-		}
-		if finishErr := r.finishRPC(name, id, e, nil); finishErr != nil {
-			return finishErr
-		}
-		if readErr := readJSON(r.receiptPath(id), &res); readErr != nil {
-			return readErr
-		}
-	} else if err != nil {
+	if err := r.refreshInbox(); err != nil {
 		return err
 	}
-	if res.Error != nil {
-		return res.Error
+	receipt, ok := r.inbox.receipts[initialForkOp]
+	if !ok {
+		raw, err := json.Marshal(params)
+		if err != nil {
+			return err
+		}
+		e := envelope{Version: 1, Kind: "call", Method: "thread/fork", Params: raw}
+		if err = r.claimInbox(stateRecord{ID: initialForkOp}, "deliver"); err != nil {
+			return err
+		}
+		receipt, err = r.finishRPC(initialForkOp, e, nil)
+		if err != nil {
+			return err
+		}
 	}
-	return json.Unmarshal(res.Result, dst)
+	if receipt.Error != nil {
+		return receipt.Error
+	}
+	return json.Unmarshal(receipt.Answer, dst)
 }

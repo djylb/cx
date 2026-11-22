@@ -1,11 +1,15 @@
 package main
 
 import (
+	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -39,10 +43,236 @@ type turnError struct {
 	Message           string
 	AdditionalDetails string
 	Code              json.RawMessage
-	CodexErrorInfo    json.RawMessage
+	// ErrorInfo carries the Codex wire field codexErrorInfo; other adapters set RateLimited.
+	ErrorInfo   json.RawMessage `json:"codexErrorInfo,omitempty"`
+	RateLimited bool            `json:"rateLimited,omitempty"`
 }
 
 const failedReportHeading = "STATUS: FAILED"
+
+const turnReportKind = "turn_report"
+
+type turnReportRef struct {
+	Turn   string `json:"turn"`
+	Path   string `json:"path"`
+	Size   int64  `json:"size"`
+	SHA256 string `json:"sha256"`
+}
+
+func turnReportPath(id string) (string, error) {
+	if _, err := jobPath("", id); err != nil {
+		return "", fmt.Errorf("invalid turn report id %q", id)
+	}
+	return "turns/" + id + ".md", nil
+}
+
+func turnReportRecords(dir string) (map[string]stateRecord, error) {
+	tail, err := openStateTail(dir, stateCursor{})
+	if err != nil {
+		return nil, err
+	}
+	defer closeBestEffort(tail)
+	records, err := tail.Next()
+	if err != nil {
+		return nil, err
+	}
+	reports := make(map[string]stateRecord)
+	for _, record := range records {
+		if record.Kind != turnReportKind {
+			continue
+		}
+		var ref turnReportRef
+		if err := json.Unmarshal(record.Value, &ref); err != nil {
+			return nil, err
+		}
+		if ref.Turn != "" {
+			reports[ref.Turn] = record
+		}
+	}
+	return reports, nil
+}
+
+func turnReportCheckpoints(dir string) ([]stateRecord, error) {
+	reports, err := turnReportRecords(dir)
+	if err != nil {
+		return nil, err
+	}
+	records := make([]stateRecord, 0, len(reports))
+	for _, record := range reports {
+		records = append(records, record)
+	}
+	sort.Slice(records, func(i, j int) bool { return records[i].Seq < records[j].Seq })
+	return records, nil
+}
+
+func findTurnReport(dir, id string) (turnReportRef, error) {
+	var ref turnReportRef
+	if id == "" {
+		return ref, nil
+	}
+	record, _, err := latestStateKind(dir, turnReportKind)
+	if err != nil || record.Seq == 0 {
+		return ref, err
+	}
+	if err = json.Unmarshal(record.Value, &ref); err != nil || ref.Turn == id {
+		return ref, err
+	}
+	reports, err := turnReportRecords(dir)
+	if err != nil {
+		return turnReportRef{}, err
+	}
+	ref = turnReportRef{}
+	if record, ok := reports[id]; ok {
+		err = json.Unmarshal(record.Value, &ref)
+	}
+	return ref, err
+}
+
+func openJobContent(ctx context.Context, path string) (*os.File, error) {
+	ctx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+	defer cancel()
+	for {
+		f, err := openJobFile(path, jobFileRead)
+		if err == nil {
+			return f, nil
+		}
+		if pause(ctx, 10*time.Millisecond) != nil {
+			return nil, err
+		}
+	}
+}
+
+func readTurnReport(ctx context.Context, dir, id string) ([]byte, error) {
+	ref, err := findTurnReport(dir, id)
+	if err != nil || ref.Turn == "" {
+		return nil, err
+	}
+	path, err := turnReportPath(id)
+	base := strings.TrimSuffix(path, ".md") + "-"
+	nonce, retryPath := strings.CutPrefix(strings.TrimSuffix(ref.Path, ".md"), base)
+	retryPath = retryPath && strings.HasSuffix(ref.Path, ".md") && snapHex(nonce, 32)
+	if err != nil || (ref.Path != path && !retryPath) || ref.Size < 0 || !snapHex(ref.SHA256, 64) {
+		return nil, fmt.Errorf("invalid report reference for turn %q", id)
+	}
+	f, err := openJobContent(ctx, filepath.Join(dir, filepath.FromSlash(ref.Path)))
+	if err != nil {
+		return nil, err
+	}
+	defer closeBestEffort(f)
+	b, err := io.ReadAll(io.LimitReader(f, ref.Size))
+	if err != nil {
+		return nil, err
+	}
+	var extra [1]byte
+	if n, err := f.Read(extra[:]); n != 0 || err != io.EOF {
+		return nil, fmt.Errorf("report for turn %q has content beyond its reference: %v", id, err)
+	}
+	if int64(len(b)) != ref.Size || snapSum(b) != ref.SHA256 {
+		return nil, fmt.Errorf("report for turn %q does not match its state record", id)
+	}
+	return b, nil
+}
+
+func (r *runner) publishTurnReport(id string, report []byte) error {
+	path, err := turnReportPath(id)
+	if err != nil {
+		return err
+	}
+	full := filepath.Join(r.dir, filepath.FromSlash(path))
+	if err := os.MkdirAll(filepath.Dir(full), 0700); err != nil {
+		return err
+	}
+	ref := turnReportRef{Turn: id, Path: path, Size: int64(len(report)), SHA256: snapSum(report)}
+	previous, err := findTurnReport(r.dir, id)
+	if err != nil || previous.Turn != "" {
+		return err
+	}
+	f, err := openJobFile(full, jobFileNew)
+	if errors.Is(err, os.ErrExist) {
+		// An interrupted write left unpublished bytes. Use a fresh name.
+		var nonce [16]byte
+		_, _ = rand.Read(nonce[:])
+		ref.Path = strings.TrimSuffix(path, ".md") + fmt.Sprintf("-%x.md", nonce)
+		f, err = openJobFile(filepath.Join(r.dir, filepath.FromSlash(ref.Path)), jobFileNew)
+	}
+	if err != nil {
+		return err
+	}
+	_, err = f.Write(report)
+	if err == nil {
+		err = syncJobFile(f)
+	}
+	if err := errors.Join(err, f.Close()); err != nil {
+		return err
+	}
+	if err := syncJobTree(filepath.Dir(full), r.dir); err != nil {
+		return err
+	}
+	return r.stateLog.Append(turnReportKind, ref)
+}
+
+type turnCompletion struct {
+	observedResult
+	Outcome string `json:"outcome"`
+}
+
+func completedTurn(s status) turnCompletion {
+	outcome := s.CompletedStatus
+	if s.final && s.Turn == s.LastCompleted && s.TurnStatus != "" && s.TurnStatus != "inProgress" {
+		// Closing a queued continuation can update the job's outcome without
+		// changing the result of the prior turn.
+		outcome = s.TurnStatus
+	}
+	return turnCompletion{observedResult{s.RunID, s.Finished, s.LastCompleted}, outcome}
+}
+
+func completionCheckpoints(dir string) ([]stateRecord, error) {
+	tail, err := openStateTail(dir, stateCursor{})
+	if err != nil {
+		return nil, err
+	}
+	defer closeBestEffort(tail)
+	records, err := tail.Next()
+	if err != nil {
+		return nil, err
+	}
+	var order []int64
+	turns := make(map[int64]turnCompletion)
+	for _, record := range records {
+		var turn turnCompletion
+		switch record.Kind {
+		case "turn_completion":
+			err = json.Unmarshal(record.Value, &turn)
+		case "status":
+			var s status
+			err = decodeJobStatus(record, &s)
+			turn = completedTurn(s)
+		default:
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		if turn.Number == 0 || turn.TurnID == "" {
+			continue
+		}
+		if prior, seen := turns[turn.Number]; !seen {
+			order = append(order, turn.Number)
+		} else if prior.RunID != turn.RunID || prior.TurnID != turn.TurnID {
+			continue
+		}
+		turns[turn.Number] = turn
+	}
+	checkpoints := make([]stateRecord, 0, len(order))
+	for _, number := range order {
+		frame, err := newRecord("turn_completion", turns[number])
+		if err != nil {
+			return nil, err
+		}
+		checkpoints = append(checkpoints, frame)
+	}
+	return checkpoints, nil
+}
 
 func reportStatus(firstLine string) string {
 	state, ok := strings.CutPrefix(strings.TrimSuffix(firstLine, "\r"), "STATUS: ")
@@ -68,8 +298,8 @@ func (r *runner) describeFailure(e *turnError) string {
 		if len(e.Code) != 0 && string(e.Code) != "null" {
 			report += "code=" + r.c.secret.text(string(e.Code)) + "\n"
 		}
-		if len(e.CodexErrorInfo) != 0 && string(e.CodexErrorInfo) != "null" {
-			report += "codexErrorInfo=" + r.c.secret.text(string(e.CodexErrorInfo)) + "\n"
+		if len(e.ErrorInfo) != 0 && string(e.ErrorInfo) != "null" {
+			report += "errorInfo=" + r.c.secret.text(string(e.ErrorInfo)) + "\n"
 		}
 	}
 	return report
@@ -119,7 +349,7 @@ func (r *runner) note(kind, s string) error {
 }
 
 // Some progress records are read back to locate a turn. Their identity and
-// status columns must agree with the status file and the unmodified protocol.
+// status columns must agree with the state snapshot and the unmodified protocol.
 func (r *runner) writeProgress(kind, s string) error {
 	fi, err := r.log.Stat()
 	if err != nil {
@@ -162,14 +392,11 @@ func (r *runner) finish(t turn) error {
 	if t.Error != nil {
 		t.Status = "failed"
 	}
-	// A terminal error notification can precede turn/completed. The later
-	// notification may supply the final agent item, but cannot undo failure.
-	alreadyFailed := t.ID == r.s.LastCompleted && r.s.CompletedStatus == "failed"
-	if alreadyFailed && (r.s.Turn != t.ID || r.failureReport == "") {
+	// The first report is immutable once published. The error notification
+	// grace period lets a closely following completion supply its final items.
+	alreadyCompleted := t.ID == r.s.LastCompleted
+	if alreadyCompleted && (r.s.CompletedStatus == "failed" || t.Status == r.s.CompletedStatus) {
 		return nil
-	}
-	if alreadyFailed {
-		t.Status = "failed"
 	}
 	if t.Status != "interrupted" || r.pending == "" {
 		r.releaseSlot()
@@ -195,15 +422,12 @@ func (r *runner) finish(t turn) error {
 	report := r.c.secret.reportText(r.lastText)
 	if t.Status == "failed" {
 		r.s.Approvals = nil
-		if !alreadyFailed {
-			r.failureReport = r.describeFailure(t.Error)
-		}
 		if report != "" {
 			report = "\n" + report
 		}
-		report = r.failureReport + report
+		report = r.describeFailure(t.Error) + report
 	}
-	if err := atomicWrite(filepath.Join(r.dir, "last.md"), []byte(report)); err != nil {
+	if err := r.publishTurnReport(t.ID, []byte(report)); err != nil {
 		return err
 	}
 	r.s.Turn = t.ID
@@ -224,7 +448,7 @@ func (r *runner) finish(t turn) error {
 	if t.Error != nil {
 		info += " " + r.c.secret.text(t.Error.Message)
 	}
-	if !alreadyFailed {
+	if !alreadyCompleted {
 		if err := r.writeProgress("turn/completed", info); err != nil {
 			return err
 		}
@@ -479,7 +703,7 @@ func (r *runner) connectThread() error {
 				latest.Status = "interrupted"
 			}
 			if latest.ID == r.s.LastCompleted && latest.Status == r.s.CompletedStatus {
-				// This completion and last.md were already committed before restart.
+				// This completion and its report were already published.
 				if r.pending == "" {
 					r.releaseSlot()
 				}
@@ -499,6 +723,9 @@ func (r *runner) connectThread() error {
 		return err
 	}
 	if latest.ID == "" {
+		if previous != "" && r.hasUncertainRevert() {
+			r.clearCurrentTurn()
+		}
 		if r.c.ForkThread != "" || r.s.Finished > 0 && r.s.Turn == "" {
 			r.releaseSlot()
 			r.s.State = "waiting"
@@ -592,7 +819,7 @@ func (r *runner) localEvent(method, detail string) error {
 	events := r.events
 	if events == nil {
 		var err error
-		events, err = os.OpenFile(filepath.Join(r.dir, "events.jsonl"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+		events, err = openJobFile(filepath.Join(r.dir, "events.jsonl"), jobFileAppendCreate)
 		if err != nil {
 			return err
 		}
@@ -606,7 +833,7 @@ func (r *runner) localEvent(method, detail string) error {
 	if r.log != nil {
 		return r.writeProgress(method, detail)
 	}
-	f, err := os.OpenFile(filepath.Join(r.dir, "progress.log"), os.O_APPEND|os.O_WRONLY, 0600)
+	f, err := openJobFile(filepath.Join(r.dir, "progress.log"), jobFileAppend)
 	if err != nil {
 		return err
 	}
@@ -617,7 +844,7 @@ func (r *runner) localEvent(method, detail string) error {
 
 // appendProgress records a line without an open runner log, best effort.
 func appendProgress(dir, kind, detail string) {
-	f, err := os.OpenFile(filepath.Join(dir, "progress.log"), os.O_APPEND|os.O_WRONLY, 0600)
+	f, err := openJobFile(filepath.Join(dir, "progress.log"), jobFileAppend)
 	if err != nil {
 		return
 	}

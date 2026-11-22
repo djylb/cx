@@ -55,22 +55,19 @@ type server struct {
 func openServer(c config, root, dir string) (*server, error) {
 	args := []string{"app-server", "--listen", "stdio://"}
 	if c.JobTools {
-		exe, e := os.Executable()
+		exe, toolArgs, e := jobToolServer(c, root, dir)
 		if e != nil {
 			return nil, e
 		}
-		id := filepath.Base(dir)
-		if c.Project != "" {
-			id = c.Project + "/" + id
-		}
 		binary, _ := json.Marshal(exe)
-		argv, _ := json.Marshal([]string{"node", "mcp-tools", "--state", root, "--job", id})
-		args = append(args, "-c", "mcp_servers.cxrun.command="+string(binary), "-c", "mcp_servers.cxrun.args="+string(argv), "-c", "mcp_servers.cxrun.tool_timeout_sec=150")
+		argv, _ := json.Marshal(toolArgs)
+		args = append(args, "-c", "mcp_servers."+jobToolServerName+".command="+string(binary), "-c", "mcp_servers."+jobToolServerName+".args="+string(argv),
+			"-c", fmt.Sprintf("mcp_servers.%s.tool_timeout_sec=%d", jobToolServerName, int(jobToolTimeout/time.Second)))
 	}
 	cmd := exec.Command("codex", args...)
 	cmd.Dir = c.Dir
 
-	log, err := os.OpenFile(filepath.Join(dir, "server.stderr.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+	log, err := openJobFile(filepath.Join(dir, "server.stderr.log"), jobFileAppendCreate)
 	if err != nil {
 		return nil, err
 	}
@@ -92,7 +89,7 @@ func openServer(c config, root, dir string) (*server, error) {
 		return nil, err
 	}
 	c.mark(cmd, dir)
-	tree, err := startCommand(cmd, c.RunID)
+	tree, err := c.startCachedCommand(cmd)
 	if err != nil {
 		_ = in.Close()
 		_ = out.Close()
@@ -308,7 +305,7 @@ func (r *runner) call(method string, p any, result any) error {
 	deadline := time.Now().Add(limit + r.c.Approval)
 	timer := time.NewTimer(limit)
 	defer timer.Stop()
-	tick := time.NewTicker(250 * time.Millisecond)
+	tick := time.NewTicker(statePollInterval)
 	defer tick.Stop()
 	for {
 		select {
@@ -322,6 +319,9 @@ func (r *runner) call(method string, p any, result any) error {
 			r.srv.expired[strconv.Itoa(id)] = true
 			return fmt.Errorf("%s timed out: %w", method, errRPCUncertain)
 		case <-tick.C:
+			if err := r.flushState(); err != nil {
+				return err
+			}
 			if err := r.flushExpiredTurnFailure(); err != nil {
 				return err
 			}
@@ -362,21 +362,26 @@ func (r *runner) call(method string, p any, result any) error {
 }
 
 type runner struct {
-	ctx         context.Context
-	claude      *claudeSession
-	budget      *runtimeBudget
-	slot        *os.File
-	cacheLease  *os.File
-	events, log *os.File
-	srv         *server
-	turnFailure *pendingTurnFailure
-	cmdOpen     map[string]time.Time // command items in progress
-	follow      *followAdmission
+	ctx                       context.Context
+	claude                    *claudeSession
+	budget                    *runtimeBudget
+	slot                      *os.File
+	targetLease, packageLease *os.File
+	events, log               *os.File
+	stateLog                  *stateWriter
+	inbox                     *inboxState
+	srv                       *server
+	turnFailure               *pendingTurnFailure
+	closeRequest              uint64
+	closeCompleted            bool
+	cmdOpen                   map[string]time.Time // command items in progress
+	follow                    *followAdmission
 
 	idleSince, turnSince, closing time.Time
 	lastAction                    time.Time
+	lastStateWrite                time.Time
 	root, dir                     string
-	lastText, failureReport       string
+	lastText                      string
 	pending                       string // a turn to start once the current one ended (stall recovery)
 
 	c     config
@@ -384,50 +389,117 @@ type runner struct {
 	dirty bool
 }
 
-// The terminal record is the only publication a finished job gets; a transient
-// filesystem refusal (for example a scanner holding the new file) must not turn
-// a completed job into an orphan.
-var terminalSaveBudget = 10 * time.Second
+const (
+	statePollInterval    = 100 * time.Millisecond
+	statePublishInterval = 150 * time.Millisecond
+)
+
+// The caller holds owner.lock until the writer is closed.
+func (r *runner) openState() error {
+	w, err := openStateLog(r.dir)
+	if err != nil {
+		return err
+	}
+	if err = w.RecoveryError(); err != nil {
+		appendProgress(r.dir, "state/recovery", err.Error())
+	}
+	if err = w.Append("config", r.c); err != nil {
+		return errors.Join(err, w.Close())
+	}
+	r.stateLog = w
+	return nil
+}
 
 func (r *runner) saveTerminal() error {
-	deadline := time.Now().Add(terminalSaveBudget)
-	delay := 50 * time.Millisecond
-	for {
-		err := r.store(true)
-		if err == nil || time.Now().Add(delay).After(deadline) {
+	defer closeBestEffort(r.stateLog)
+	r.s.QueueReason = ""
+	defer func() {
+		if r.inbox != nil {
+			closeBestEffort(r.inbox.tail)
+			closeBestEffort(r.inbox.outboxTail)
+		}
+	}()
+	ctx := r.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	// Cleanup must still run after the runtime deadline or a canceled caller.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	unlock, err := lockJobMailboxes(ctx, r.dir)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	var outcomes []stateRecord
+	if err = r.stateLog.RecoveryError(); err == nil {
+		outcomes, err = r.terminalMailboxOutcomes()
+	}
+	if !errors.Is(err, errLogDamage) {
+		if err != nil {
 			return err
 		}
-		time.Sleep(delay)
-		delay = min(2*delay, time.Second)
+		return r.stateLog.Final(r.s, outcomes...)
 	}
+	// A damaged transcript cannot establish an individual result safely.
+	// Publish the job-level failure without deducing or replaying operations.
+	r.s.Error = err.Error()
+	if r.s.State == "orphaned" {
+		return r.stateLog.Final(r.s)
+	}
+	r.s.State = "failed"
+	return errors.Join(err, r.stateLog.Final(r.s))
 }
 
-// writeStatus replaces status.json; durable writes also flush it to stable storage.
-var writeStatus = func(path string, v any, durable bool) error {
-	if durable {
-		return writeJSON(path, v)
+func (r *runner) failStart(err error) error {
+	r.s.State = "failed"
+	if errors.Is(err, errQueueTimeout) {
+		r.s.State = "queue_timeout"
 	}
-	return writeJSONVolatile(path, v)
+	r.s.PID = 0
+	r.s.Error = err.Error()
+	return errors.Join(err, r.saveTerminal())
 }
 
-// save publishes the current state. Intermediate states change many times per turn and
-// are rebuilt by the runner, so they are replaced atomically without a flush: on Windows
-// FlushFileBuffers can stall for seconds on a busy volume and would freeze the runner.
-// Terminal states use saveTerminal, which flushes.
-func (r *runner) save() error { return r.store(false) }
+func (r *runner) flushState() error {
+	if !r.stateLog.NeedsRotate() && (!r.dirty || time.Since(r.lastStateWrite) < statePublishInterval) {
+		return nil
+	}
+	return r.save()
+}
 
-func (r *runner) store(durable bool) error {
+// save publishes transitions immediately. Pollers use flushState for telemetry.
+func (r *runner) save() error {
+	if err := r.stateLog.Append("status", r.s); err != nil {
+		return err
+	}
 	r.dirty = false
-	var approvals []approval
-	for _, a := range r.s.Approvals {
-		if approvalMethod(a.Method) {
-			approvals = append(approvals, a)
-		}
+	r.lastStateWrite = time.Now()
+	if !r.stateLog.NeedsRotate() {
+		return nil
 	}
-	return writeStatus(filepath.Join(r.dir, "status.json"), struct {
-		Legacy []approval `json:"waiting_approval,omitempty"`
-		status
-	}{Legacy: approvals, status: r.s}, durable)
+	if err := validateSegments(filepath.Join(r.dir, "state"), false); err != nil {
+		return err
+	}
+	// Runtime preparation adds machine-local cache paths to r.c.
+	c, err := jobConfigRecord(r.dir)
+	if err != nil {
+		return err
+	}
+	checkpoints, err := mailboxCheckpoints(r.dir)
+	if err != nil {
+		return err
+	}
+	reports, err := turnReportCheckpoints(r.dir)
+	if err != nil {
+		return err
+	}
+	completions, err := completionCheckpoints(r.dir)
+	if err != nil {
+		return err
+	}
+	checkpoints = append(checkpoints, reports...)
+	return r.stateLog.Rotate(c.Value, r.s, append(checkpoints, completions...)...)
 }
 func (r *runner) active() bool { return r.s.TurnStatus == "inProgress" }
 func (r *runner) deriveState() {
@@ -460,15 +532,20 @@ func (r *runner) deriveState() {
 func (r *runner) serveAgent(session func() error) (err error) {
 	defer r.cancelFollow()
 	r.s.PID = os.Getpid()
-	r.s.ServerPID = 0
+	r.s.EnginePID = 0
 	r.s.Error = ""
 	r.s.StallCount = 0
 	r.s.LastAction = ""
 	r.s.State = "running"
 	r.s.Approvals = nil
 	defer func() {
+		if r.inbox != nil {
+			// Finish receipts for RPCs that lost the engine before the job
+			// terminates, including initial fork and transport errors.
+			err = errors.Join(err, r.recoverRPC())
+		}
 		r.s.PID = 0
-		r.s.ServerPID = 0
+		r.s.EnginePID = 0
 		if r.s.InputKind == "server_request" || r.s.InputKind == agentAsk {
 			r.s.InputKind = ""
 		}
@@ -486,12 +563,12 @@ func (r *runner) serveAgent(session func() error) (err error) {
 		} else {
 			r.s.State = "done"
 		}
-		err = errors.Join(err, r.save())
+		err = errors.Join(err, r.saveTerminal())
 	}()
 	if err = r.save(); err != nil {
 		return err
 	}
-	r.log, err = os.OpenFile(filepath.Join(r.dir, "progress.log"), os.O_APPEND|os.O_WRONLY, 0600)
+	r.log, err = openJobFile(filepath.Join(r.dir, "progress.log"), jobFileAppend)
 	if err != nil {
 		return err
 	}
@@ -503,12 +580,18 @@ func (r *runner) serveAgent(session func() error) (err error) {
 			err = r.note("done", "agent exited")
 		}
 	}()
-	r.events, err = os.OpenFile(filepath.Join(r.dir, "events.jsonl"), os.O_APPEND|os.O_WRONLY, 0600)
+	r.events, err = openJobFile(filepath.Join(r.dir, "events.jsonl"), jobFileAppend)
 	if err != nil {
 		return err
 	}
 	defer closeBestEffort(r.events)
-	return session()
+	err = session()
+	if errors.Is(err, errQueuedClose) {
+		r.s.CompletedStatus = "interrupted"
+		err = nil
+	}
+	r.closeCompleted = err == nil && r.closeRequest != 0
+	return err
 }
 
 func (r *runner) serveCodex() (err error) {
@@ -523,12 +606,12 @@ func (r *runner) serveCodex() (err error) {
 			err = errors.Join(err, r.shutdown())
 		}
 	}()
-	r.s.ServerPID = r.srv.cmd.Process.Pid
+	r.s.EnginePID = r.srv.cmd.Process.Pid
 	if err = r.save(); err != nil {
 		return err
 	}
 	err = r.initializeThread()
-	tick := time.NewTicker(250 * time.Millisecond)
+	tick := time.NewTicker(statePollInterval)
 	defer tick.Stop()
 	for {
 		if err != nil {
@@ -539,10 +622,11 @@ func (r *runner) serveCodex() (err error) {
 			if errors.Is(err, errServerClosed) && !r.active() && r.slot == nil && r.follow == nil && r.s.CompletedStatus == "failed" {
 				return nil
 			}
-			if !errors.Is(err, errServerClosed) || r.s.Restarts >= r.c.RestartLimit || !r.closing.IsZero() {
+			if !errors.Is(err, errServerClosed) || r.s.EngineRestarts >= r.c.RestartLimit || !r.closing.IsZero() {
 				return err
 			}
 			r.s.Restarts++
+			r.s.EngineRestarts++
 			r.s.StallCount = 3
 			r.s.LastAction = "resume after app-server exit"
 			if noteErr := r.note("restart", r.s.LastAction); noteErr != nil {

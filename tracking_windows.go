@@ -136,25 +136,24 @@ func scanProcesses(id string, v *inventory) map[int]process {
 		}
 		p := process{PID: int(e.ProcessID), PPID: int(e.ParentProcessID), Start: handleStart(h), Command: windows.UTF16ToString(e.ExeFile[:])}
 		p.jobObject = job != 0 && inJob(h, job)
-		if job == 0 || p.jobObject {
-			mem, err := windows.OpenProcess(windows.PROCESS_QUERY_INFORMATION|windows.PROCESS_VM_READ, false, e.ProcessID)
-			if err == nil {
-				p.Marked, err = hasRun(mem, id)
-				windows.CloseHandle(mem)
-			}
-			if err != nil {
-				v.Unreadable++
+		// A process from an earlier invocation with this run ID can still
+		// carry the marker after a new Job Object has taken the name.
+		mem, err := windows.OpenProcess(windows.PROCESS_QUERY_INFORMATION|windows.PROCESS_VM_READ, false, e.ProcessID)
+		if err == nil {
+			p.Marked, err = hasRun(mem, id)
+			windows.CloseHandle(mem)
+		}
+		p.Unreadable = err != nil
+		if p.Marked || p.jobObject {
+			buf := make([]byte, 131072)
+			if err = windows.NtQueryInformationProcess(h, 60, unsafe.Pointer(&buf[0]), uint32(len(buf)), nil); err == nil {
+				p.Command = (*windows.NTUnicodeString)(unsafe.Pointer(&buf[0])).String()
+			} else {
 				p.Unreadable = true
 			}
-			if p.Marked || p.jobObject {
-				buf := make([]byte, 131072)
-				if err = windows.NtQueryInformationProcess(h, 60, unsafe.Pointer(&buf[0]), uint32(len(buf)), nil); err == nil {
-					p.Command = (*windows.NTUnicodeString)(unsafe.Pointer(&buf[0])).String()
-				} else {
-					p.Unreadable = true
-					v.Unreadable++
-				}
-			}
+		}
+		if p.Unreadable {
+			v.Unreadable++
 		}
 		m[p.PID] = p
 		windows.CloseHandle(h)

@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"time"
 	"unicode/utf16"
@@ -102,7 +103,12 @@ type snapGit struct {
 }
 
 func (g snapGit) input(b []byte, args ...string) ([]byte, error) {
-	return snapCommand(g.ctx, g.dir, g.env, b, "git", append([]string{"-c", "core.hooksPath=" + os.DevNull, "-c", "core.fsmonitor=false", "-c", "commit.gpgSign=false"}, args...)...)
+	config := []string{"-c", "core.hooksPath=" + os.DevNull, "-c", "core.fsmonitor=false", "-c", "commit.gpgSign=false"}
+	if runtime.GOOS == "windows" {
+		// Snapshot mirrors and bundle paths include content hashes.
+		config = append(config, "-c", "core.longpaths=true")
+	}
+	return snapCommand(g.ctx, g.dir, g.env, b, "git", append(config, args...)...)
 }
 func (g snapGit) get(args ...string) (string, error) {
 	b, e := g.input(nil, args...)
@@ -159,29 +165,42 @@ func (m Manifest) validate() error {
 	return nil
 }
 func snapImmutable(path string, data []byte) error {
+	return publishImmutable(path, data, "")
+}
+
+func publishImmutable(path string, data []byte, durableRoot string) error {
 	dir := filepath.Dir(path)
 	if e := os.MkdirAll(dir, 0700); e != nil {
 		return e
 	}
-	f, e := os.CreateTemp(dir, ".snap-*")
+	f, e := createJobTemp(dir, ".snap-")
 	if e != nil {
 		return e
 	}
 	defer removeBestEffort(f.Name())
-	_, e = f.Write(data)
+	e = writeFrame(f.Write, data)
+	if e == nil && durableRoot != "" {
+		e = syncJobFile(f)
+	}
 	if e = errors.Join(e, f.Close()); e != nil {
 		return e
 	}
 	e = os.Link(f.Name(), path)
 	if errors.Is(e, os.ErrExist) {
-		b, err := readStateFile(path)
+		b, err := readSharedFile(path)
 		if err != nil {
 			return err
 		}
 		if !bytes.Equal(b, data) {
 			return errors.New("immutable snapshot record conflict")
 		}
-		return nil
+		e = nil
+		if durableRoot != "" {
+			e = syncExistingJobFile(path, syncJobFile)
+		}
+	}
+	if e == nil && durableRoot != "" {
+		e = syncJobTree(dir, durableRoot)
 	}
 	return e
 }

@@ -52,14 +52,18 @@ func TestWaitAnyConsumers(t *testing.T) {
 	case <-time.After(80 * time.Millisecond):
 	}
 	first.Finished, first.CompletedStatus = 1, "failed"
-	if err := writeJSON(filepath.Join(dir, "status.json"), first); err != nil {
+	if err := writeFixtureStatus(dir, first); err != nil {
 		t.Fatal(err)
 	}
 	check := func(line string, expected waitReport) {
 		t.Helper()
 		var got waitReport
-		if err := json.Unmarshal([]byte(line), &got); err != nil || got != expected || strings.Count(line, "\n") != 1 {
+		if err := json.Unmarshal([]byte(line), &got); err != nil || got.Event == "" || got.EventID == "" || strings.Count(line, "\n") != 1 {
 			t.Fatalf("wanted %+v, got %s %v", expected, line, err)
+		}
+		got.Event, got.EventID = "", ""
+		if got != expected {
+			t.Fatalf("wanted %+v, got %s", expected, line)
 		}
 	}
 	if err := <-done; err != nil {
@@ -87,7 +91,7 @@ func TestWaitAnyConsumers(t *testing.T) {
 		t.Fatal(line)
 	}
 	first.State = "done"
-	if err := writeJSON(filepath.Join(dir, "status.json"), first); err != nil {
+	if err := writeFixtureStatus(dir, first); err != nil {
 		t.Fatal(err)
 	}
 	// Closing after the (already reported) failed turn carries no new information: no event.
@@ -96,7 +100,7 @@ func TestWaitAnyConsumers(t *testing.T) {
 	}
 
 	first.RunID, first.State, first.CompletedStatus = "replacement", "waiting", "completed"
-	if err := writeJSON(filepath.Join(dir, "status.json"), first); err != nil {
+	if err := writeFixtureStatus(dir, first); err != nil {
 		t.Fatal(err)
 	}
 	check(call(a, "p", "s"), waitReport{Project: "p", Job: "work", State: "waiting", Outcome: "completed", Finished: 1, Code: 0})

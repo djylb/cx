@@ -17,6 +17,23 @@ func TestWaitAndStatusBeforeRegistration(t *testing.T) {
 	statusArgs := []string{"status", "--state", root, "--job", "j"}
 	waitArgs := []string{"wait", "--state", root, "--job", "j", "--timeout"}
 	ctx := context.Background()
+	if err := os.Mkdir(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	owner, err := openJobFile(filepath.Join(dir, "owner.lock"), jobFileLock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := owner.Close(); err != nil {
+		t.Fatal(err)
+	}
+	unpublished := runner{dir: dir}
+	if err := unpublished.openState(); err != nil {
+		t.Fatal(err)
+	}
+	if err := unpublished.stateLog.Close(); err != nil {
+		t.Fatal(err)
+	}
 	var row status
 	output := fixtureCLI(t, 11, statusArgs...)
 	if err := json.Unmarshal([]byte(output), &row); err != nil || row.State != "not_registered" || row.Job != "j" {
@@ -40,7 +57,9 @@ func TestWaitAndStatusBeforeRegistration(t *testing.T) {
 	if err := run(ctx, statusArgs); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "status.json"), []byte("broken"), 0600); err != nil {
+	r := runner{dir: dir}
+	startFixtureWriter(t, &r)
+	if err := r.stateLog.Append("status", "invalid status payload"); err != nil {
 		t.Fatal(err)
 	}
 	if err := run(ctx, append(waitArgs, "2s")); err == nil || errors.Is(err, errObserveTimeout) {
@@ -51,38 +70,35 @@ func TestWaitAndStatusBeforeRegistration(t *testing.T) {
 func fixture(t *testing.T, state string) string {
 	t.Helper()
 	dir := t.TempDir()
-	for _, sub := range []string{"inbox", "inbox/pending", "inbox/done", "inbox/uncertain"} {
-		if err := os.MkdirAll(filepath.Join(dir, sub), 0700); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := os.WriteFile(filepath.Join(dir, "status.json"), []byte(`{"job":"j","status":"`+state+`"}`), 0600); err != nil {
+	if err := register(filepath.Dir(dir), dir, config{Engine: "codex"}, status{Job: "j", Engine: "codex", State: state}); err != nil {
 		t.Fatal(err)
 	}
 	return dir
 }
 
-// A retried say with the same CXRUN_MSG_NAME delivers once, also after the message was archived and the job ended.
+// A retried say with the same ID delivers once, including after the job ends.
 func TestSayNameIsIdempotent(t *testing.T) {
 	dir := fixture(t, "waiting")
 	t.Setenv("CXRUN_MSG_NAME", "0000000000000000001-0123456789abcdef.msg")
-	if err := control(context.Background(), "say", dir, []string{"hello"}); err != nil {
+	if err := control(t.Context(), "say", dir, []string{"hello"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Rename(filepath.Join(dir, "inbox", "0000000000000000001-0123456789abcdef.msg"), filepath.Join(dir, "inbox/done", "0000000000000000001-0123456789abcdef.msg")); err != nil {
+	if err := writeFixtureStatus(dir, status{Job: "j", State: "done", Engine: "codex"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "status.json"), []byte(`{"job":"j","status":"done"}`), 0600); err != nil {
+	if err := control(t.Context(), "say", dir, []string{"hello"}); err != nil {
+		t.Fatalf("retry after end: %v", err)
+	}
+	tail, err := inboxTail(dir, stateCursor{})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := control(context.Background(), "say", dir, []string{"hello"}); err != nil {
-		t.Fatalf("retry after archive and end: %v", err)
-	}
-	if e, _ := os.ReadDir(filepath.Join(dir, "inbox")); len(e) != 3 { // pending, done, uncertain
-		t.Fatalf("inbox changed: %v", e)
+	defer closeBestEffort(tail)
+	if records, err := tail.Next(); err != nil || len(records) != 1 {
+		t.Fatalf("inbox changed: %v %v", records, err)
 	}
 	t.Setenv("CXRUN_MSG_NAME", "bad")
-	if err := control(context.Background(), "say", dir, []string{"x"}); err == nil {
+	if err := control(t.Context(), "say", dir, []string{"x"}); err == nil {
 		t.Fatal("bad name accepted")
 	}
 }
@@ -96,13 +112,18 @@ func TestLogOffsetAndDrain(t *testing.T) {
 	if err := logFrom(dir, []string{"2"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "status.json"), []byte(`{"job":"j","status":"done"}`), 0600); err != nil {
+	if err := writeFixtureStatus(dir, status{Job: "j", State: "done", Engine: "codex"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := logFrom(dir, []string{"4"}); err != nil { // partial line pending: not drained
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "progress.log"), []byte("a\nb\npart\n"), 0600); err != nil {
+	log, err := openJobFile(filepath.Join(dir, "progress.log"), jobFileAppend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = log.WriteString("\n")
+	if err = errors.Join(err, log.Close()); err != nil {
 		t.Fatal(err)
 	}
 	if err := logFrom(dir, []string{"4"}); !errors.Is(err, errDrained) {

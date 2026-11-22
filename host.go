@@ -10,6 +10,24 @@ import (
 const hostConfigName = "host.json"
 const defaultCacheMaxBytes = 50_000_000_000
 
+// Without min_free_bytes, admission keeps the larger of 20 GB and 5% of the volume free.
+// Variables only so the test binary (also used as child cx processes) can run
+// independently of the free space on the machine running the tests.
+var (
+	defaultMinFreeBytes   uint64 = 20_000_000_000
+	defaultMinFreeDivisor uint64 = 20
+)
+
+func (h *hostConfig) minFreeBytes(total uint64) uint64 {
+	if h.MinFreeBytes != nil {
+		return *h.MinFreeBytes
+	}
+	if defaultMinFreeDivisor == 0 {
+		return defaultMinFreeBytes
+	}
+	return max(defaultMinFreeBytes, total/defaultMinFreeDivisor)
+}
+
 type hostConfig struct {
 	Profiles       map[string]hostProfile `json:"profiles,omitempty"`
 	Slots          map[string]int         `json:"slots"`
@@ -36,7 +54,7 @@ func defaultSlots() int {
 func readHostConfig(root string) (*hostConfig, error) {
 	slots := defaultSlots()
 	host := &hostConfig{CacheMaxBytes: defaultCacheMaxBytes, Slots: map[string]int{
-		codexSlotClass: slots,
+		agentSlotClass: slots,
 		testSlotClass:  slots,
 		"system":       defaultSystemSlots,
 	}}
@@ -66,7 +84,7 @@ func validateHostSlots(root string, slots map[string]int) error {
 
 func (h *hostConfig) slotCount(class string) int {
 	if class == "" {
-		class = codexSlotClass
+		class = agentSlotClass
 	}
 	if count, ok := h.Slots[class]; ok {
 		return count

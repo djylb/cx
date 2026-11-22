@@ -283,9 +283,6 @@ func nodeCLI(ctx context.Context, args []string) error {
 			}
 			return errors.New("invalid reuse query")
 		case "clean-job":
-			if len(args) == 4 {
-				return cleanLegacyJob(ctx, args[1], args[2], args[3])
-			}
 			if len(args) == 2 {
 				return cleanNodeJob(ctx, args[1])
 			}
@@ -321,7 +318,7 @@ func nodeCLI(ctx context.Context, args []string) error {
 			return cacheNode(ctx, args)
 		case "recv":
 			return receive(ctx, args[1:])
-		case "follow", "observe-one", "submit-if-version", "install", "host-config", "check-profile", "doctor", "show", "overview", "rows", "wait-poll", "submit-command":
+		case "follow", "observe-one", "wait-ack", "submit-if-version", "install", "host-config", "check-profile", "doctor", "show", "overview", "rows", "wait-poll", "submit-command":
 			return nodeControl(ctx, args)
 		}
 	}
@@ -357,17 +354,34 @@ func windowsNodeCommand(binary string, argv []string, probe bool) string {
 }
 
 func (h endpoint) command(ctx context.Context, args []string) (*exec.Cmd, error) {
+	// These callers manage their own clocks around the returned command.
+	cmd, e := h.transportCommand(ctx, args, 0)
+	if e != nil {
+		return nil, e
+	}
+	return cmd.Cmd, nil
+}
+
+type relayTarget struct {
+	endpoint
+	Idle time.Duration `json:"idle"`
+}
+
+func (h endpoint) transportCommand(ctx context.Context, args []string, idle time.Duration) (*transportProcess, error) {
+	if e := ctx.Err(); e != nil {
+		return nil, e
+	}
 	stream := (len(args) == 4 && args[0] == "recv") || (len(args) > 0 && (args[0] == "forward-stream" || args[0] == "submit-script" || args[0] == "snap-receive" || args[0] == "task-receive"))
 	if h.relay != nil {
 		op := "forward"
 		if stream {
 			op = "forward-stream"
 		}
-		dest, e := json.Marshal(h)
+		dest, e := json.Marshal(relayTarget{h, idle})
 		if e != nil {
 			return nil, e
 		}
-		return h.relay.command(ctx, append([]string{op, string(dest)}, args...))
+		return h.relay.transportCommand(ctx, append([]string{op, string(dest)}, args...), idle)
 	}
 	var budget time.Duration
 	if end, ok := ctx.Deadline(); ok {
@@ -393,13 +407,13 @@ func (h endpoint) command(ctx context.Context, args []string) (*exec.Cmd, error)
 	if stream {
 		argv = append(argv, base64.RawURLEncoding.EncodeToString(b))
 	}
-	var cmd *exec.Cmd
+	cmd := &transportProcess{ctx: ctx, connect: idle, idle: idle}
 	if h.SSH == "" {
 		exe, err := os.Executable()
 		if err != nil {
 			return nil, err
 		}
-		cmd = exec.CommandContext(ctx, exe, argv...)
+		cmd.Cmd = exec.CommandContext(ctx, exe, argv...)
 	} else {
 		line := shellQuote(h.CX) + " " + strings.Join(argv, " ")
 		probe := len(args) > 0 && (args[0] == "version" || args[0] == "submit-if-version" || args[0] == "doctor" || args[0] == "compiler-protocol")
@@ -409,11 +423,12 @@ func (h endpoint) command(ctx context.Context, args []string) (*exec.Cmd, error)
 			binary := shellQuote(h.CX)
 			line = "command -v " + binary + " >/dev/null 2>&1 || test -e " + binary + " || exit 127; " + line
 		}
-		opts, e := sshOptions()
+		opts, master, e := endpointSSHOptions(ctx, h.SSH)
 		if e != nil {
 			return nil, e
 		}
-		cmd = exec.CommandContext(ctx, "ssh", append(opts, "--", h.SSH, line)...)
+		cmd.Cmd = exec.CommandContext(ctx, "ssh", append(opts, "--", h.SSH, line)...)
+		cmd.master, cmd.connect = master, sshConnect
 	}
 	if live {
 		wr, e := cmd.StdinPipe()
@@ -444,18 +459,19 @@ func (h endpoint) invoke(parent context.Context, per time.Duration, replay bool,
 	defer cancel()
 	for i := 0; ; i++ {
 		attempt, stop := context.WithCancel(ctx)
-		cmd, err := h.command(attempt, args)
+		cmd, err := h.transportCommand(attempt, args, per)
 		if err != nil {
 			stop()
+			if cause := parent.Err(); cause != nil {
+				return reply{}, errors.Join(ctlExit(9), cause)
+			}
 			return reply{}, err
 		}
 		var out, diag bytes.Buffer
-		err = runActive(cmd, stop, connect, per, &out, &diag)
+		err = cmd.run(ctx, stop, &out, &diag)
 		b := out.Bytes()
-		expired := errors.Is(err, context.DeadlineExceeded) || attempt.Err() != nil
 		stop()
-		if err != nil && !unsupportedMaster.Load() && unsupportedDiagnostic(runtime.GOOS, diag.String()) {
-			unsupportedMaster.Store(true)
+		if errors.Is(err, errSSHMasterUnsupported) {
 			i--
 			continue
 		}
@@ -463,17 +479,11 @@ func (h endpoint) invoke(parent context.Context, per time.Duration, replay bool,
 		if err == nil {
 			return reply{b, 0}, nil
 		}
-		if !expired && errors.As(err, &exit) && (exit.ExitCode() != 255 || h.SSH == "") {
+		if errors.As(err, &exit) && (exit.ExitCode() != 255 || h.SSH == "") {
 			if diag.Len() > 0 {
 				diagnosticf("%s", cleanDiag(diag.Bytes()))
 			}
 			return reply{b, exit.ExitCode()}, nil
-		}
-		if expired && len(b) == 0 && h.SSH != "" && !errors.Is(parent.Err(), context.Canceled) {
-			// No reply at all: the shared master may be wedged on a stalled link while still
-			// answering keepalives. Retire it so the next attempt (here or in another
-			// command) opens a fresh connection; sessions already on it keep running.
-			retireMaster(h.SSH)
 		}
 		if cause := parent.Err(); cause != nil {
 			return reply{}, errors.Join(ctlExit(9), cause)
@@ -501,39 +511,82 @@ func relayNode(ctx context.Context, args []string) error {
 	if len(args) < 2 {
 		return errors.New("missing relay destination")
 	}
-	var dest endpoint
+	var dest relayTarget
 	if e := json.Unmarshal([]byte(args[1]), &dest); e != nil {
 		return e
 	}
 	if args[0] == "preinstall-doctor" {
-		f, e := preinstallDoctor(ctx, dest)
+		f, e := preinstallDoctor(ctx, dest.endpoint)
 		if e != nil {
 			return e
 		}
 		return json.NewEncoder(os.Stdout).Encode(f)
 	}
 	if args[0] == "platform-probe" {
-		p, e := detectPlatform(ctx, dest)
+		p, e := detectPlatform(ctx, dest.endpoint)
 		if e == nil {
 			fmt.Println(p)
 		}
 		return e
 	}
-	cmd, e := dest.command(ctx, args[2:])
-	if e != nil {
-		return e
+	// Each relay acknowledges and monitors its downstream command. Upstream
+	// sees this link's heartbeat while a later hop connects or recovers.
+	relayCtx, finish := context.WithCancel(ctx)
+	defer finish()
+	if dest.Idle > 0 {
+		if _, e := io.WriteString(os.Stderr, wireReady); e != nil {
+			return e
+		}
+		go func() {
+			ticker := time.NewTicker(min(time.Second, max(time.Nanosecond, dest.Idle/3)))
+			defer ticker.Stop()
+			for {
+				select {
+				case <-relayCtx.Done():
+					return
+				case <-ticker.C:
+					if _, e := io.WriteString(os.Stderr, wireProgress); e != nil {
+						finish()
+						return
+					}
+				}
+			}
+		}()
 	}
-	if args[0] == "forward-stream" {
-		cmd.Stdin = os.Stdin
-	}
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.WaitDelay = time.Second
-	if e = cmd.Run(); e != nil {
+	for {
+		attempt, stop := context.WithCancel(relayCtx)
+		cmd, e := dest.transportCommand(attempt, args[2:], dest.Idle)
+		if e != nil {
+			stop()
+			return e
+		}
+		if args[0] == "forward-stream" {
+			cmd.Stdin = os.Stdin
+		}
+		var diag bytes.Buffer
+		if dest.Idle > 0 {
+			e = cmd.run(relayCtx, stop, os.Stdout, &diag)
+		} else {
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+			cmd.WaitDelay = time.Second
+			e = cmd.Run()
+		}
+		stop()
+		if errors.Is(e, errSSHMasterUnsupported) {
+			continue
+		}
+		if s := cleanDiag(diag.Bytes()); s != "" {
+			diagnosticf("%s", s)
+		}
+		if errors.Is(e, errWireSilence) {
+			diagnosticf("cx: relay to %s: %v\n", dest.SSH, e)
+			return ctlExit(255)
+		}
 		var ex *exec.ExitError
 		if errors.As(e, &ex) {
 			return ctlExit(ex.ExitCode())
 		}
+		return e
 	}
-	return e
 }

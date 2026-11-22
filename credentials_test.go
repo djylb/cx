@@ -69,6 +69,7 @@ func TestCredentialFilterProtocolFields(t *testing.T) {
 		dir: dir, log: log, events: events, srv: &server{},
 		c: config{secret: filter, Approval: time.Second}, s: status{Thread: "thread-fixture"},
 	}
+	startFixtureWriter(t, &r)
 	read := func(raw string) message {
 		t.Helper()
 		m, readErr := r.read(frame{raw: []byte(raw)})
@@ -106,7 +107,7 @@ func TestCredentialFilterProtocolFields(t *testing.T) {
 		r.s.FailedCommand == nil || r.s.FailedCommand.Command != "echo "+hiddenValue {
 		t.Fatalf("unexpected persisted state: %+v", r.s)
 	}
-	report, err := os.ReadFile(filepath.Join(dir, "last.md"))
+	report, err := readTurnReport(t.Context(), dir, r.s.LastCompleted)
 	if err != nil || string(report) != "STATUS: DONE\r\n[REDACTED] [REDACTED] [REDACTED]" {
 		t.Fatalf("unexpected report %q: %v", report, err)
 	}
@@ -138,7 +139,7 @@ func TestCredentialFilterProtocolFields(t *testing.T) {
 		t.Fatalf("captured turn lost control data or output filtering: %+v", got)
 	}
 	read(`{"method":"turn/completed","params":{"turn":{"id":"second-turn","status":"failed","error":{"message":"FAILED request-fixture"}}}}`)
-	report, err = os.ReadFile(filepath.Join(dir, "last.md"))
+	report, err = readTurnReport(t.Context(), dir, r.s.LastCompleted)
 	if err != nil || !bytes.HasPrefix(report, []byte("STATUS: FAILED\n[REDACTED] [REDACTED]\n")) {
 		t.Fatalf("failed report changed control data or leaked output: %s (%v)", report, err)
 	}
@@ -203,7 +204,7 @@ func TestCredentialProfilesCommandCLI(t *testing.T) {
 	writeCredentialFixture(t, filepath.Join(root, "second.env"), "AUTH_VALUE="+profileValue+"\nCODEX_HOME=wrong-value\n", 0644)
 	writeCredentialFixture(t, filepath.Join(root, "host.json"), `{
 		"min_free_bytes":0,"env_file":"host.env","default_profile":"first",
-		"profiles":{"first":{"codex_home":"first-account"},"second":{"codex_home":"second-account","claude_config_dir":"second-claude","env_file":"second.env"},"missing":{"env_file":"absent.env"}}
+		"profiles":{"first":{"engine_homes":{"codex":"first-account"}},"second":{"engine_homes":{"codex":"second-account","claude":"second-claude"},"env_file":"second.env"},"missing":{"env_file":"absent.env"}}
 	}`, 0600)
 	for _, tc := range []struct {
 		tag, profile, check, echo string
@@ -256,8 +257,24 @@ esac
 	writeCredentialFixture(t, filepath.Join(f.home, "claude"), "#!/bin/sh\nprintf '%s\\n' '{\"loggedIn\":false}'\n", 0700)
 	t.Setenv("PATH", f.home+string(os.PathListSeparator)+os.Getenv("PATH"))
 	out, _ := credentialCLI(t, f, 0, "doctor", "local", "--json")
-	for _, want := range []string{`"first":{"claude_available":true,"codex_login_status":"logged_in"`,
-		`"second":{"claude_available":true,"codex_login_status":"logged_out"`, `"mode":"0644"`,
+	var report map[string]struct {
+		Profiles map[string]struct {
+			Engines map[string]struct {
+				LoginStatus *string `json:"login_status"`
+			}
+		}
+	}
+	if err := json.Unmarshal([]byte(out), &report); err != nil {
+		t.Fatal(out, err)
+	}
+	for profile, want := range map[string][2]string{"first": {"logged_in", "logged_out"}, "second": {"logged_out", "logged_out"}} {
+		engines := report["local"].Profiles[profile].Engines
+		codex, claude := engines["codex"].LoginStatus, engines["claude"].LoginStatus
+		if codex == nil || *codex != want[0] || claude == nil || *claude != want[1] {
+			t.Fatalf("%s login states in %s", profile, out)
+		}
+	}
+	for _, want := range []string{`"mode":"0644"`,
 		`env_file permissions are broader than 0600`, `env_file missing; runner skips it`} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("doctor missing %q in %s", want, out)
@@ -287,7 +304,7 @@ func TestCredentialProfilesAgentResumeCLI(t *testing.T) {
 	hostJSON := filepath.Join(root, "host.json")
 	hostConfig := func(defaultName string) string {
 		return fmt.Sprintf(`{"min_free_bytes":0,"default_profile":%q,"profiles":{
-			"first":{"codex_home":"first-account","env_file":"account.env"},"second":{"codex_home":"second-account"}
+			"first":{"engine_homes":{"codex":"first-account"},"env_file":"account.env"},"second":{"engine_homes":{"codex":"second-account"}}
 		}}`, defaultName)
 	}
 	writeCredentialFixture(t, hostJSON, hostConfig("first"), 0600)
@@ -343,7 +360,7 @@ func TestCredentialProfilesClaudeCLI(t *testing.T) {
 	value := "fixture-mock-auth-claude"
 	writeCredentialFixture(t, filepath.Join(root, "profile.env"), "AUTH_VALUE="+value+"\nTYPE_COLLISION=result\nID_COLLISION=fixture-session\n", 0600)
 	writeCredentialFixture(t, filepath.Join(root, "host.json"), `{
-		"min_free_bytes":0,"profiles":{"claude-test":{"claude_config_dir":"claude-home","env_file":"profile.env"}}
+		"min_free_bytes":0,"profiles":{"claude-test":{"engine_homes":{"claude":"claude-home"},"env_file":"profile.env"}}
 	}`, 0600)
 	fake := `#!/bin/sh
 set -eu

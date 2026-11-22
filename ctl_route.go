@@ -35,28 +35,5 @@ func lookupRoute(id string) (string, error) {
 	if !os.IsNotExist(e) {
 		return "", e
 	}
-	path, e = legacyRouteFile(id)
-	if os.IsNotExist(e) {
-		return "local", nil
-	}
-	if e != nil {
-		return "", e
-	}
-	var old struct{ Host string }
-	if e = readJSON(path, &old); e == nil {
-		return old.Host, nil
-	} else if !os.IsNotExist(e) {
-		return "", e
-	}
 	return "local", nil
-}
-
-// Python routes are JSON despite the historical .env suffix.
-func legacyRouteFile(id string) (string, error) {
-	root := os.Getenv("CX_HOME")
-	if root == "" {
-		return "", os.ErrNotExist
-	}
-	path, e := jobDir(filepath.Join(root, ".locks", "cx-jobs"), id)
-	return path + ".env", e
 }

@@ -40,23 +40,44 @@ echo '{"type":"result","session_id":"fixture-session","result":"answer"}'
 	}
 }
 
-func TestDriverCapabilitiesAndPermissions(t *testing.T) {
+func flagValue(args []string, name string) string {
+	for i, a := range args {
+		if a == name && i+1 < len(args) {
+			return args[i+1]
+		}
+	}
+	return ""
+}
+
+func TestClaudeArgsMapping(t *testing.T) {
 	c := config{Engine: "claude", Sandbox: "read-only", WebSearch: true}
-	args := strings.Join(c.claudeArgs(""), " ")
-	if !strings.Contains(args, "--restricted") || !strings.Contains(args, "WebFetch") || strings.Contains(args, "Write") {
+	args := c.claudeArgs("", "")
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "--restricted") || !strings.Contains(flagValue(args, "--tools"), "WebFetch") ||
+		strings.Contains(flagValue(args, "--tools"), "Bash") || strings.Contains(joined, "Write") || strings.Contains(joined, "--mcp-config") {
 		t.Fatal(args)
 	}
-	c.Sandbox = "workspace-write"
-	args = strings.Join(c.claudeArgs("id"), " ")
-	if !strings.Contains(args, "Write(./**)") || !strings.Contains(args, "--resume id") {
+	root := filepath.Join(t.TempDir(), "cache")
+	c = config{Engine: "claude", Sandbox: "workspace-write", Network: true, Effort: "high", Roots: []string{root}}
+	args = c.claudeArgs("id", "/tmp/tools.json")
+	allowed := flagValue(args, "--allowedTools")
+	pattern := "//" + strings.TrimPrefix(filepath.ToSlash(root), "/") + "/**"
+	for _, want := range []string{"Write(./**)", "Edit(./**)", "Bash", "WebFetch", "Edit(" + pattern + ")", "mcp__" + jobToolServerName} {
+		if !strings.Contains(allowed, want) {
+			t.Fatalf("missing %s in %v", want, args)
+		}
+	}
+	if flagValue(args, "--resume") != "id" || flagValue(args, "--effort") != "high" || flagValue(args, "--add-dir") != root ||
+		flagValue(args, "--mcp-config") != "/tmp/tools.json" || !strings.Contains(flagValue(args, "--tools"), "Bash") || strings.Contains(allowed, "WebSearch") {
 		t.Fatal(args)
 	}
 	if c.driver().capabilities().Steer || !c.driver().capabilities().Resume {
 		t.Fatal("invalid Claude capabilities")
 	}
 	c.Sandbox = dangerFullAccess
-	if !strings.Contains(strings.Join(c.claudeArgs(""), " "), "bypassPermissions") {
-		t.Fatal("missing full access")
+	args = c.claudeArgs("", "")
+	if flagValue(args, "--permission-mode") != "bypassPermissions" || flagValue(args, "--tools") != "" {
+		t.Fatal(args)
 	}
 	r := runner{c: config{WebSearch: true, Effort: "medium"}}
 	cfg := r.threadParams()["config"].(fields)

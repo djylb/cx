@@ -174,7 +174,7 @@ func expectedVersion(version, plat string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	b, err := readStateFile(path + ".sha256")
+	b, err := readSharedFile(path + ".sha256")
 	if os.IsNotExist(err) {
 		return "", nil
 	}
@@ -338,7 +338,7 @@ func deploy(ctx context.Context, hs endpoints, name string) error {
 	return retryTransfer(ctx, func() error { return deployOnce(ctx, hs, name, false) })
 }
 func deployOnce(ctx context.Context, hs endpoints, name string, setup bool) error {
-	ctx, stop := context.WithTimeout(ctx, 6*time.Hour)
+	ctx, stop := context.WithTimeout(ctx, transferLimit)
 	defer stop()
 	h := hs[name]
 	if h.Via != "" {

@@ -18,6 +18,9 @@ import (
 
 // The subprocess fixture exercises real pipes, files and locks. It needs no model account.
 func TestMain(m *testing.M) {
+	// Tests that exercise the disk watermark set min_free_bytes explicitly.
+	defaultMinFreeBytes, defaultMinFreeDivisor = 0, 0
+	trackFixtureWorkerStarts()
 	if base := filepath.Base(os.Args[0]); base == "cx" || base == "cxrun" {
 		main()
 		return
@@ -52,6 +55,50 @@ func TestMain(m *testing.M) {
 	}
 	os.Exit(m.Run())
 }
+
+const fixtureWorkerLock = "CX_TEST_WORKER_LOCK"
+
+func trackFixtureWorkerStarts() {
+	start := startDetachedWorker
+	startDetachedWorker = func(cmd *exec.Cmd) error {
+		path := os.Getenv(fixtureWorkerLock)
+		if path == "" || runtime.GOOS == "windows" {
+			return start(cmd)
+		}
+		lease, err := lockFile(path, os.O_CREATE, trySharedLock)
+		if err != nil {
+			return err
+		}
+		if lease == nil {
+			return errors.New("fixture is already joining its workers")
+		}
+		defer closeBestEffort(lease)
+		// Hold the lease from spawn, including when the CLI can return
+		// before the worker's first instruction (such as fetch-turn).
+		cmd.ExtraFiles = append(cmd.ExtraFiles, lease)
+		return start(cmd)
+	}
+}
+
+func joinFixtureWorkers(t *testing.T, dir string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		return // ExtraFiles and inherited flock ownership are Unix-only.
+	}
+	path := filepath.Join(dir, "workers.lock")
+	t.Setenv(fixtureWorkerLock, path)
+	t.Cleanup(func() {
+		// The runner can still maintain caches after publishing terminal
+		// state and releasing owner.lock. Join before TempDir removes state.
+		barrier, err := lockUntil(context.Background(), path)
+		if err != nil {
+			t.Errorf("waiting for detached fixture workers: %v", err)
+			return
+		}
+		closeBestEffort(barrier)
+	})
+}
+
 func fixtureServer() error {
 	in := json.NewDecoder(os.Stdin)
 	out := json.NewEncoder(os.Stdout)
@@ -125,7 +172,11 @@ func fixtureServer() error {
 			if os.Getenv("FIXMODE") == "wait-enospc" {
 				outcome = "completed"
 			}
-			result = fields{"thread": fields{"id": "thread", "turns": []fields{{"id": "first", "status": outcome}}}}
+			turns := []fields{{"id": "first", "status": outcome}}
+			if os.Getenv("FIXMODE") == "revert-empty" {
+				turns = []fields{}
+			}
+			result = fields{"thread": fields{"id": "thread", "turns": turns}}
 		case "thread/fork":
 			var params struct{ ThreadID, LastTurnID string }
 			if err := json.Unmarshal(m.Params, &params); err != nil || params.ThreadID != "thread" || params.LastTurnID != "first" {
@@ -143,7 +194,11 @@ func fixtureServer() error {
 				return fmt.Errorf("bad revert %s", m.Params)
 			}
 		case "thread/turns/list":
-			result = fields{"data": []fields{{"id": "prior", "status": "completed", "items": []fields{{"type": "agentMessage", "text": "restored"}}}}}
+			turns := []fields{{"id": "prior", "status": "completed", "items": []fields{{"type": "agentMessage", "text": "restored"}}}}
+			if os.Getenv("FIXMODE") == "revert-empty" {
+				turns = []fields{}
+			}
+			result = fields{"data": turns}
 		case "fixture/disconnect":
 			return nil
 		case "fixture/complete":
@@ -325,7 +380,7 @@ func fixtureServer() error {
 			case "credential":
 				itemEvent(fields{"type": "agentMessage", "text": os.Getenv("AUTH_VALUE")})
 				notify("turn/completed", fields{"turn": fields{"id": turnID, "status": "completed"}})
-			case "complete":
+			case "complete", "revert-empty":
 				notify("turn/completed", fields{"turn": fields{"id": turnID, "status": "completed"}})
 			default:
 				if turnID == "first" {
@@ -340,6 +395,8 @@ func fixtureServer() error {
 		case "turn/steer":
 			if os.Getenv("FIXMODE") == "manual" {
 				switch p.Input[0].Text {
+				case "hello":
+					// Agent inbox tests acknowledge a steer without ending the turn.
 				case "completed", "failed":
 					notify("turn/completed", fields{"turn": fields{"id": turnID, "status": p.Input[0].Text}})
 				default:
@@ -437,6 +494,8 @@ func runnerFixture(t *testing.T) (root, work, prompt string) {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", tmp+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
 	prompt = filepath.Join(tmp, "prompt")
 	if err = os.WriteFile(prompt, []byte("task"), 0600); err != nil {
 		t.Fatal(err)
@@ -468,7 +527,7 @@ func TestRunnerConversation(t *testing.T) {
 		t.Helper()
 		for {
 			var s status
-			if readJSON(filepath.Join(dir, "status.json"), &s) == nil && want(s) {
+			if loadJobStatusInto(dir, &s) == nil && want(s) {
 				return s
 			}
 			select {
@@ -490,7 +549,7 @@ func TestRunnerConversation(t *testing.T) {
 		until(func(s status) bool {
 			return s.State == "waiting_approval" && len(s.Approvals) == 1 && string(s.Approvals[0].ID) == id
 		})
-		check(publishMarker(dir, which, markerOptions{}, []string{id}))
+		check(run(ctx, []string{which, "--job", "job", id}))
 	}
 	approvalFile("approve", `"approval-1"`)
 	approvalFile("deny", "42")
@@ -503,16 +562,16 @@ func TestRunnerConversation(t *testing.T) {
 			t.Fatal(p, string(b))
 		}
 	}
-	b, err := os.ReadFile(filepath.Join(dir, "last.md"))
+	b, err := readTurnReport(ctx, dir, "first")
 	check(err)
 	if string(b) != "STATUS: DONE\nthree files" {
 		t.Fatal(string(b))
 	}
 	check(control(ctx, "say", dir, []string{"second round"}))
 	until(func(s status) bool { return s.Turn == "second" && s.State == "running" })
-	check(control(ctx, "interrupt", dir, nil))
+	check(run(ctx, []string{"interrupt", "--job", "job"}))
 	until(func(s status) bool { return s.CompletedStatus == "interrupted" })
-	check(control(ctx, "close", dir, nil))
+	check(run(ctx, []string{"close", "--job", "job"}))
 	select {
 	case err = <-done:
 		check(err)
@@ -520,7 +579,7 @@ func TestRunnerConversation(t *testing.T) {
 		t.Fatal(ctx.Err())
 	}
 	var s status
-	check(readJSON(filepath.Join(dir, "status.json"), &s))
+	check(loadJobStatusInto(dir, &s))
 	if s.State != "done" || s.Finished != 2 || s.PID != 0 {
 		t.Fatal(s)
 	}
@@ -564,7 +623,7 @@ func TestConcurrentRegistrationAndInterruptedDelivery(t *testing.T) {
 		t.Fatalf("expected exactly one publisher: %v / %v", a, b)
 	}
 	var c config
-	if err := readJSON(filepath.Join(dir, "config.json"), &c); err != nil || (c.Prompt != "one" && c.Prompt != "two") {
+	if err := readJobConfig(dir, &c); err != nil || (c.Prompt != "one" && c.Prompt != "two") {
 		t.Fatal(c, err)
 	}
 	log, err := os.OpenFile(filepath.Join(dir, "progress.log"), os.O_WRONLY|os.O_APPEND, 0600)
@@ -572,42 +631,67 @@ func TestConcurrentRegistrationAndInterruptedDelivery(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = log.Close() }()
-	r := runner{dir: dir, log: log}
+	r := runner{dir: dir, log: log, c: c}
+	startFixtureWriter(t, &r)
+	if err = r.refreshInbox(); err != nil {
+		t.Fatal(err)
+	}
 	for _, name := range []string{"ack.msg", "unknown.msg"} {
-		if writeErr := os.WriteFile(r.mail(filepath.Join("pending", name)), []byte("same"), 0600); writeErr != nil {
-			t.Fatal(writeErr)
+		record, err := newRecord("msg", inboxMessage{Text: "same"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		record.ID = name
+		record, err = appendInbox(t.Context(), dir, record, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := r.claimInbox(record, "deliver"); err != nil {
+			t.Fatal(err)
 		}
 	}
 	if err = r.recoverInbox(turn{Items: []item{{Type: "userMessage", ClientID: "ack.msg"}}}); err != nil {
 		t.Fatal(err)
 	}
-	for sub, name := range map[string]string{"done": "ack.msg", "uncertain": "unknown.msg"} {
-		if ok, existsErr := fileExists(r.mail(filepath.Join(sub, name))); !ok || existsErr != nil {
-			t.Fatal(sub, name, existsErr)
-		}
-		if err = os.WriteFile(r.mail(name), []byte("same"), 0600); err != nil {
+	in, err := readInboxState(dir)
+	if err != nil || in.acks[1].Result != "delivered" || in.acks[2].Result != "uncertain" || len(in.claims) != 0 {
+		t.Fatal(in, err)
+	}
+	for _, name := range []string{"ack.msg", "unknown.msg"} {
+		if err := publishMessage(t.Context(), dir, name, inboxMessage{Text: "same"}); err != nil {
 			t.Fatal(err)
 		}
-		if err = r.deliver(name); err != nil {
-			t.Fatal(err)
-		}
-		if ok, err := fileExists(r.mail(name)); ok || err != nil {
-			t.Fatal("duplicate still queued", name, err)
-		}
+	}
+	pending, err := pendingInboxMessages(dir)
+	if err != nil || len(pending) != 0 {
+		t.Fatal(pending, err)
 	}
 }
 
 func TestWaitKeepsOriginalTurn(t *testing.T) {
-	dir := t.TempDir()
-	lines := "t\tturn/completed\told completed\nt\tturn/completed\ttarget interrupted\nt\tturn/completed\tnext completed\n"
-	if err := os.WriteFile(filepath.Join(dir, "progress.log"), []byte(lines), 0600); err != nil {
+	dir := fixture(t, "waiting")
+	o, err := openJobObservation(dir, stateCursor{}, "")
+	if err != nil {
 		t.Fatal(err)
 	}
-	before := status{Finished: 1, LastCompleted: "old", Turn: "target", TurnStatus: "inProgress"}
-	now := status{Finished: 3, LastCompleted: "next", CompletedStatus: "completed"}
-	id, outcome, err := waitOutcome(dir, before, now)
-	if err != nil || id != "target" || outcome != "interrupted" {
-		t.Fatal(id, outcome, err)
+	defer closeBestEffort(o)
+	o.floor = &status{Finished: 1, Turn: "target", TurnStatus: "inProgress"}
+	r := runner{dir: dir}
+	startFixtureWriter(t, &r)
+	for _, s := range []status{
+		{Finished: 2, LastCompleted: "target", CompletedStatus: "completed"},
+		{Finished: 2, LastCompleted: "target", CompletedStatus: "interrupted"},
+		{Finished: 3, LastCompleted: "next", CompletedStatus: "completed"},
+	} {
+		if err := r.stateLog.Append("status", s); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := o.read(); err != nil {
+		t.Fatal(err)
+	}
+	if sel := o.selected; sel == nil || sel.TurnID != "target" || sel.Outcome != "interrupted" {
+		t.Fatal(sel)
 	}
 }
 
@@ -638,7 +722,7 @@ func (h *testRuns) await(id string, match func(status) bool) status {
 	h.t.Helper()
 	for {
 		var s status
-		if err := readJSON(filepath.Join(h.root, id, "status.json"), &s); err == nil && match(s) {
+		if err := loadJobStatusInto(filepath.Join(h.root, id), &s); err == nil && match(s) {
 			return s
 		}
 		if err := pause(h.ctx, 10*time.Millisecond); err != nil {
@@ -695,7 +779,7 @@ func TestFirstTurnPreamble(t *testing.T) {
 				t.Fatalf("runner: %v\n%s", err, stderr)
 			}
 			var saved config
-			if err := readJSON(filepath.Join(h.root, "job", "config.json"), &saved); err != nil || saved.Prompt != tc.want {
+			if err := readJobConfig(filepath.Join(h.root, "job"), &saved); err != nil || saved.Prompt != tc.want {
 				t.Fatalf("saved prompt: %q, err: %v", saved.Prompt, err)
 			}
 		})
@@ -731,7 +815,7 @@ func TestDangerFullAccess(t *testing.T) {
 	}
 	dir := filepath.Join(h.root, id)
 	var s status
-	if err := readJSON(filepath.Join(dir, "status.json"), &s); err != nil || !s.Privileged || s.LastCompleted != "continued" || s.CompletedStatus != "completed" || s.Restarts != 1 {
+	if err := loadJobStatusInto(dir, &s); err != nil || !s.Privileged || s.LastCompleted != "continued" || s.CompletedStatus != "completed" || s.Restarts != 1 {
 		t.Fatalf("status: %+v, err: %v", s, err)
 	}
 	f, err := os.Open(filepath.Join(dir, "events.jsonl"))
@@ -810,7 +894,7 @@ func TestStallAndCrashRecovery(t *testing.T) {
 }
 func TestFIFOQueuedCloseAndDedup(t *testing.T) {
 	h := newRuns(t, "silent")
-	setTestHost(t, h.root, map[string]int{"codex": 1}, "")
+	setTestHost(t, h.root, map[string]int{"agent": 1}, "")
 	g, err := registryLock(h.ctx, h.root)
 	if err != nil {
 		t.Fatal(err)
@@ -850,7 +934,7 @@ func TestFIFOQueuedCloseAndDedup(t *testing.T) {
 	}
 	h.await("alpha/j", func(s status) bool { return s.Turn == "first" })
 	var s status
-	if err = readJSON(filepath.Join(h.root, "beta/j/status.json"), &s); err != nil || !queued(s) {
+	if err = loadJobStatusInto(filepath.Join(h.root, "beta", "j"), &s); err != nil || !queued(s) {
 		t.Fatal(s, err)
 	}
 	if err = h.ctl("clean", "alpha/j"); err == nil {
@@ -872,7 +956,7 @@ func TestFIFOQueuedCloseAndDedup(t *testing.T) {
 }
 func TestProjectsRunConcurrently(t *testing.T) {
 	h := newRuns(t, "silent")
-	setTestHost(t, h.root, map[string]int{"codex": 2}, "")
+	setTestHost(t, h.root, map[string]int{"agent": 2}, "")
 	var ends []<-chan error
 	for _, id := range []string{"a/same", "b/same"} {
 		ends = append(ends, h.start(id, "--session", id))
@@ -908,15 +992,15 @@ func TestCleanKeepsSuccessfulReceipt(t *testing.T) {
 	}
 }
 
-func TestLockedLegacyJob(t *testing.T) {
+func TestLockedRegisteredJob(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("CXRUN_STATE", root)
 	dir := filepath.Join(root, "legacy")
 	if err := register(root, dir, config{Prompt: "saved"}, status{Job: "legacy", State: "running"}); err != nil {
 		t.Fatal(err)
 	}
-	s := []byte("{\"job\":\"legacy\",\"status\":\"running\",\"legacy_field\":true}")
-	if err := os.WriteFile(filepath.Join(dir, "status.json"), s, 0600); err != nil {
+	_, before, err := latestState(dir)
+	if err != nil {
 		t.Fatal(err)
 	}
 	held, err := lockPath(filepath.Join(dir, "owner.lock"), 0)
@@ -926,17 +1010,22 @@ func TestLockedLegacyJob(t *testing.T) {
 	defer func() { _ = held.Close() }()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	for _, op := range []string{"start", "resume", "status", "close"} {
+	for _, op := range []string{"start", "resume", "status"} {
 		if err = run(ctx, []string{op, "--job", "legacy"}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err = run(ctx, []string{"clean", "--job", "legacy"}); err == nil {
-		t.Fatal("clean accepted live legacy owner")
+	closeCtx, stopClose := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer stopClose()
+	if err = run(closeCtx, []string{"close", "--job", "legacy"}); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("close returned without a final record: %v", err)
 	}
-	b, err := os.ReadFile(filepath.Join(dir, "status.json"))
-	if err != nil || string(b) != string(s) {
-		t.Fatalf("modified legacy status: %s %v", b, err)
+	if err = run(ctx, []string{"clean", "--job", "legacy"}); err == nil {
+		t.Fatal("clean accepted live owner")
+	}
+	_, after, err := latestState(dir)
+	if err != nil || after != before {
+		t.Fatalf("modified locked status: %v -> %v (%v)", before, after, err)
 	}
 }
 
@@ -989,7 +1078,7 @@ func fixtureCLI(t *testing.T, expected int, args ...string) string {
 
 func TestLoadGateAndAbandonedTicket(t *testing.T) {
 	h := newRuns(t, "complete")
-	setTestHost(t, h.root, map[string]int{"codex": 1}, "exit 1")
+	setTestHost(t, h.root, map[string]int{"agent": 1}, "exit 1")
 	// Kill only this CLI child. The failing load probe keeps it in the queue
 	// without an app-server, and the next runner must reclaim the stale ticket.
 	exe, err := os.Executable()
@@ -1008,7 +1097,7 @@ func TestLoadGateAndAbandonedTicket(t *testing.T) {
 		}
 	}()
 	h.await("p/abandoned", func(s status) bool { return s.State == "queued" && s.PID == cmd.Process.Pid })
-	if err = h.ctl("wait", "p/abandoned", "--timeout", "300ms"); !errors.Is(err, context.DeadlineExceeded) {
+	if err = h.ctl("wait", "p/abandoned", "--timeout", "1s"); !errors.Is(err, ctlExit(exitQueued)) {
 		t.Fatal(err)
 	}
 	if err = cmd.Process.Kill(); err != nil {
@@ -1017,7 +1106,7 @@ func TestLoadGateAndAbandonedTicket(t *testing.T) {
 	if err = cmd.Wait(); err == nil {
 		t.Fatal("expected killed runner")
 	}
-	setTestHost(t, h.root, map[string]int{"codex": 1}, "exit 0")
+	setTestHost(t, h.root, map[string]int{"agent": 1}, "exit 0")
 	if err = <-h.start("p/next"); err != nil {
 		t.Fatal(err)
 	}
@@ -1027,7 +1116,7 @@ func TestLoadGateAndAbandonedTicket(t *testing.T) {
 // queue behind C, even though A's server and thread already exist.
 func TestTurnSlotHandoff(t *testing.T) {
 	h := newRuns(t, "manual")
-	setTestHost(t, h.root, map[string]int{"codex": 1}, "")
+	setTestHost(t, h.root, map[string]int{"agent": 1}, "")
 	queued := func(s status) bool { return s.State == "queued" && s.PID != 0 }
 	first := func(s status) bool { return s.State == "running" && s.Turn == "first" }
 	submit := func(id string) <-chan error { return h.start(id, "--idle-exit", "1m") }
@@ -1048,18 +1137,18 @@ func TestTurnSlotHandoff(t *testing.T) {
 	h.await("c", queued)
 	ctl("say", "a", "second round")
 	waiting := h.await("a", queued)
-	if waiting.ServerPID != original.ServerPID || waiting.Turn != "first" {
+	if waiting.EnginePID != original.EnginePID || waiting.Turn != "first" {
 		t.Fatal(waiting)
 	}
 	ctl("interrupt", "b")
 	h.await("c", first)
 	var s status
-	if err := readJSON(filepath.Join(h.root, "a", "status.json"), &s); err != nil || !queued(s) {
+	if err := loadJobStatusInto(filepath.Join(h.root, "a"), &s); err != nil || !queued(s) {
 		t.Fatal("follow-up overtook c", s, err)
 	}
 	ctl("say", "c", "failed")
 	second := h.await("a", func(s status) bool { return s.Turn == "second" && s.State == "running" })
-	if second.ServerPID != original.ServerPID || second.Thread != original.Thread {
+	if second.EnginePID != original.EnginePID || second.Thread != original.Thread {
 		t.Fatal(second)
 	}
 	for id, end := range map[string]<-chan error{"a": a, "b": b, "c": c} {
@@ -1072,14 +1161,14 @@ func TestTurnSlotHandoff(t *testing.T) {
 
 func TestRestartKeepsActiveSlot(t *testing.T) {
 	h := newRuns(t, "silent")
-	setTestHost(t, h.root, map[string]int{"codex": 1}, "")
+	setTestHost(t, h.root, map[string]int{"agent": 1}, "")
 	recovery := h.start("recover", "--stall", "600ms")
 	h.await("recover", func(s status) bool { return s.Turn == "continued" && s.StallCount == 2 })
 	next := h.start("next")
 	h.await("next", func(s status) bool { return s.State == "queued" && s.PID != 0 })
 	h.await("next", func(s status) bool { return s.Turn == "first" })
 	var s status
-	if err := readJSON(filepath.Join(h.root, "recover", "status.json"), &s); err != nil || s.State != "stalled" {
+	if err := loadJobStatusInto(filepath.Join(h.root, "recover"), &s); err != nil || s.State != "stalled" {
 		t.Fatalf("competitor entered during restart: %+v %v", s, err)
 	}
 	if err := <-recovery; !errors.Is(err, errStalled) {
@@ -1097,7 +1186,7 @@ func TestFollowupQueueDeadlines(t *testing.T) {
 	for _, expireQueue := range []bool{false, true} {
 		t.Run(fmt.Sprint("expireQueue=", expireQueue), func(t *testing.T) {
 			h := newRuns(t, "manual")
-			setTestHost(t, h.root, map[string]int{"codex": 1}, "")
+			setTestHost(t, h.root, map[string]int{"agent": 1}, "")
 			h.t.Setenv("GORACE", "atexit_sleep_ms=0")
 			queueLimit := "0"
 			if expireQueue {

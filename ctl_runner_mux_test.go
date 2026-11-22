@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -63,7 +64,7 @@ func TestMuxRunnerCarriesStateAcrossDaemon(t *testing.T) {
 	if err := writeJSON(filepath.Join(root, hostConfigName), fields{"psmux": mux, "mux_socket": "selected-socket"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeJSON(filepath.Join(root, "status.json"), status{State: "done"}); err != nil {
+	if err := writeFixtureStatus(root, status{State: "done", RunID: "fixture", LaunchID: "token"}); err != nil {
 		t.Fatal(err)
 	}
 	exe, err := os.Executable()
@@ -72,8 +73,12 @@ func TestMuxRunnerCarriesStateAcrossDaemon(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	if err = launchMuxRunner(ctx, root, exe, root, root, []string{"host"}, nil, false); err != nil {
+	if err = launchMuxRunner(ctx, root, exe, root, root, []string{"host"}, nil, "fixture", "token", func() {}); err != nil {
 		t.Fatal(err)
+	}
+	attempts, err := os.ReadDir(filepath.Join(root, ".cx-launches"))
+	if err != nil || len(attempts) != 0 {
+		t.Fatalf("acknowledged mux launch left descriptors: %v %v", attempts, err)
 	}
 	var got hostConfig
 	if err = readJSON(filepath.Join(root, "launch.log"), &got); err != nil || got.MuxSocket != "selected-socket" {
@@ -82,5 +87,21 @@ func TestMuxRunnerCarriesStateAcrossDaemon(t *testing.T) {
 	t.Setenv("CXRUN_TMUX_SOCKET", "explicit-socket")
 	if program, socket := psmuxSettings(root); program != mux || socket != "explicit-socket" {
 		t.Fatal(program, socket)
+	}
+}
+
+func TestRunnerHandoffReportsOwnerBusyWithoutAcceptingOldStatus(t *testing.T) {
+	dir := t.TempDir()
+	if err := writeFixtureStatus(dir, status{State: "done", RunID: "same-run", LaunchID: "earlier-worker"}); err != nil {
+		t.Fatal(err)
+	}
+	rejection := filepath.Join(dir, "worker.rejected")
+	if err := writeJobBytes(rejection, []byte("owner-busy")); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	if err := awaitRunner(ctx, dir, "same-run", "requested-worker", 0, nil, rejection); !errors.Is(err, errJobOwnerBusy) {
+		t.Fatalf("runner handoff = %v", err)
 	}
 }

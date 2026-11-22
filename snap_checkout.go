@@ -6,11 +6,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strings"
 )
 
 type PreparedSnapshot struct {
@@ -20,6 +22,75 @@ type PreparedSnapshot struct {
 	Source      string            `json:"source"`
 	SnapshotOID string            `json:"snapshot_oid"`
 }
+
+const preparedBlobRole = "prepared"
+
+type blobRef struct {
+	Role   string `json:"role"`
+	SHA256 string `json:"sha256"`
+}
+
+func blobPath(dir, sum string) string {
+	return filepath.Join(dir, "blobs", sum+".json")
+}
+
+func readPreparedSnapshot(ctx context.Context, dir string) (PreparedSnapshot, bool, error) {
+	var prepared PreparedSnapshot
+	record, _, err := latestStateKind(dir, "blob")
+	if err != nil || record.Seq == 0 {
+		return prepared, false, err
+	}
+	var ref blobRef
+	if err := json.Unmarshal(record.Value, &ref); err != nil {
+		return prepared, false, err
+	}
+	if err := syncJobDir(filepath.Join(dir, "state")); err != nil {
+		return prepared, false, err
+	}
+	if ref.Role != preparedBlobRole || !snapHex(ref.SHA256, 64) {
+		return prepared, false, errors.New("invalid prepared blob reference")
+	}
+	f, err := openJobContent(ctx, blobPath(dir, ref.SHA256))
+	if err != nil {
+		return prepared, false, err
+	}
+	defer closeBestEffort(f)
+	b, err := io.ReadAll(f)
+	if err != nil {
+		return prepared, false, err
+	}
+	if snapSum(b) != ref.SHA256 {
+		return prepared, false, errors.New("prepared blob does not match its state record")
+	}
+	if err := json.Unmarshal(b, &prepared); err != nil {
+		return prepared, false, err
+	}
+	return prepared, true, nil
+}
+
+// The checkout exists before runner registration and may be shared by forks.
+// Its owner.lock serializes materialization and publication of its blob record.
+func publishPreparedSnapshot(dir string, prepared PreparedSnapshot) error {
+	b, err := json.Marshal(prepared)
+	if err != nil {
+		return err
+	}
+	ref := blobRef{Role: preparedBlobRole, SHA256: snapSum(b)}
+	if err := publishImmutable(blobPath(dir, ref.SHA256), b, filepath.Dir(dir)); err != nil {
+		return err
+	}
+	w, err := openStateLog(dir)
+	if err != nil {
+		return err
+	}
+	defer closeBestEffort(w)
+	record, err := newRecord("blob", ref)
+	if err != nil {
+		return err
+	}
+	return w.commit(record)
+}
+
 type SnapshotPatch struct {
 	Path         string `json:"path"`
 	RepoID       string `json:"repo_id"`
@@ -51,6 +122,30 @@ func (g snapGit) worktree(args ...string) error {
 	return err
 }
 
+func removeUnpublishedWorktree(mirror snapGit, dst string) error {
+	parent := diskPath(dst)
+	relative, err := filepath.Rel(parent, dst)
+	if err != nil {
+		return err
+	}
+	physical, err := filepath.EvalSymlinks(parent)
+	if err != nil {
+		return err
+	}
+	actual := filepath.Join(physical, relative)
+	paths, err := mirror.get("worktree", "list", "--porcelain", "-z")
+	if err != nil {
+		return err
+	}
+	for _, field := range strings.Split(string(paths), "\x00") {
+		path, ok := strings.CutPrefix(field, "worktree ")
+		if ok && (filepath.Clean(path) == filepath.Clean(dst) || filepath.Clean(path) == actual) {
+			return mirror.worktree("remove", "--force", dst)
+		}
+	}
+	return nil
+}
+
 func Materialize(ctx context.Context, job string, m Manifest, target string) (PreparedSnapshot, error) {
 	var out PreparedSnapshot
 	var e error
@@ -74,7 +169,7 @@ func Materialize(ctx context.Context, job string, m Manifest, target string) (Pr
 	if e = os.MkdirAll(job, 0700); e != nil {
 		return out, e
 	}
-	lock, e := lockUntil(ctx, filepath.Join(job, ".materialize.lock"))
+	lock, e := lockUntil(ctx, filepath.Join(job, "owner.lock"))
 	if e != nil {
 		return out, e
 	}
@@ -86,16 +181,32 @@ func Materialize(ctx context.Context, job string, m Manifest, target string) (Pr
 	if e = snapImmutable(filepath.Join(job, "input/manifest.json"), b); e != nil {
 		return out, e
 	}
-	if e = readJSON(filepath.Join(job, "prepared.json"), &out); e == nil {
-		return out, nil
-	} else if !os.IsNotExist(e) {
-		return out, e
+	if e = validateSnapshotRepos(ctx, target, m); e != nil {
+		return out, fmt.Errorf("snapshot repository unavailable, republish snapshot %s: %w", snapSum(b), e)
+	}
+	if prepared, found, err := readPreparedSnapshot(ctx, job); err != nil || found {
+		return prepared, err
 	}
 	work := filepath.Join(job, "work")
+	tree := filepath.Join(work, "tree")
+	if _, err := os.Stat(work); err == nil {
+		// Recover an unpublished attempt while holding checkout ownership.
+		for _, repo := range slices.Backward(m.Repositories) {
+			mirror := snapGit{ctx: ctx, dir: repo.bare(target)}
+			dst := filepath.Join(tree, repo.Path)
+			if err := removeUnpublishedWorktree(mirror, dst); err != nil {
+				return out, err
+			}
+		}
+		if err := os.RemoveAll(work); err != nil {
+			return out, err
+		}
+	} else if !os.IsNotExist(err) {
+		return out, err
+	}
 	if e = os.Mkdir(work, 0700); e != nil {
 		return out, e
 	}
-	tree := filepath.Join(work, "tree")
 	var added []SnapshotRepo
 	ok := false
 	defer func() {
@@ -117,9 +228,6 @@ func Materialize(ctx context.Context, job string, m Manifest, target string) (Pr
 		}
 		g := snapGit{ctx: ctx, dir: dst}
 		mirror := snapGit{ctx: ctx, dir: r.bare(target)}
-		if e = snapVerifyRepo(mirror, r); e != nil {
-			return out, e
-		}
 		attributes := filepath.Join(mirror.dir, "info", "attributes")
 		if err := snapImmutable(attributes, []byte("* -text !eol -crlf -ident !filter !working-tree-encoding\n")); err != nil {
 			return out, err
@@ -163,17 +271,17 @@ func Materialize(ctx context.Context, job string, m Manifest, target string) (Pr
 		}
 	}
 	if out.ReviewDiff != nil {
-		if e = atomicWrite(*out.ReviewDiff, review.Bytes()); e != nil {
+		if e = snapImmutable(*out.ReviewDiff, review.Bytes()); e != nil {
 			return out, e
 		}
 	}
 	if w := m.Workspace; w != nil {
 		p := filepath.Join(work, "go.work")
-		if e = os.WriteFile(p, []byte(w.Text), 0600); e != nil {
+		if e = writeJobBytes(p, []byte(w.Text)); e != nil {
 			return out, e
 		}
 		if w.Sum != nil {
-			if e = os.WriteFile(p+".sum", []byte(*w.Sum), 0600); e != nil {
+			if e = writeJobBytes(p+".sum", []byte(*w.Sum)); e != nil {
 				return out, e
 			}
 		}
@@ -190,7 +298,11 @@ func Materialize(ctx context.Context, job string, m Manifest, target string) (Pr
 		}
 		out.Env["PATH"] = os.Getenv("PATH") + string(os.PathListSeparator) + filepath.Join(os.Getenv("APPDATA"), "npm")
 	}
-	if e = writeJSON(filepath.Join(job, "prepared.json"), out); e != nil {
+	if e = publishPreparedSnapshot(job, out); e != nil {
+		// A link can already be visible if only its final directory flush
+		// failed. Keep the materialization for a reader to confirm.
+		record, _, _ := latestStateKind(job, "blob")
+		ok = record.Seq != 0
 		return out, e
 	}
 	ok = true
@@ -199,7 +311,7 @@ func Materialize(ctx context.Context, job string, m Manifest, target string) (Pr
 func Collect(ctx context.Context, job string) (SnapshotResult, error) {
 	var m Manifest
 	var out SnapshotResult
-	raw, e := readStateFile(filepath.Join(job, "input/manifest.json"))
+	raw, e := readSharedFile(filepath.Join(job, "input/manifest.json"))
 	if e != nil {
 		return out, e
 	}
@@ -320,7 +432,7 @@ func collectSnapshotPatch(ctx context.Context, out *SnapshotResult, r SnapshotRe
 		if count > 1 {
 			name = fmt.Sprintf("%s.%d.patch", r.RepoID, i)
 		}
-		if indexErr = os.WriteFile(filepath.Join(out.Dir, name), data, 0600); indexErr != nil {
+		if indexErr = writeJobBytes(filepath.Join(out.Dir, name), data); indexErr != nil {
 			return indexErr
 		}
 		baseTree, treeErr := g.get("rev-parse", r.OID+"^{tree}")

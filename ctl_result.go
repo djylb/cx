@@ -13,7 +13,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -41,6 +40,13 @@ type turnResult struct {
 	Turn         int64                 `json:"turn"`
 }
 
+func currentTurnID(s status) string {
+	if s.Turn != "" {
+		return s.Turn
+	}
+	return s.LastCompleted
+}
+
 func readyResult(s status) bool {
 	if s.State == "running" || s.State == "waiting_approval" || s.State == "queued" || s.State == "waiting_input" && s.InputKind == "server_request" {
 		return false
@@ -48,15 +54,13 @@ func readyResult(s status) bool {
 	if s.Finished == 0 {
 		return s.State != "waiting"
 	}
-	return s.Turn == s.LastCompleted
+	return s.LastCompleted != "" && currentTurnID(s) == s.LastCompleted
 }
 func resultCheckout(work string) (string, error) {
-	for _, checkout := range []string{filepath.Join(work, "jobs", "checkout"), work} {
-		if _, err := os.Stat(filepath.Join(checkout, "input", "manifest.json")); err == nil {
-			return checkout, nil
-		} else if !os.IsNotExist(err) {
-			return "", err
-		}
+	if _, err := os.Stat(filepath.Join(work, "input", "manifest.json")); err == nil {
+		return work, nil
+	} else if !os.IsNotExist(err) {
+		return "", err
 	}
 	return "", nil
 }
@@ -112,10 +116,8 @@ func sealTurn(ctx context.Context, dir string, s status, n int64) (string, error
 		if e == nil {
 			defer removeTreeBestEffort(result.Dir)
 			var c config
-			if e = readJSON(filepath.Join(dir, "config.json"), &c); e == nil && c.Dir != "" {
+			if e = readJobConfig(dir, &c); e == nil && c.Dir != "" {
 				e = copySnapshotArtifacts(filepath.Join(c.Dir, "artifacts"), &result)
-			} else if os.IsNotExist(e) {
-				e = nil
 			}
 		}
 	}
@@ -123,13 +125,16 @@ func sealTurn(ctx context.Context, dir string, s status, n int64) (string, error
 		return "", e
 	}
 	defer removeTreeBestEffort(result.Dir)
-	if e = copyFile(filepath.Join(dir, "last.md"), filepath.Join(result.Dir, "last.md")); e != nil {
-		if !os.IsNotExist(e) || s.Finished > 0 {
-			return "", e
-		}
-		if e = atomicWrite(filepath.Join(result.Dir, "last.md"), nil); e != nil {
-			return "", e
-		}
+	report, e := readTurnReport(ctx, dir, s.LastCompleted)
+	if e != nil {
+		return "", e
+	}
+	if report == nil && s.LastCompleted != "" {
+		return "", fmt.Errorf("no published report for turn %q", s.LastCompleted)
+	}
+	// last.md is the report entry in the sealed result archive.
+	if e = writeJobBytes(filepath.Join(result.Dir, "last.md"), report); e != nil {
+		return "", e
 	}
 	meta := turnResult{Turn: n, TurnID: s.LastCompleted, Repositories: []turnPatch{}, Bases: map[string]ResultBase{}}
 	if s.Engine != "cmd" {
@@ -161,25 +166,19 @@ func sealTurn(ctx context.Context, dir string, s status, n int64) (string, error
 		result.Artifacts = []SnapshotArtifact{}
 	}
 	meta.Artifacts = result.Artifacts
-	if e = writeJSON(filepath.Join(result.Dir, "result.json"), meta); e != nil {
-		return "", e
-	}
-	var after status
-	if e = readJSON(filepath.Join(dir, "status.json"), &after); e != nil {
-		return "", e
-	}
-	beforeReport, e := os.ReadFile(filepath.Join(result.Dir, "last.md"))
+	data, e := json.Marshal(meta)
 	if e != nil {
 		return "", e
 	}
-	currentReport, e := os.ReadFile(filepath.Join(dir, "last.md"))
-	if e != nil && (!os.IsNotExist(e) || s.Finished != 0) {
+	if e = snapImmutable(filepath.Join(result.Dir, "result.json"), data); e != nil {
 		return "", e
 	}
-	if !bytes.Equal(beforeReport, currentReport) {
-		return "", errors.New("report changed during collection")
+	var after status
+	if _, e = readJobStatus(dir, &after); e != nil {
+		return "", e
 	}
-	if s.Finished != after.Finished || s.Turn != after.Turn || s.RunID != after.RunID || !readyResult(after) {
+	if s.Finished != after.Finished || s.Turn != after.Turn || s.LastCompleted != after.LastCompleted ||
+		s.CompletedStatus != after.CompletedStatus || s.RunID != after.RunID || !readyResult(after) {
 		return "", errors.New("job changed during collection")
 	}
 	if e = os.Rename(result.Dir, folder); e != nil {
@@ -206,7 +205,7 @@ func resultArchive(ctx context.Context, folder, dir string, s status, details bo
 			return "", e
 		}
 	}
-	f, e := os.CreateTemp(filepath.Dir(path), ".archive-")
+	f, e := createJobTemp(filepath.Dir(path), ".archive-")
 	if e != nil {
 		return "", e
 	}
@@ -235,7 +234,7 @@ func resultArchive(ctx context.Context, folder, dir string, s status, details bo
 		if e = w.WriteHeader(&tar.Header{Name: filepath.ToSlash(rel), Mode: 0600, Size: st.Size(), Typeflag: tar.TypeReg}); e != nil {
 			return e
 		}
-		in, e := os.Open(p)
+		in, e := openJobFile(p, jobFileRead)
 		if e != nil {
 			return e
 		}
@@ -285,7 +284,7 @@ func nodeResult(ctx context.Context, a []string) error {
 		return e
 	}
 	var s status
-	if e = readJSON(filepath.Join(dir, "status.json"), &s); e != nil {
+	if _, e = readJobStatus(dir, &s); e != nil {
 		return e
 	}
 	if s.RunID != a[1] {
@@ -299,7 +298,7 @@ func nodeResult(ctx context.Context, a []string) error {
 	if e != nil {
 		return e
 	}
-	f, e := os.Open(archive)
+	f, e := openJobFile(archive, jobFileRead)
 	if e != nil {
 		return e
 	}
@@ -321,18 +320,56 @@ func nodeResult(ctx context.Context, a []string) error {
 	_, e = io.Copy(os.Stdout, f)
 	return e
 }
-func unpackTurn(archive, dest string) error {
-	f, e := os.Open(archive)
+
+type resultReader struct {
+	ctx context.Context
+	io.Reader
+}
+
+func (r resultReader) Read(p []byte) (int, error) {
+	if e := r.ctx.Err(); e != nil {
+		return 0, e
+	}
+	return r.Reader.Read(p)
+}
+
+func validateResultTurn(dir string, target observedResult) error {
+	var m turnResult
+	if e := readJSON(filepath.Join(dir, "result.json"), &m); e != nil {
+		return e
+	}
+	if m.Turn != target.Number || target.TurnID != "" && m.TurnID != target.TurnID {
+		return errors.New("result manifest does not match the requested turn")
+	}
+	for _, row := range m.Repositories {
+		if !snapPath(row.Patch) {
+			return errors.New("invalid patch path")
+		}
+	}
+	for _, art := range m.Artifacts {
+		if !snapPath(art.Path) {
+			return errors.New("invalid artifact path")
+		}
+	}
+	return nil
+}
+
+func unpackTurn(ctx context.Context, archive, dest string, target observedResult) error {
+	if e := ctx.Err(); e != nil {
+		return e
+	}
+	f, e := openJobFile(archive, jobFileRead)
 	if e != nil {
 		return e
 	}
 	defer closeBestEffort(f)
-	z, e := gzip.NewReader(f)
+	z, e := gzip.NewReader(resultReader{ctx, f})
 	if e != nil {
 		return e
 	}
 	defer closeBestEffort(z)
-	r := tar.NewReader(z)
+	reader := resultReader{ctx, z}
+	r := tar.NewReader(reader)
 	tmp, e := os.MkdirTemp(filepath.Dir(dest), ".unpack-")
 	if e != nil {
 		return e
@@ -353,7 +390,7 @@ func unpackTurn(archive, dest string) error {
 		if unpackErr = os.MkdirAll(filepath.Dir(p), 0700); unpackErr != nil {
 			return unpackErr
 		}
-		out, unpackErr := os.OpenFile(p, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+		out, unpackErr := openJobFile(p, jobFileNew)
 		if unpackErr != nil {
 			return unpackErr
 		}
@@ -362,39 +399,39 @@ func unpackTurn(archive, dest string) error {
 			return unpackErr
 		}
 	}
-	if _, e = io.Copy(io.Discard, z); e != nil {
+	if _, e = io.Copy(io.Discard, reader); e != nil {
 		return e
 	}
-	var m turnResult
-	if e = readJSON(filepath.Join(tmp, "result.json"), &m); e != nil {
+	if e = validateResultTurn(tmp, target); e != nil {
 		return e
 	}
-	for _, row := range m.Repositories {
-		if !snapPath(row.Patch) {
-			return errors.New("invalid patch path")
-		}
-	}
-	for _, art := range m.Artifacts {
-		if !snapPath(art.Path) {
-			return errors.New("invalid artifact path")
-		}
+	if e = ctx.Err(); e != nil {
+		return e
 	}
 	return os.Rename(tmp, dest)
 }
 
 func fetchTurn(ctx context.Context, h endpoint, id, gen, turn, dest string, details bool) error {
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Minute)
+	n, e := strconv.ParseInt(turn, 10, 64)
+	if e != nil || n < 0 {
+		return errors.New("invalid result turn")
+	}
+	return fetchResultTurn(ctx, h, id, dest, details, observedResult{RunID: gen, Number: n})
+}
+
+func fetchResultTurn(ctx context.Context, h endpoint, id, dest string, details bool, target observedResult) error {
+	ctx, cancel := context.WithTimeout(ctx, collectLimit)
 	defer cancel()
 	lock, e := transferLock(ctx, dest+".lock")
 	if e != nil {
 		return e
 	}
 	defer closeBestEffort(lock)
-	if _, e = os.Stat(filepath.Join(dest, "result.json")); e == nil {
-		return nil
+	if e = validateResultTurn(dest, target); !os.IsNotExist(e) {
+		return e
 	}
 	partial := dest + ".part"
-	f, e := os.OpenFile(partial, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+	f, e := openJobFile(partial, jobFileAppendCreate)
 	if e != nil {
 		return e
 	}
@@ -403,44 +440,63 @@ func fetchTurn(ctx context.Context, h endpoint, id, gen, turn, dest string, deta
 	if e != nil {
 		return e
 	}
+	var total int64
+	if st.Size() == 0 || readJSON(dest+".total", &total) != nil || total != st.Size() {
+		if e = downloadTurn(ctx, h, id, dest, details, target, f, st.Size()); e != nil {
+			return e
+		}
+	}
+	if e = f.Close(); e != nil {
+		return e
+	}
+	return installResultTurn(ctx, partial, dest, target)
+}
+
+func installResultTurn(ctx context.Context, partial, dest string, target observedResult) error {
+	if e := unpackTurn(ctx, partial, dest, target); e != nil {
+		if !errors.Is(e, context.Canceled) && !errors.Is(e, context.DeadlineExceeded) {
+			removeBestEffort(partial)
+		}
+		return e
+	}
+	return os.Remove(partial)
+}
+
+func downloadTurn(ctx context.Context, h endpoint, id, dest string, details bool, target observedResult, f *os.File, offset int64) error {
 	idle, e := transferSetting("CX_TRANSFER_IDLE", 120*time.Second, false)
 	if e != nil {
 		return e
 	}
 	attempt, stop := context.WithCancel(ctx)
 	defer stop()
-	args := []string{"result-download", id, gen, turn, strconv.FormatInt(st.Size(), 10)}
+	args := []string{"result-download", id, target.RunID, strconv.FormatInt(target.Number, 10), strconv.FormatInt(offset, 10)}
 	if details {
 		args = append(args, "details")
 	}
-	cmd, e := h.command(attempt, args)
+	cmd, e := h.transportCommand(attempt, args, idle)
 	if e != nil {
 		return e
 	}
-	sink := resultStream{file: f, offset: st.Size(), total: -1, progress: dest + ".total"}
+	sink := resultStream{file: f, offset: offset, total: -1, progress: dest + ".total"}
 	var diag bytes.Buffer
-	if e = runActive(cmd, stop, h.connectionBudget(idle), idle, &sink, &diag); e != nil {
+	if e = cmd.run(ctx, stop, &sink, &diag); e != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if errors.Is(e, errSSHMasterUnsupported) {
+			return e
+		}
 		var ex *exec.ExitError
 		if errors.As(e, &ex) && ex.ExitCode() >= 0 && ex.ExitCode() != 255 {
 			diagnosticf("%s", cleanDiag(diag.Bytes()))
 			return ctlExit(ex.ExitCode())
-		}
-		if runtime.GOOS == "windows" && unsupportedDiagnostic(runtime.GOOS, diag.String()) {
-			unsupportedMaster.Store(true)
 		}
 		return fmt.Errorf("%w: %v %s", ctlExit(9), e, cleanDiag(diag.Bytes()))
 	}
 	if sink.total < 0 || sink.offset != sink.total {
 		return fmt.Errorf("%w: interrupted result transfer", ctlExit(9))
 	}
-	if e = f.Close(); e != nil {
-		return e
-	}
-	if e = unpackTurn(partial, dest); e != nil {
-		_ = os.Remove(partial)
-		return e
-	}
-	return os.Remove(partial)
+	return nil
 }
 
 func resultDest(host, id, gen, turn string) (string, error) {
@@ -475,7 +531,7 @@ func resultDest(host, id, gen, turn string) (string, error) {
 func ctlResult(ctx context.Context, host, id, op string, o ctlOptions) error {
 	details := o.json || o.log
 	if op == "result" || op == "patch" {
-		if !o.refresh && !o.incremental {
+		if o.turn != "" && !o.refresh && !o.incremental {
 			cached, e := cachedResultDir(host, id, o.turn, details)
 			if e != nil {
 				return e
@@ -493,6 +549,15 @@ func ctlResult(ctx context.Context, host, id, op string, o ctlOptions) error {
 	if e != nil {
 		return e
 	}
+	publish := op == "result" || op == "agent" || op == "patch"
+	var marker string
+	var seen resultReference
+	if publish {
+		marker, seen, e = resultMarkerSnapshot(host, id)
+		if e != nil {
+			return e
+		}
+	}
 	r, e := h.call(ctx, 30*time.Second, "status", "--job", id)
 	if e != nil {
 		return e
@@ -506,6 +571,9 @@ func ctlResult(ctx context.Context, host, id, op string, o ctlOptions) error {
 	}
 	turn := o.turn
 	if turn == "" {
+		if !readyResult(s) {
+			return ctlExit(44)
+		}
 		turn = strconv.FormatInt(s.Finished, 10)
 	}
 	n, e := strconv.ParseInt(turn, 10, 64)
@@ -525,18 +593,18 @@ func ctlResult(ctx context.Context, host, id, op string, o ctlOptions) error {
 		}
 	}
 	turn = strconv.FormatInt(n, 10)
+	target := observedResult{RunID: s.RunID, Number: n}
+	if o.turn == "" {
+		target.TurnID = s.LastCompleted
+	}
 	dest, e := resultDest(host, id, s.RunID, turn)
 	if e != nil {
 		return e
 	}
 	dest = resultVariant(dest, details)
-	if op == "result" || op == "agent" || op == "patch" {
-		marker, markerErr := resultMarker(host, id)
-		if markerErr != nil {
-			return markerErr
-		}
-		if markerErr = writeJSON(marker, resultReference{s.RunID, s.Finished}); markerErr != nil {
-			return markerErr
+	if publish {
+		if e = publishResultMarker(ctx, marker, seen, s.RunID, s.Finished); e != nil {
+			return e
 		}
 	}
 	if _, e = os.Stat(filepath.Join(dest, "result.json")); os.IsNotExist(e) {
@@ -553,7 +621,7 @@ func ctlResult(ctx context.Context, host, id, op string, o ctlOptions) error {
 			}
 			return backgroundFetch(host, id, s.RunID, turn, dest, o)
 		}
-		if e = fetchTurn(ctx, h, id, s.RunID, turn, dest, details); e != nil {
+		if e = fetchResultTurn(ctx, h, id, dest, details, target); e != nil {
 			if op == "agent" && errors.Is(e, ctlExit(9)) {
 				return backgroundFetch(host, id, s.RunID, turn, dest, ctlOptions{})
 			}
@@ -561,6 +629,10 @@ func ctlResult(ctx context.Context, host, id, op string, o ctlOptions) error {
 		}
 	} else if e != nil {
 		return e
+	} else if o.turn == "" {
+		if e = validateResultTurn(dest, target); e != nil {
+			return e
+		}
 	}
 	if op == "apply" || op == "rebase" || since > 1 {
 		var m turnResult
@@ -588,7 +660,7 @@ func ctlResult(ctx context.Context, host, id, op string, o ctlOptions) error {
 				return err
 			}
 			defer removeTreeBestEffort(patchDir)
-			m, err = incrementalResult(ctx, host, id, previous, dest, patchDir, since-1, m)
+			m, err = incrementalResult(ctx, previous, dest, patchDir, since-1, m)
 			if err != nil {
 				return err
 			}
@@ -623,7 +695,7 @@ func workerFetch(ctx context.Context, a []string) error {
 	if e != nil {
 		return e
 	}
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Minute)
+	ctx, cancel := context.WithTimeout(ctx, collectLimit)
 	defer cancel()
 	l, e := lockPath(dest+".worker", os.O_CREATE)
 	if e != nil || l == nil {
@@ -688,7 +760,7 @@ func writeTurn(ctx context.Context, out io.Writer, dir, id, op string, o ctlOpti
 				}
 			}
 			if o.full {
-				b, e := os.ReadFile(p)
+				b, e := readSharedFile(p)
 				if e != nil {
 					return e
 				}
@@ -707,7 +779,7 @@ func writeTurn(ctx context.Context, out io.Writer, dir, id, op string, o ctlOpti
 		return nil
 	}
 	p := filepath.Join(dir, "last.md")
-	b, e := os.ReadFile(p)
+	b, e := readSharedFile(p)
 	if e != nil {
 		return e
 	}
@@ -775,29 +847,29 @@ func agentReport(ctx context.Context, host string, h endpoint, id string, full b
 	if e != nil {
 		return e
 	}
-	r, e := h.call(ctx, d+time.Second, "wait", "--job", id, "--timeout", d.String())
+	r, e := h.call(ctx, d+time.Second, "observe-one", id, d.String())
 	if e != nil {
 		return e
 	}
+	if r.code == exitQueued {
+		return printQueuedWait(ctx, h, id, r)
+	}
+	var notice waitObservation
 	if r.code == 6 {
-		snapshot, statusErr := h.call(ctx, 30*time.Second, "status", "--job", id)
-		if statusErr != nil {
-			return statusErr
+		if e = json.Unmarshal(r.data, &notice); e != nil {
+			return e
 		}
-		if snapshot.code != 0 {
-			return snapshot.output()
-		}
-		var s status
-		if statusErr = json.Unmarshal(snapshot.data, &s); statusErr != nil {
-			return statusErr
-		}
-		if s.InputKind == "server_request" {
-			fmt.Println("STATUS: QUESTION")
-			if statusErr = json.NewEncoder(os.Stdout).Encode(s.Approvals); statusErr != nil {
-				return statusErr
+		if notice.InputKind == "server_request" {
+			if _, e = fmt.Println("STATUS: QUESTION"); e != nil {
+				return e
 			}
-			fmt.Printf("JOB=%s STATUS=QUESTION patch=none repos=0\n", id)
-			return ctlExit(6)
+			if e = json.NewEncoder(os.Stdout).Encode(notice.Approvals); e != nil {
+				return e
+			}
+			if _, e = fmt.Printf("JOB=%s STATUS=QUESTION patch=none repos=0\n", id); e != nil {
+				return e
+			}
+			return acknowledgeWait(ctx, h, id, notice, r.code)
 		}
 	}
 	if r.code == 124 {
@@ -806,41 +878,29 @@ func agentReport(ctx context.Context, host string, h endpoint, id string, full b
 	if e = ctlResult(ctx, host, id, "agent", ctlOptions{wait: true, full: full}); e != nil {
 		return e
 	}
+	if r.code == 6 {
+		return acknowledgeWait(ctx, h, id, notice, r.code)
+	}
 	if r.code != 0 {
 		return ctlExit(r.code)
 	}
 	return nil
 }
 
-// prefetchResult downloads the latest sealed turn's summary result into the controller
-// cache, the same variant `cx result` reads, and points the result marker at it. It is best
-// effort: the node may still be sealing the turn (44), so it retries until ctx ends, and an
-// interrupted transfer leaves its partial download for the next attempt to resume.
-func prefetchResult(ctx context.Context, h endpoint, host, id string) {
-	for {
-		r, e := h.call(ctx, 30*time.Second, "status", "--job", id)
-		if e != nil || r.code != 0 {
-			return
-		}
-		var s status
-		if json.Unmarshal(r.data, &s) != nil || s.Finished == 0 && !readyResult(s) {
-			return
-		}
-		turn := strconv.FormatInt(s.Finished, 10)
-		dest, e := resultDest(host, id, s.RunID, turn)
-		if e != nil {
-			return
-		}
-		dest = resultVariant(dest, false)
-		if e = fetchTurn(ctx, h, id, s.RunID, turn, dest, false); e == nil {
-			if marker, markerErr := resultMarker(host, id); markerErr == nil {
-				_ = writeJSON(marker, resultReference{s.RunID, s.Finished})
-			}
-			return
-		}
-		if !errors.Is(e, ctlExit(44)) || pause(ctx, 200*time.Millisecond) != nil {
-			return
-		}
+// result-download seals a ready turn under the result lock before streaming it.
+// An unavailable selected turn (44) gives this observer no reason to poll again.
+func prefetchResult(ctx context.Context, h endpoint, host, id, marker string, seen resultReference, target observedResult) {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	if ctx.Err() != nil {
+		return
+	}
+	dest, e := resultDest(host, id, target.RunID, strconv.FormatInt(target.Number, 10))
+	if e != nil {
+		return
+	}
+	if e = fetchResultTurn(ctx, h, id, resultVariant(dest, false), false, target); e == nil {
+		_ = publishResultMarker(ctx, marker, seen, target.RunID, target.Number)
 	}
 }
 
@@ -866,9 +926,8 @@ func backgroundFetch(host, id, gen, turn, dest string, o ctlOptions) error {
 			args = append(args, "details")
 		}
 		cmd := exec.Command(exe, args...)
-		detachWorker(cmd)
 		_ = lock.Close()
-		if e = cmd.Start(); e != nil {
+		if e = startDetachedWorker(cmd); e != nil {
 			return e
 		}
 		go func() { _ = cmd.Wait() }()
@@ -904,6 +963,7 @@ func backgroundFetch(host, id, gen, turn, dest string, o ctlOptions) error {
 type resultReference struct {
 	Generation string
 	Turn       int64
+	Epoch      uint64
 }
 
 func resultMarker(host, id string) (string, error) {
@@ -913,27 +973,70 @@ func resultMarker(host, id string) (string, error) {
 	}
 	return filepath.Join(filepath.Dir(d), "latest.json"), nil
 }
+func readResultReference(path string) (resultReference, error) {
+	var ref resultReference
+	e := readJSON(path, &ref)
+	if os.IsNotExist(e) {
+		e = nil
+	}
+	return ref, e
+}
+
+func resultMarkerSnapshot(host, id string) (string, resultReference, error) {
+	path, e := resultMarker(host, id)
+	if e != nil {
+		return "", resultReference{}, e
+	}
+	ref, e := readResultReference(path)
+	return path, ref, e
+}
+
+func publishResultMarker(ctx context.Context, path string, seen resultReference, gen string, turn int64) error {
+	lock, e := lockUntil(ctx, path+".lock")
+	if e != nil {
+		return e
+	}
+	defer closeBestEffort(lock)
+	old, e := readResultReference(path)
+	if e != nil {
+		return e
+	}
+	// Invalidation fences writers that started before it. A new generation can
+	// replace only the marker observed before the status or wait request.
+	if old.Epoch != seen.Epoch || (old.Generation != gen && old != seen) ||
+		(old.Generation == gen && old.Turn >= turn) {
+		return nil
+	}
+	if e = ctx.Err(); e != nil {
+		return e
+	}
+	return writeJSON(path, resultReference{Generation: gen, Turn: turn, Epoch: old.Epoch})
+}
+
 func forgetResult(host, id string) error {
 	path, e := resultMarker(host, id)
 	if e != nil {
 		return e
 	}
-	e = os.Remove(path)
-	if os.IsNotExist(e) {
-		return nil
+	lock, e := lockUntil(context.Background(), path+".lock")
+	if e != nil {
+		return e
 	}
-	return e
+	defer closeBestEffort(lock)
+	old, e := readResultReference(path)
+	if e != nil {
+		return e
+	}
+	return writeJSON(path, resultReference{Epoch: old.Epoch + 1})
 }
+
 func cachedResultDir(host, id, turn string, details bool) (string, error) {
-	p, e := resultMarker(host, id)
+	_, ref, e := resultMarkerSnapshot(host, id)
 	if e != nil {
 		return "", e
 	}
-	var ref resultReference
-	if e = readJSON(p, &ref); os.IsNotExist(e) {
+	if ref.Generation == "" {
 		return "", nil
-	} else if e != nil {
-		return "", e
 	}
 	n := ref.Turn
 	if turn != "" {

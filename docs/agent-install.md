@@ -71,12 +71,10 @@ On the execution host, merge credential paths and named profiles into `host.json
   "default_profile": "account-a",
   "profiles": {
     "account-a": {
-      "codex_home": "accounts/a/codex",
-      "claude_config_dir": "accounts/a/claude"
+      "engine_homes": {"codex": "accounts/a/codex", "claude": "accounts/a/claude"}
     },
     "account-b": {
-      "codex_home": "accounts/b/codex",
-      "claude_config_dir": "accounts/b/claude",
+      "engine_homes": {"codex": "accounts/b/codex", "claude": "accounts/b/claude"},
       "env_file": "credentials/account-b.env"
     }
   }
@@ -85,7 +83,7 @@ On the execution host, merge credential paths and named profiles into `host.json
 
 Create the credential files privately on the executor. Use mode `0600` on Unix and restrict access to the executor account on Windows. The UTF-8 format is one `KEY=VALUE` per line. Blank lines and lines beginning with `#` after optional whitespace are ignored. Characters after the first `=`, including quotes, spaces, inline `#` and dollar signs, are literal. A profile's `env_file` replaces the host file selection. A profile with no file uses the host file. Only the child process environment receives the file's values.
 
-Use `cx doctor HOST --json` after setup to check each profile's Codex login, Claude CLI availability and selected file. A missing file is skipped. Unix permission warnings are advisory. The Codex probe checks the account's `CODEX_HOME`; it does not verify API credentials supplied by an environment file.
+`engine_homes` maps each engine to its account directory, exported as that engine's home variable (`CODEX_HOME` for Codex, `CLAUDE_CONFIG_DIR` for Claude Code). Use `cx doctor HOST --json` after setup: `engines` reports each engine's path, version and login state for the host, and each profile's `engines` reports the login state under that profile's account directories. A missing file is skipped. Unix permission warnings are advisory. Login probes do not verify API credentials supplied by an environment file.
 
 ### Windows execution
 

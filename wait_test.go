@@ -60,7 +60,7 @@ func TestWaitFollowup(t *testing.T) {
 			// holding the request before turn/started.
 			nodeWait(124, "100ms")
 			h.await(id, func(s status) bool {
-				entries, err := os.ReadDir(filepath.Join(h.root, id, "inbox", "pending"))
+				entries, err := pendingInboxMessages(filepath.Join(h.root, id))
 				return err == nil && len(entries) == 1 && s.TurnStatus != "inProgress"
 			})
 			controllerWait(124, "150ms")
@@ -118,8 +118,12 @@ func TestWaitAnyFollowup(t *testing.T) {
 		t.Helper()
 		var got waitReport
 		out := wait(0, "3s")
-		if err := json.Unmarshal([]byte(out), &got); err != nil || got != want {
-			t.Fatalf("expected %+v, got %s (%v)", want, out, err)
+		if err := json.Unmarshal([]byte(out), &got); err != nil || got.Event != "completion" || got.EventID == "" {
+			t.Fatalf("missing completion identity: %s (%v)", out, err)
+		}
+		got.Event, got.EventID = "", ""
+		if got != want {
+			t.Fatalf("expected %+v, got %s", want, out)
 		}
 	}
 	if err := h.ctl("say", active, "second round"); err != nil {

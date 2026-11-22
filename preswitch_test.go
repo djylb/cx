@@ -41,10 +41,10 @@ func TestPreswitchTurnFailures(t *testing.T) {
 			cliOutput(t, code, nil, f.cx, "wait", "local:"+id, "--timeout", "3s")
 			cliOutput(t, code, nil, f.cx, "wait", "--any", "--project", "p", "--timeout", "3s")
 			var s status
-			if err := readJSON(filepath.Join(dir, "status.json"), &s); err != nil || s.CompletedStatus != outcome || s.TurnStatus != outcome || s.Finished != 1 {
+			if err := loadJobStatusInto(dir, &s); err != nil || s.CompletedStatus != outcome || s.TurnStatus != outcome || s.Finished != 1 {
 				t.Fatalf("turn status = %+v, %v", s, err)
 			}
-			report, err := os.ReadFile(filepath.Join(dir, "last.md"))
+			report, err := readTurnReport(t.Context(), dir, s.LastCompleted)
 			if err != nil || !bytes.Contains(report, []byte("last agent message")) {
 				t.Fatalf("last.md = %q, %v", report, err)
 			}
@@ -53,7 +53,7 @@ func TestPreswitchTurnFailures(t *testing.T) {
 					t.Fatalf("failure report = %q", report)
 				}
 				if mode != "failure-status" {
-					for _, fragment := range []string{"This content was flagged for possible cybersecurity risk", "code=431", "codexErrorInfo=\"other\""} {
+					for _, fragment := range []string{"This content was flagged for possible cybersecurity risk", "code=431", "errorInfo=\"other\""} {
 						if !bytes.Contains(report, []byte(fragment)) {
 							t.Fatalf("missing %q from %q", fragment, report)
 						}
@@ -84,28 +84,52 @@ func TestPreswitchCacheAndDiskAdmission(t *testing.T) {
 	}
 	t.Setenv("PATH", f.home+string(os.PathListSeparator)+os.Getenv("PATH"))
 	cliOutput(t, 0, nil, f.cx, "host", "local", "--set", "min_free_bytes=18446744073709551615")
-	cliOutput(t, 0, nil, f.cx, "host", "local", "--set", "cache_max_bytes=4")
+	cliOutput(t, 0, nil, f.cx, "host", "local", "--set", "slots.test=1")
+	pool := filepath.Join(root, ".admit", "classes", "test")
+	if err := os.MkdirAll(pool, 0700); err != nil {
+		t.Fatal(err)
+	}
+	slot, err := lockPath(filepath.Join(pool, "slot-0.lock"), os.O_CREATE)
+	if err != nil || slot == nil {
+		t.Fatalf("hold command slot: %v", err)
+	}
+	t.Cleanup(func() {
+		if slot != nil {
+			closeBestEffort(slot)
+		}
+	})
+	cache := filepath.Join(packageCachePath(root), "cargo", "registry", "cache")
+	prepareCacheFixture(t, root, "p")
+	makeCacheFixture(t, cache, 1000)
 	goCache := filepath.Join(f.home, "go-cache")
 	t.Setenv("GOCACHE", goCache)
-	cliOutput(t, 0, nil, f.cx, "exec", "local", "--tag", "disk", "--", "sh", "-c", "printf \"%s\\n%s\\n\" \"$CARGO_TARGET_DIR\" \"$GOCACHE\"")
+	cliOutput(t, 0, nil, f.cx, "exec", "local", "--tag", "disk", "--queue-timeout", "30s", "--", "sh", "-c", "printf \"%s\\n%s\\n\" \"$CARGO_TARGET_DIR\" \"$GOCACHE\"")
 	t.Cleanup(func() { cliOutput(t, 0, nil, f.cx, "close", "local:p/disk") })
 	dir := filepath.Join(root, "p", "disk")
-	deadline := time.Now().Add(3 * time.Second)
-	for {
+	one := []string{"wait", "local:p/disk"}
+	anyJob := []string{"wait", "--any", "--project", "p", "--cursor", "disk"}
+	assertQueued := func(reason string, args ...string) {
+		t.Helper()
+		got := cliOutput(t, exitQueued, nil, f.cx, args...)
 		var s status
-		if err := readJSON(filepath.Join(dir, "status.json"), &s); err != nil {
-			t.Fatal(err)
+		if err := json.Unmarshal(got, &s); err != nil || s.State != "queued" || !strings.Contains(s.QueueReason, reason) {
+			t.Fatalf("queue notice = %s, %v", got, err)
 		}
-		if s.State != "queued" {
-			t.Fatalf("low disk status = %+v", s)
-		}
-		if strings.Contains(s.QueueReason, "min_free_bytes") {
+	}
+	assertQueued("min_free_bytes", append(one, "--timeout", "4s")...)
+	assertQueued("min_free_bytes", append(anyJob, "--timeout", "4s")...)
+	for deadline := time.Now().Add(3 * time.Second); ; {
+		_, err := os.Stat(cache)
+		if os.IsNotExist(err) {
 			break
 		}
-		if time.Now().After(deadline) {
-			t.Fatal("missing disk queue reason")
+		if err != nil || time.Now().After(deadline) {
+			t.Fatalf("cache should be reclaimed under disk pressure with the slot occupied: %v", err)
 		}
-		time.Sleep(25 * time.Millisecond)
+		time.Sleep(20 * time.Millisecond)
+	}
+	for _, args := range [][]string{one, anyJob} {
+		cliOutput(t, 124, nil, f.cx, append(args, "--timeout", "250ms")...)
 	}
 	for _, args := range [][]string{{"doctor", "local", "--json"}, {"overview", "--all", "--json"}} {
 		if got := cliOutput(t, 0, nil, f.cx, args...); !bytes.Contains(got, []byte("\"disk_warning\"")) {
@@ -113,18 +137,48 @@ func TestPreswitchCacheAndDiskAdmission(t *testing.T) {
 		}
 	}
 	cliOutput(t, 0, nil, f.cx, "host", "local", "--set", "min_free_bytes=0")
+	assertQueued("slots", append(one, "--timeout", "5s")...)
+	// Neither cursor observes the clear before the same disk reason returns.
+	cliOutput(t, 0, nil, f.cx, "host", "local", "--set", "min_free_bytes=18446744073709551615")
+	assertQueued("min_free_bytes", append(one, "--timeout", "4s")...)
+	assertQueued("min_free_bytes", append(anyJob, "--timeout", "4s")...)
+	src := filepath.Join(f.home, "agent-src")
+	if err := os.Mkdir(src, 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CXRUN_MONITOR_TIMEOUT", "4s")
+	assertQueued("min_free_bytes", "agent", "--host", "local", "--dir", src, "--tag", "disk-agent", "--queue-timeout", "20s", "fixture")
+	cliOutput(t, 0, nil, f.cx, "close", "local:p/disk-agent")
+	cliOutput(t, 0, nil, f.cx, "host", "local", "--set", "min_free_bytes=0")
+	closeBestEffort(slot)
+	slot = nil
 	cliOutput(t, 0, nil, f.cx, "wait", "local:p/disk", "--timeout", "3s")
 	out, err := os.ReadFile(filepath.Join(dir, "output.log"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	var done status
-	if err = readJSON(filepath.Join(dir, "status.json"), &done); err != nil || done.QueueReason != "" {
+	if err = loadJobStatusInto(dir, &done); err != nil || done.QueueReason != "" {
 		t.Fatalf("completed queue reason = %q, %v", done.QueueReason, err)
 	}
 	want := filepath.Join(cargoCachePath(root), "p") + "\n" + goCache + "\n"
 	if string(out) != want {
 		t.Fatalf("build env = %q, want %q", out, want)
+	}
+
+	cliOutput(t, 0, nil, f.cx, "host", "local", "--set", "cache_max_bytes=1")
+	cliOutput(t, 0, nil, f.cx, "exec", "local", "--tag", "grow-cache", "--queue-timeout", "5s", "--", "sh", "-c", `printf xx > "$CARGO_TARGET_DIR/new"`)
+	cliOutput(t, 0, nil, f.cx, "wait", "local:p/grow-cache", "--timeout", "3s")
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		_, err := os.Stat(filepath.Join(cargoCachePath(root), "p"))
+		if os.IsNotExist(err) {
+			break
+		}
+		if err != nil || time.Now().After(deadline) {
+			t.Fatalf("worker did not trim its cache after exit: %v", err)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 
@@ -133,37 +187,174 @@ func TestPreswitchCacheEvictsLeastRecentlyUsed(t *testing.T) {
 	ctx, stop := context.WithTimeout(context.Background(), 3*time.Second)
 	defer stop()
 	active := runner{root: root, ctx: ctx, s: status{Project: "active"}}
-	if err := active.prepareBuildCache(); err != nil {
+	if err := active.prepareCaches(); err != nil {
 		t.Fatal(err)
 	}
-	defer active.releaseBuildCache()
 	peer := runner{root: root, ctx: ctx, s: active.s}
-	if err := peer.prepareBuildCache(); err != nil {
+	if err := peer.prepareCaches(); err != nil {
 		t.Fatal(err)
 	}
-	defer peer.releaseBuildCache()
 	base := cargoCachePath(root)
-	for i, name := range []string{"active", "old", "new"} {
-		path := filepath.Join(base, name)
-		if err := os.MkdirAll(path, 0700); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(filepath.Join(path, "data"), []byte("x"), 0600); err != nil {
-			t.Fatal(err)
-		}
-		stamp := time.Unix(int64(1000+i), 0)
-		if err := os.Chtimes(path, stamp, stamp); err != nil {
-			t.Fatal(err)
-		}
+	prepareCacheFixture(t, root, "old")
+	prepareCacheFixture(t, root, "new")
+	makeCacheFixture(t, filepath.Join(base, "active"), 1000)
+	makeCacheFixture(t, filepath.Join(base, "old"), 1002)
+	makeCacheFixture(t, filepath.Join(base, "new"), 1003)
+	cargo := filepath.Join(packageCachePath(root), "cargo")
+	registry := filepath.Join(cargo, "registry", "cache")
+	makeCacheFixture(t, registry, 1001)
+	credential := filepath.Join(cargo, "credentials.toml")
+	if err := os.WriteFile(credential, []byte("user data"), 0600); err != nil {
+		t.Fatal(err)
 	}
+	peer.releaseCaches()
 	zero := uint64(0)
-	if warning, err := maintainBuildCache(ctx, root, &hostConfig{CacheMaxBytes: 2, MinFreeBytes: &zero}); err != nil || warning != "" {
-		t.Fatalf("cache maintenance = %q, %v", warning, err)
+	host := &hostConfig{CacheMaxBytes: 3, MinFreeBytes: &zero}
+	if err := maintainCaches(ctx, root, host, true); err != nil {
+		t.Fatalf("cache maintenance: %v", err)
 	}
-	for _, name := range []string{"active", "old", "new"} {
-		_, err := os.Stat(filepath.Join(base, name))
-		if (name == "old" && !os.IsNotExist(err)) || (name != "old" && err != nil) {
-			t.Fatalf("cache %s: %v", name, err)
+	if _, err := os.Stat(filepath.Join(base, "old")); !os.IsNotExist(err) {
+		t.Fatalf("an unleased target must be evicted while package and target leases are held: %v", err)
+	}
+	for _, path := range []string{registry, filepath.Join(base, "active"), filepath.Join(base, "new")} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatal(err)
+		}
+	}
+	active.releaseCaches()
+	host.CacheMaxBytes = 2
+	if err := maintainCaches(ctx, root, host, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(registry); !os.IsNotExist(err) {
+		t.Fatalf("oldest package cache should be evicted after lease release: %v", err)
+	}
+	for _, path := range []string{credential, filepath.Join(base, "active"), filepath.Join(base, "new")} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestQueueNoticePreservesPendingWaitEvents(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "j")
+	c := config{RunID: "r", Engine: "codex"}
+	r := runner{dir: dir, c: c, s: status{Job: "j", RunID: c.RunID, Engine: c.Engine, State: "waiting"}}
+	if err := register(root, dir, c, r.s); err != nil {
+		t.Fatal(err)
+	}
+	owner, err := lockPath(filepath.Join(dir, "owner.lock"), 0)
+	if err != nil || owner == nil {
+		t.Fatalf("lock owner: %v", err)
+	}
+	defer closeBestEffort(owner)
+	identity, _, start, err := captureJobIdentity(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	startFixtureWriter(t, &r)
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+
+	for _, turn := range []struct{ id, outcome string }{{"first", "failed"}, {"second", "completed"}} {
+		r.s.Finished++
+		r.s.LastCompleted = turn.id
+		r.s.CompletedStatus = turn.outcome
+		if err := r.save(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	r.s.State = "queued"
+	if err := r.setQueueReason("disk free space below min_free_bytes"); err != nil {
+		t.Fatal(err)
+	}
+	mail := agentMail{Type: "send", To: "parent", Text: "fixture"}
+	if err := appendMail(ctx, dir, identity, "send-1", &mail); err != nil {
+		t.Fatal(err)
+	}
+	baseline := map[string]waitCursor{"j": {RunID: c.RunID, StateCursor: start.String()}}
+	expect := func(code int, finished int64, mailSeq uint64) {
+		t.Helper()
+		report, err := pollWaitAny(ctx, root, "", "", baseline)
+		if err != nil || report == nil || report.Code != code || (report.State == "queued") != (code == exitQueued) ||
+			report.Finished != finished || report.OutboxSeq != mailSeq {
+			t.Fatalf("wait report = %+v, %v", report, err)
+		}
+	}
+	expect(exitQueued, 2, 0)
+	if before := baseline["j"]; before.StateCursor != start.String() || before.OutboxCursor != "" || before.OutboxSeq != 0 ||
+		before.Finished != 0 || before.QueueGeneration != r.s.QueueGeneration {
+		t.Fatalf("queue notice advanced unrelated cursor fields: %+v", before)
+	}
+	expect(1, 1, 0)
+	expect(0, 2, 0)
+	expect(0, 2, mail.Seq)
+}
+
+func TestCachePressureRechecksDiskAndLeavesWorkspace(t *testing.T) {
+	root := t.TempDir()
+	prepareCacheFixture(t, root, "recent")
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	guard, err := lockCaches(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeBestEffort(guard)
+	old := filepath.Join(packageCachePath(root), "npm")
+	recent := filepath.Join(cargoCachePath(root), "recent")
+	work := filepath.Join(root, ".work", "p", "job")
+	makeCacheFixture(t, old, 1000)
+	makeCacheFixture(t, recent, 1001)
+	makeCacheFixture(t, work, 999)
+	if err := os.Symlink(work, filepath.Join(old, "workspace")); err != nil && runtime.GOOS != "windows" {
+		t.Fatal(err)
+	}
+	stamp := time.Unix(1000, 0)
+	if err := os.Chtimes(old, stamp, stamp); err != nil {
+		t.Fatal(err)
+	}
+	probes := 0
+	disk, err := trimCaches(ctx, root, 100, func() diskStatus {
+		probes++
+		if _, err := os.Stat(old); os.IsNotExist(err) {
+			return diskStatus{free: 2, minimum: 2}
+		}
+		return diskStatus{free: 1, minimum: 2}
+	})
+	if err != nil || disk.belowMinimum() || probes != 2 {
+		t.Fatalf("disk recovery = %+v, probes = %d, err = %v", disk, probes, err)
+	}
+	for _, path := range []string{recent, work} {
+		if b, err := os.ReadFile(filepath.Join(path, "data")); err != nil || string(b) != "x" {
+			t.Fatalf("unexpected eviction of %s: %s, %v", path, b, err)
+		}
+	}
+}
+
+func prepareCacheFixture(t *testing.T, root, project string) {
+	t.Helper()
+	r := runner{root: root, ctx: t.Context(), s: status{Project: project}}
+	if err := r.prepareCaches(); err != nil {
+		t.Fatal(err)
+	}
+	r.releaseCaches()
+}
+
+func makeCacheFixture(t *testing.T, path string, seconds int64) {
+	t.Helper()
+	if err := os.MkdirAll(path, 0700); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(path, "data")
+	if err := os.WriteFile(file, []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	stamp := time.Unix(seconds, 0)
+	for _, name := range []string{file, path} {
+		if err := os.Chtimes(name, stamp, stamp); err != nil {
+			t.Fatal(err)
 		}
 	}
 }
@@ -181,9 +372,9 @@ func TestPreswitchCloseKeepsResult(t *testing.T) {
 	cliOutput(t, 0, nil, f.cx, "wait", "local:p/close", "--timeout", "3s")
 	root := os.Getenv("CXRUN_STATE")
 	work := filepath.Join(root, ".work", "p", "close")
-	var prep PreparedSnapshot
-	if err := readJSON(filepath.Join(work, "prepared.json"), &prep); err != nil {
-		t.Fatal(err)
+	prep, found, err := readPreparedSnapshot(t.Context(), work)
+	if err != nil || !found {
+		t.Fatal(found, err)
 	}
 	cliOutput(t, 0, nil, f.cx, "close", "local:p/close")
 	cliOutput(t, 0, nil, f.cx, "close", "local:p/close")

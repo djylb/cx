@@ -86,7 +86,7 @@ cx clean "$job"
 | `say JOB TEXT`、`interrupt JOB`、`resume JOB`、`close JOB` | 插话、打断、恢复或关闭代理。 |
 | `result JOB`、`patch JOB`、`apply JOB`、`rebase JOB TEXT`、`clean JOB` | 回收结果、检查补丁、应用变更、用新快照重派或清理作业。 |
 
-从另一控制端操作作业时，可以用 `HOST:project/tag` 直接寻址。语法、会话分组和 Codex 控制命令见[管理者指南](agent-guide.md)。当前控制端没有通用的 `--help` 输出。
+从另一控制端操作作业时，可以用 `HOST:project/tag` 直接寻址。语法、会话分组和引擎控制命令见[管理者指南](agent-guide.md)。当前控制端没有通用的 `--help` 输出。
 
 ## 退出码
 

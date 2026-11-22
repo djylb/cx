@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 )
@@ -37,8 +36,6 @@ func credentialDoctor(ctx context.Context, root string, h *hostConfig, out field
 	if abs, err := filepath.Abs(root); err == nil {
 		root = abs
 	}
-	_, claudeErr := exec.LookPath("claude")
-	out["claude_available"] = claudeErr == nil
 	out["env_file"] = envFileDoctor(root, h.EnvFile)
 	if h.DefaultProfile != "" {
 		out["default_profile"] = h.DefaultProfile
@@ -55,9 +52,8 @@ func credentialDoctor(ctx context.Context, root string, h *hostConfig, out field
 		p, _ := h.profile(name)
 		go func() {
 			results <- probeResult{name: name, info: fields{
-				"codex_login_status": loginStatus(ctx, p.accountEnv(root)),
-				"claude_available":   claudeErr == nil,
-				"env_file":           envFileDoctor(root, p.EnvFile),
+				"engines":  engineFacts(ctx, p.accountEnv(root), false),
+				"env_file": envFileDoctor(root, p.EnvFile),
 			}}
 		}()
 	}

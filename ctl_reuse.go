@@ -68,9 +68,9 @@ func findReuse(ctx context.Context, raw string) error {
 		return e
 	}
 	// When the requested tag exists, only that job may satisfy the request.
-	_, e = os.Stat(filepath.Join(dir, "config.json"))
+	_, _, e = loadJobStatus(dir)
 	exists := e == nil
-	if e != nil && !os.IsNotExist(e) {
+	if e != nil && !errors.Is(e, os.ErrNotExist) {
 		return e
 	}
 	p, _, ok := strings.Cut(q.ID, "/")
@@ -98,10 +98,11 @@ func findReuse(ctx context.Context, raw string) error {
 		if sourceErr != nil {
 			return false, sourceErr
 		}
-		var work string
-		sourceErr = readJSON(filepath.Join(path, "cx-work.json"), &work)
-		switch {
-		case sourceErr == nil:
+		work, sourceErr := workDir(path, s)
+		if sourceErr != nil {
+			return false, sourceErr
+		}
+		if work != path {
 			if q.Key == "" {
 				return false, nil
 			}
@@ -112,14 +113,12 @@ func findReuse(ctx context.Context, raw string) error {
 			if req.ReuseKey != q.Key {
 				return false, nil
 			}
-		case !os.IsNotExist(sourceErr):
-			return false, sourceErr
-		default:
+		} else {
 			if q.Key != "" {
 				return false, nil
 			}
 			var c config
-			if sourceErr = readJSON(filepath.Join(path, "config.json"), &c); sourceErr != nil {
+			if sourceErr = readJobConfig(path, &c); sourceErr != nil {
 				return false, sourceErr
 			}
 			targetDir := q.Dir
@@ -130,7 +129,20 @@ func findReuse(ctx context.Context, raw string) error {
 			if absErr != nil {
 				return false, absErr
 			}
-			if c.Dir != cwd || !maps.Equal(c.Env, q.Env) {
+			if c.Dir != cwd {
+				wanted, wantErr := jobDirectoryKey(cwd)
+				recorded, recordedErr := jobDirectoryKey(c.Dir)
+				if os.IsNotExist(wantErr) || os.IsNotExist(recordedErr) {
+					return false, nil
+				}
+				if err := errors.Join(wantErr, recordedErr); err != nil {
+					return false, err
+				}
+				if wanted != recorded {
+					return false, nil
+				}
+			}
+			if !maps.Equal(c.Env, q.Env) {
 				return false, nil
 			}
 			argv := q.Argv

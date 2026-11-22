@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,89 +13,204 @@ import (
 
 var errDuplicate = errors.New("duplicate submission")
 
-// While the job exists only status.json is authoritative. Clean freezes its last
-// snapshot in the receipt before removing the directory.
-type receipt struct {
-	Archived *status `json:"archived,omitempty"`
-	Project  string  `json:"project"`
-	Job      string  `json:"job"`
+const nodeStateFormat = 1
+const nodeStateFormatFile = ".state-format"
+
+var errStateFormat = errors.New("unsupported node state format; select a separate state root")
+
+func checkNodeStateFormat(root string) (bool, error) {
+	var version int
+	path := filepath.Join(root, nodeStateFormatFile)
+	if err := readJSON(path, &version); os.IsNotExist(err) {
+		return false, nil
+	} else if err != nil {
+		return false, fmt.Errorf("%w: %s: %w", errStateFormat, path, err)
+	}
+	if version != nodeStateFormat {
+		return false, fmt.Errorf("%w: %s has version %d", errStateFormat, path, version)
+	}
+	return true, nil
 }
 
-func claimKey(root string, c config, s status) error {
-	dir := filepath.Join(root, ".dedup")
-	if err := os.MkdirAll(dir, 0700); err != nil {
+// The first registration or restart checks unmarked roots from the
+// state-log rollout. The caller holds the registry lock.
+func ensureNodeStateFormat(ctx context.Context, root string) error {
+	if known, err := checkNodeStateFormat(root); err != nil || known {
 		return err
 	}
-	path, err := jobPath(dir, c.DedupKey)
+	err := walkJobDirs(ctx, root, "", func(dir, project, name string) (bool, bool, error) {
+		if project == "" && strings.EqualFold(name, "cache") {
+			return true, false, nil
+		}
+		for _, old := range []string{"status.json", "config.json"} {
+			if _, err := os.Lstat(filepath.Join(dir, old)); err == nil {
+				return false, false, fmt.Errorf("%w: %s contains %s", errStateFormat, dir, old)
+			} else if !os.IsNotExist(err) {
+				return false, false, err
+			}
+		}
+		current, _, err := latestState(dir)
+		if err != nil || current.Seq == 0 {
+			return false, false, err
+		}
+		record, _, err := latestStateKind(dir, outboxSeenKind)
+		if err == nil && record.Seq != 0 {
+			var at stateCursor
+			if err := json.Unmarshal(record.Value, &at); err != nil || at.Seg == 0 || at.Seq == 0 || at.Off == 0 {
+				return true, false, fmt.Errorf("%w: %s has an incompatible outbox checkpoint", errStateFormat, dir)
+			}
+		}
+		return true, false, err
+	})
 	if err != nil {
 		return err
 	}
-	// Reserve the entry before publishing the job. An empty reservation is
-	// recoverable: the registry lock excludes other publishers, and no job
-	// is registered until a complete receipt has replaced the reservation.
-	reservation, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
-	if err == nil {
-		if err = reservation.Close(); err != nil {
-			return err
-		}
-	} else if !os.IsExist(err) {
-		return err
-	}
-	raw, err := readStateFile(path)
-	if err != nil {
-		return err
-	}
-	var old receipt
-	if len(raw) > 0 {
-		if err = json.Unmarshal(raw, &old); err != nil {
-			return err
-		}
+	data := fmt.Appendf(nil, "%d\n", nodeStateFormat)
+	return publishImmutable(filepath.Join(root, nodeStateFormatFile), data, root)
+}
 
-		current := old.Archived
-		// A crash before register can leave this name available for a
-		// different key. Only a matching job may supersede the receipt.
-		previousDir := filepath.Join(root, old.Project, old.Job)
-		var previous config
-		err = readJSON(filepath.Join(previousDir, "config.json"), &previous)
-		if err == nil && previous.DedupKey == c.DedupKey {
-			var live status
-			if err = readJSON(filepath.Join(previousDir, "status.json"), &live); err != nil {
+type receipt struct {
+	Project string `json:"project"`
+	Job     string `json:"job"`
+	RunID   string `json:"run_id"`
+}
+
+func dedupReceipt(root, key string) (string, receipt, error) {
+	var ref receipt
+	dir, err := jobPath(filepath.Join(root, ".dedup"), key)
+	if err != nil {
+		return "", ref, err
+	}
+	record, _, err := latestStateKind(dir, "claim")
+	if err == nil && record.Seq != 0 {
+		err = json.Unmarshal(record.Value, &ref)
+	}
+	return dir, ref, err
+}
+
+// The registry lock serializes claim publication and archive creation.
+func claimKey(root string, c config, s status) error {
+	dir, old, err := dedupReceipt(root, c.DedupKey)
+	if err != nil {
+		return err
+	}
+	if old.RunID != "" {
+		current, _, err := loadJobStatus(filepath.Join(root, old.Project, old.Job))
+		if err != nil && !errors.Is(err, errNotRegistered) {
+			return err
+		}
+		if current.RunID != old.RunID {
+			current, err = archivedDedupStatus(dir, old)
+			if err != nil {
 				return err
 			}
-			current = &live
-		} else if err != nil && !os.IsNotExist(err) {
-			return err
 		}
-		if current != nil && (!isTerminal(current.State) || (current.State == "done" && current.CompletedStatus == "completed")) {
+		if current.State != "" && (!current.final || (current.State == "done" && current.CompletedStatus == "completed")) {
 			if err = json.NewEncoder(os.Stdout).Encode(current); err != nil {
 				return err
 			}
 			return errDuplicate
 		}
 	}
-	next := receipt{Project: s.Project, Job: s.Job}
-	return writeJSON(path, next)
-}
-func archiveReceipt(root string, c config, s status) error {
-	if c.DedupKey == "" {
-		return nil
-	}
-	path := filepath.Join(root, ".dedup", c.DedupKey)
-	var rec receipt
-	if err := readJSON(path, &rec); err != nil {
+	writer, err := openLogWriter(dir, true)
+	if err != nil {
 		return err
 	}
-	if rec.Project != s.Project || rec.Job != s.Job {
+	next := receipt{Project: s.Project, Job: s.Job, RunID: c.RunID}
+	err = writer.Append("claim", next)
+	if err == nil {
+		err = writer.sync()
+	}
+	if err := errors.Join(err, writer.Close()); err != nil {
+		return err
+	}
+	if err := syncJobTree(dir, root); err != nil {
+		return err
+	}
+	// The new claim supersedes every older claim once its segment is durable.
+	if segments, err := logSegments(writer.dir); err == nil {
+		for _, seg := range segments {
+			if seg != writer.seg {
+				removeJobSegment(segmentPath(writer.dir, seg))
+			}
+		}
+	}
+	return nil
+}
+
+func archivedDedupStatus(dir string, ref receipt) (status, error) {
+	var s status
+	archive := filepath.Join(dir, "final", ref.RunID)
+	entries, err := os.ReadDir(archive)
+	if errors.Is(err, os.ErrNotExist) {
+		return s, nil
+	}
+	if err != nil {
+		return s, err
+	}
+	for i := len(entries) - 1; i >= 0; i-- {
+		record, _, err := latestFileKind(filepath.Join(archive, entries[i].Name()), "status")
+		if err != nil {
+			return s, err
+		}
+		if record.Final {
+			err = decodeJobStatus(record, &s)
+			return s, err
+		}
+	}
+	return s, nil
+}
+
+// The registry, owner and mailbox locks protect the confirmed directory.
+func archiveAndDetachJob(ctx context.Context, root, dir string, owner *os.File, c config, s status, syncArchive func(string, string) error) error {
+	unlock, err := lockJobMailboxes(ctx, dir)
+	if err != nil {
+		return errors.Join(err, owner.Close())
+	}
+	defer unlock()
+	if err := errors.Join(archiveReceipt(root, c, s, syncArchive), owner.Close()); err != nil {
+		return err
+	}
+	return detachCleanJob(root, dir, s)
+}
+
+func archiveReceipt(root string, c config, s status, syncArchive func(string, string) error) error {
+	if c.DedupKey == "" || s.State != "done" || s.CompletedStatus != "completed" {
 		return nil
 	}
-	rec.Archived = &s
-	return writeJSON(path, rec)
+	dir, ref, err := dedupReceipt(root, c.DedupKey)
+	if err != nil || ref.RunID != s.RunID {
+		return err
+	}
+	job := filepath.Join(root, s.Project, s.Job)
+	record, cursor, err := latestState(job)
+	if err != nil {
+		return err
+	}
+	if !record.Final {
+		return errors.New("cannot archive an unsealed job")
+	}
+	// Link the flushed segment before detaching the job. A matching live
+	// run still takes precedence if clean fails after making the link.
+	archive := filepath.Join(dir, "final", ref.RunID)
+	if err = os.MkdirAll(archive, 0700); err != nil {
+		return err
+	}
+	final := filepath.Join(archive, fmt.Sprintf("%020d.jsonl", cursor.Seq))
+	err = os.Link(segmentPath(filepath.Join(job, "state"), cursor.Seg), final)
+	if err != nil && !os.IsExist(err) {
+		return err
+	}
+	return syncArchive(archive, root)
 }
-func scanJobs(ctx context.Context, root, project, session string, visit func(status) (bool, error)) error {
+
+// The root may contain flat jobs and project directories. A top-level
+// directory without a published job status may be a project.
+func walkJobDirs(ctx context.Context, root, project string, visit func(dir, project, job string) (registered, stop bool, err error)) error {
 	var scan func(string, string) (bool, error)
 	scan = func(dir, p string) (bool, error) {
 		entries, err := os.ReadDir(dir)
-		if os.IsNotExist(err) {
+		if errors.Is(err, os.ErrNotExist) {
 			return false, nil
 		}
 		if err != nil {
@@ -111,31 +227,13 @@ func scanJobs(ctx context.Context, root, project, session string, visit func(sta
 				continue
 			}
 			path := filepath.Join(dir, entry.Name())
-			statePath := filepath.Join(path, "status.json")
-			fi, err := os.Stat(statePath)
-			if os.IsNotExist(err) || (err == nil && fi.IsDir()) {
-				if p == "" {
-					if stop, scanErr := scan(path, entry.Name()); stop || scanErr != nil {
-						return stop, scanErr
-					}
-				}
-				continue
+			registered, stop, err := visit(path, p, entry.Name())
+			if stop || err != nil {
+				return stop, err
 			}
-			if err != nil {
-				return false, err
-			}
-			if project != "" && project != p {
-				continue
-			}
-			var s status
-			if err = projected(ctx, path, &s); os.IsNotExist(err) {
-				continue
-			} else if err != nil {
-				return false, err
-			}
-			if session == "" || session == s.Session {
-				if stop, err := visit(s); stop || err != nil {
-					return stop, err
+			if p == "" && !registered {
+				if stop, scanErr := scan(path, entry.Name()); stop || scanErr != nil {
+					return stop, scanErr
 				}
 			}
 		}
@@ -143,6 +241,25 @@ func scanJobs(ctx context.Context, root, project, session string, visit func(sta
 	}
 	_, err := scan(root, "")
 	return err
+}
+
+func scanJobs(ctx context.Context, root, project, session string, visit func(status) (bool, error)) error {
+	return walkJobDirs(ctx, root, project, func(path, p, _ string) (bool, bool, error) {
+		id, s, _, err := captureJobIdentity(path)
+		if errors.Is(err, os.ErrNotExist) {
+			return false, false, nil
+		}
+		if err != nil || (project != "" && p != project) || (session != "" && session != s.Session) {
+			return true, false, err
+		}
+		if _, err = projectJobStatus(ctx, path, &s, id); errors.Is(err, os.ErrNotExist) {
+			return false, false, nil
+		} else if err != nil {
+			return true, false, err
+		}
+		stop, err := visit(s)
+		return true, stop, err
+	})
 }
 
 func listJobs(ctx context.Context, root, project, session string, briefOnly bool) error {

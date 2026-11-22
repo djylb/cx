@@ -1,12 +1,10 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"slices"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -17,7 +15,6 @@ func snapTestCtx(t *testing.T) context.Context {
 	ctx, c := context.WithTimeout(context.Background(), 23*time.Second)
 	t.Cleanup(c)
 	t.Setenv("CX_SNAPSHOT_STORE", filepath.Join(t.TempDir(), "store"))
-	t.Setenv("PYTHONDONTWRITEBYTECODE", "1")
 	t.Setenv("GOWORK", "off")
 	return ctx
 }
@@ -67,7 +64,7 @@ func snapWorkspaceFixture(t *testing.T, ctx context.Context) string {
 	return app
 }
 
-func TestSnapPythonWorkspace(t *testing.T) {
+func TestSnapWorkspace(t *testing.T) {
 	ctx := snapTestCtx(t)
 	app := snapWorkspaceFixture(t, ctx)
 	t.Setenv("GOWORK", filepath.Join(app, "go.work"))
@@ -75,37 +72,49 @@ func TestSnapPythonWorkspace(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	if len(m.Repositories) != 2 {
-		t.Fatalf("expected two workspace repositories: %+v", m.Repositories)
-	}
-	if reference, ok := pythonReference(t, filepath.Join("snapshot", "freeze.py")); ok {
-		t.Setenv("PYTHONPATH", filepath.Dir(reference))
-		cmd := exec.CommandContext(ctx, "python3", "-c", `from pathlib import Path
-import freeze,sys
-freeze.STORE=Path(sys.argv[2])
-print(freeze.freeze(Path(sys.argv[1])))`, app, t.TempDir())
-		var diag bytes.Buffer
-		cmd.Stderr = &diag
-		b, err := cmd.Output()
-		if err != nil || string(sid) != strings.TrimSpace(string(b)) {
-			t.Fatalf("workspace differential: %v Python=%s Go=%s %s", err, b, sid, diag.String())
-		}
-	} else {
-		t.Log("snapshot/freeze.py unavailable: skipping workspace snapshot ID comparison")
+	if len(m.Repositories) != 2 || m.Main != "app" ||
+		m.Repositories[0].Path != "app" || m.Repositories[1].Path != "library" {
+		t.Fatalf("wrong workspace layout: %+v", m)
 	}
 	hub := endpoint{State: t.TempDir()}
 	if e = Publish(ctx, hub, sid, nil); e != nil {
 		t.Fatal(e)
 	}
 	job := t.TempDir()
+	unpublished := filepath.Join(job, "work", "tree")
+	snapWriteTest(t, filepath.Join(unpublished, "unpublished"), "partial materialization")
 	start := time.Now()
 	p, e := Materialize(ctx, job, m, filepath.Join(hub.State, "snapshot"))
 	if e != nil {
 		t.Fatal(e)
 	}
+	if _, err := os.Stat(filepath.Join(unpublished, "unpublished")); !os.IsNotExist(err) {
+		t.Fatalf("materialization left unpublished work: %v", err)
+	}
 	t.Logf("two-repository checkout including review.diff: %v", time.Since(start))
 	if p.ReviewDiff == nil {
 		t.Fatal("missing review")
+	}
+	for _, file := range []struct{ path, content string }{
+		{"app/state", "working version\n"},
+		{"app/staged", "staged only\n"},
+		{"app/new file-中", "untracked\n"},
+		{"app/internal/web/dist/generated", "generated\n"},
+		{"library/lib.go", "package lib\nconst Value = \"dirty-lib\"\n"},
+	} {
+		b, err := os.ReadFile(filepath.Join(unpublished, file.path))
+		if err != nil || string(b) != file.content {
+			t.Errorf("checkout %s: got %q (%v), want %q", file.path, b, err, file.content)
+		}
+	}
+	for _, name := range []string{"ignored", "removed"} {
+		if _, err := os.Stat(filepath.Join(p.Source, name)); !os.IsNotExist(err) {
+			t.Errorf("checkout contains %s: %v", name, err)
+		}
+	}
+	const wantWork = "go 1.23\n\nuse (\n\t./tree/app\n\t./tree/library\n)\n"
+	if b, err := os.ReadFile(p.Env["GOWORK"]); err != nil || string(b) != wantWork {
+		t.Fatalf("materialized go.work: got %q (%v), want %q", b, err, wantWork)
 	}
 	snapWriteTest(t, filepath.Join(p.Source, "state"), "job edit\n")
 	snapWriteTest(t, filepath.Join(p.Source, "artifacts", "capture"), "result")
@@ -118,37 +127,26 @@ print(freeze.freeze(Path(sys.argv[1])))`, app, t.TempDir())
 	}
 	patch := filepath.Join(result.Dir, result.Repositories[0].Patch)
 	g := snapGit{ctx: ctx, dir: app}
-	if _, e = g.get("apply", "--check", patch); e != nil {
+	if names, err := g.get("apply", "--numstat", patch); err != nil || names != "1\t1\tstate" {
+		t.Fatalf("result patch changes: %q (%v)", names, err)
+	}
+	if _, e = g.get("-c", "core.autocrlf=false", "apply", patch); e != nil {
 		t.Fatal(e)
 	}
-	goPatch, e := os.ReadFile(patch)
-	if e != nil || len(goPatch) == 0 {
-		t.Fatalf("missing Go patch: %v", e)
-	}
-	reference, ok := pythonReference(t, "cx-executor.py")
-	if !ok {
-		t.Log("cx-executor.py unavailable: skipping workspace result patch comparison")
-		return
-	}
-	script := `import importlib.util,sys
-from pathlib import Path
-spec=importlib.util.spec_from_file_location("executor",sys.argv[1])
-mod=importlib.util.module_from_spec(spec);spec.loader.exec_module(mod)
-repo,oid,tmp=Path(sys.argv[2]),sys.argv[3],Path(sys.argv[4])
-sys.stdout.buffer.write(mod.repository_patch(repo,{"oid":oid},tmp,repo/"artifacts")[0])`
-	cmd := exec.CommandContext(ctx, "python3", "-c", script, reference, p.Source, result.Repositories[0].SnapshotOID, filepath.Join(job, "py-index"))
-	var diag bytes.Buffer
-	cmd.Stderr = &diag
-	b, e := cmd.Output()
-	if e != nil {
-		t.Fatalf("reference patch: %v %s", e, diag.String())
-	}
-	if !bytes.Equal(b, goPatch) {
-		t.Fatal("Go and Python result patches differ")
+	if b, err := os.ReadFile(filepath.Join(app, "state")); err != nil || string(b) != "job edit\n" {
+		t.Fatalf("applied result: got %q (%v), want job edit", b, err)
 	}
 }
 func TestSnapDirectoryIncrement(t *testing.T) {
 	ctx := snapTestCtx(t)
+	if runtime.GOOS == "windows" {
+		// Include Git lock paths beyond MAX_PATH even with a short TEMP.
+		store := os.Getenv("CX_SNAPSHOT_STORE")
+		const minStoreLength = 135
+		if padding := minStoreLength - len(store) - 1; padding > 0 {
+			t.Setenv("CX_SNAPSHOT_STORE", filepath.Join(store, strings.Repeat("s", padding)))
+		}
+	}
 	src := t.TempDir()
 	snapWriteTest(t, filepath.Join(src, "first"), strings.Repeat("a", 4096))
 	hub := endpoint{State: t.TempDir()}
@@ -177,25 +175,11 @@ func TestSnapDirectoryIncrement(t *testing.T) {
 }
 
 func TestSnapEmbeddedDenylist(t *testing.T) {
-	if strings.TrimSpace(snapDeny) == "" {
-		t.Fatal("embedded snapshot policy is empty")
+	shared, err := os.ReadFile(filepath.Join("..", "snapshot", "denylist"))
+	if err != nil {
+		t.Fatal(err)
 	}
-	patterns := strings.Split(snapDeny, "\n")
-	for _, pattern := range []string{"*.pem", "*.key", ".env*", ".ssh", ".aws", "credentials", "token.json"} {
-		if !slices.Contains(patterns, pattern) {
-			t.Errorf("embedded snapshot policy is missing %q", pattern)
-		}
-	}
-	reference, ok := pythonReference(t, filepath.Join("snapshot", "denylist"))
-	if !ok {
-		t.Log("snapshot/denylist unavailable: skipping embedded policy comparison")
-		return
-	}
-	data, e := os.ReadFile(reference)
-	if e != nil {
-		t.Fatal(e)
-	}
-	if string(data) != snapDeny {
+	if snapDeny != strings.ReplaceAll(string(shared), "\r\n", "\n") {
 		t.Fatal("embedded snapshot policy differs from snapshot/denylist")
 	}
 }

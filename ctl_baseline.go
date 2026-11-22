@@ -134,7 +134,7 @@ func rebaseTurn(ctx context.Context, dir, host, id, text string, m turnResult) e
 	if strings.TrimSpace(text) == "" {
 		return errors.New("rebase requires follow-up text")
 	}
-	origin, _, _, e := applyOrigin(dir, host, id)
+	origin, _, _, e := applyOrigin(dir)
 	if e != nil {
 		return e
 	}

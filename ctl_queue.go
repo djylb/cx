@@ -146,7 +146,6 @@ func queueJob(ctx context.Context, q queuedJob, sync bool) error {
 		}
 		defer closeBestEffort(log)
 		cmd := exec.Command(exe, "node", "submit-worker", req.Host, req.ID)
-		detachWorker(cmd)
 		cmd.Stderr = log
 		rd, wr, launchErr := os.Pipe()
 		if launchErr != nil {
@@ -154,7 +153,7 @@ func queueJob(ctx context.Context, q queuedJob, sync bool) error {
 		}
 		defer closeBestEffort(rd)
 		cmd.Stdout = wr
-		if launchErr = cmd.Start(); launchErr != nil {
+		if launchErr = startDetachedWorker(cmd); launchErr != nil {
 			_ = wr.Close()
 			return launchErr
 		}
@@ -180,7 +179,7 @@ func queueJob(ctx context.Context, q queuedJob, sync bool) error {
 		}
 	}
 	if sync {
-		_, e = observeSubmission(ctx, req.Host, req.ID, "wait", 6*time.Hour)
+		_, e = observeSubmission(ctx, req.Host, req.ID, "wait", transferLimit)
 		return e
 	}
 	return nil
@@ -234,7 +233,7 @@ func submissionWorker(ctx context.Context, host, id string) (err error) {
 	if e != nil {
 		return e
 	}
-	ctx, cancel := context.WithTimeout(ctx, 6*time.Hour)
+	ctx, cancel := context.WithTimeout(ctx, transferLimit)
 	defer cancel()
 	if h.SSH != "" {
 		if e = deploy(ctx, hs, host); e != nil {
@@ -273,9 +272,6 @@ func observeSubmission(ctx context.Context, host, id, op string, limit time.Dura
 	for {
 		s, e := readSubmissionProgress(dir)
 		if os.IsNotExist(e) {
-			if op == "show" || op == "status" {
-				return legacySubmissionView(host, id)
-			}
 			return false, nil
 		}
 		if e != nil {
@@ -301,46 +297,4 @@ func observeSubmission(ctx context.Context, host, id, op string, limit time.Dura
 			return true, e
 		}
 	}
-}
-
-// During migration a Python submitter still owns its registration and progress file.
-func legacySubmissionView(host, id string) (bool, error) {
-	path, e := legacyRouteFile(id)
-	if os.IsNotExist(e) {
-		return false, nil
-	}
-	if e != nil {
-		return false, e
-	}
-	var row struct {
-		Code                              *int `json:"submit_rc"`
-		Host, Project, Tag, Session, Role string
-		State                             string `json:"submit_status"`
-		Reason                            string `json:"submit_reason"`
-		Log                               string `json:"submit_log"`
-		Token                             string `json:"submit_token"`
-		PID                               int    `json:"submit_pid"`
-	}
-	if e = readJSON(path, &row); os.IsNotExist(e) {
-		return false, nil
-	} else if e != nil {
-		return false, e
-	}
-	if row.Host != host || row.Project+"/"+row.Tag != id || row.State != "submitting" && row.State != "submit_failed" {
-		return false, nil
-	}
-	s := submissionProgress{Host: host, Project: row.Project, Job: row.Tag, State: row.State, Role: row.Role, Session: row.Session, PID: row.PID, Code: row.Code, Log: row.Log, Reason: row.Reason}
-	var indicator struct {
-		Token string
-		Bytes int64 `json:"uploaded_bytes"`
-	}
-	if e = readJSON(strings.TrimSuffix(path, ".env")+".publishing", &indicator); e == nil && row.Token != "" && indicator.Token == row.Token {
-		s.Bytes = indicator.Bytes
-		if s.State == "submitting" {
-			s.State = "publishing"
-		}
-	} else if e != nil && !os.IsNotExist(e) {
-		return false, e
-	}
-	return true, json.NewEncoder(os.Stdout).Encode(s)
 }
