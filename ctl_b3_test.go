@@ -86,7 +86,8 @@ func TestB3SnapshotResult(t *testing.T) {
 	}
 	cliOutput(t, 0, nil, f.cx, "run", "local", src, "roundtrip", "--cmd", "--", "sh", "-c", "echo changed > original && mkdir artifacts && echo asset > artifacts/test && echo report")
 	cliOutput(t, 0, nil, f.cx, "wait", "p/roundtrip", "--timeout", "3s")
-	cliOutput(t, 12, nil, f.cx, "result", "p/roundtrip")
+	// wait collects the result, so a plain result reads the cache (no exit 12).
+	cliOutput(t, 0, nil, f.cx, "result", "p/roundtrip")
 	if got := cliOutput(t, 0, nil, f.cx, "result", "p/roundtrip", "--wait"); !bytes.Contains(got, []byte("artifacts/test (6 bytes)")) {
 		t.Fatal(string(got))
 	}

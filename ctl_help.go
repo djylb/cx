@@ -89,7 +89,13 @@ func ctlUsage(op string, err error) error {
 		printCtlHelp(os.Stdout, op)
 		return nil
 	}
-	printCtlHelp(os.Stderr, op)
+	if op == "" {
+		printCtlHelp(os.Stderr, op)
+		return err
+	}
+	// A short usage line plus the error: the full help would bury the actual mistake.
+	cmd := ctlCommands[op]
+	_, _ = fmt.Fprintf(os.Stderr, "usage: cx %s %s\nRun cx %s --help for options.\n", strings.ReplaceAll(op, "-", " "), cmd.usage, strings.ReplaceAll(op, "-", " "))
 	return err
 }
 
@@ -204,7 +210,7 @@ var ctlFlagDescriptions = map[string]string{
 	"parent":  "parent `JOB` or session (defaults to CX_PARENT, then current session)",
 	"project": "select `PROJECT`", "raw": "show raw job output", "refresh": "refresh the cached result",
 	"repo": "select repository `PATH`", "reuse": "reuse matching successful command output",
-	"profile": "execution host credential profile `NAME`", "role": "agent `ROLE` (defaults to worker)", "sandbox": "sandbox `MODE` (defaults to workspace-write)",
+	"profile": "execution host credential profile `NAME`", "role": "agent `ROLE` (defaults to worker)", "sandbox": "sandbox `MODE`: read-only (review, research), workspace-write (default; edits inside the checkout), danger-full-access (needs the execution account's full access; recorded as privileged)",
 	"script": "upload and run `FILE`", "session": "select `SESSION` (defaults to the detected session where applicable)",
 	"set": "update a node setting with `NAME=VALUE` (repeatable)", "snapshot": "reuse snapshot `ID`",
 	"sync": "wait for job registration", "tag": "job `TAG` (generated when omitted)",

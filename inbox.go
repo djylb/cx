@@ -232,7 +232,7 @@ func (r *runner) deliver(name string) error {
 		return err
 	}
 	// A remote publisher retries by republishing the same immutable name and bytes.
-	for _, sub := range []string{"done", "uncertain"} {
+	for _, sub := range []string{"done", "uncertain", "withdrawn"} {
 		previous, duplicateErr := readStateFile(r.mail(filepath.Join(sub, name)))
 		if os.IsNotExist(duplicateErr) {
 			continue
@@ -300,6 +300,36 @@ func (r *runner) deliver(name string) error {
 		return err
 	}
 	return r.archive(pending)
+}
+
+// withdrawQueued cancels a follow-up that is still waiting for admission: interrupting an
+// idle job drops the queued input (kept under inbox/withdrawn) and returns it to waiting.
+func (r *runner) withdrawQueued() error {
+	if r.follow == nil || r.active() {
+		return nil
+	}
+	r.cancelFollow()
+	entries, err := os.ReadDir(r.mail(""))
+	if err != nil {
+		return err
+	}
+	if err = os.MkdirAll(r.mail("withdrawn"), 0700); err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if !entry.Type().IsRegular() || !strings.HasSuffix(entry.Name(), ".msg") {
+			continue
+		}
+		if err = os.Rename(r.mail(entry.Name()), r.mail(filepath.Join("withdrawn", entry.Name()))); err != nil {
+			return err
+		}
+		if err = r.note("inbox/withdrawn", entry.Name()); err != nil {
+			return err
+		}
+	}
+	r.deriveState()
+	r.idleSince = time.Now()
+	return r.save()
 }
 func (r *runner) interrupt() error {
 	if !r.active() {
@@ -381,14 +411,16 @@ func (r *runner) poll() (bool, error) {
 		return false, err
 	}
 	if exists {
+		if err = r.withdrawQueued(); err != nil {
+			return false, err
+		}
 		if err = r.interrupt(); err != nil {
 			return false, err
 		}
 		return false, nil
 	}
-	if r.follow != nil && !r.active() && time.Since(r.idleSince) >= r.c.Idle {
-		return true, nil
-	}
+	// A follow-up waiting for admission stays in the inbox; it is pending input, so idle
+	// exit must not end the runner (queue-timeout bounds the wait instead).
 	entries, err := os.ReadDir(r.mail(""))
 	if err != nil {
 		return false, err

@@ -18,6 +18,36 @@ Use `cx result JOB --json --wait` for metadata about the sealed turn, including 
 
 Separate the command's exit status, the job state, and the agent's report status when deciding whether a task is complete. The [README](../README.md#exit-codes) lists observation and collection codes.
 
+### What the agent can see
+
+- The agent sees the frozen snapshot of DIR on the execution host, not the controller's filesystem. Absolute controller paths in the prompt, such as design documents outside DIR, do not exist there. Inline the needed text in the prompt, or place the files inside DIR before dispatch.
+- The job's `.git` is read-only. Tell the agent to leave changes uncommitted: cx collects the working tree as a patch. Changes in other repositories of a multi-repository workspace are collected too, so say so in the prompt if the agent would otherwise report them as blocked.
+- Several repositories under one parent directory are a project: `cx project init NAME --repo DIR [DIR …]`, then dispatch with that project. Do not point `run` at a parent that holds nested `.git` directories.
+- The snapshot contains the local working tree, including unpushed commits, not the public upstream. Tell the agent to treat the snapshot as authoritative. Add reference repositories to the project so they travel with the snapshot.
+- Write deliverables that are not source changes into `artifacts/` in the job's working directory; `cx result` collects them. Files elsewhere outside the checkout are not collected.
+- A job that fails on a transient executor error, such as an engine routing timeout, can be continued with `cx resume JOB` followed by `cx say JOB`. cx reports the failure as is; the caller decides whether to retry. Likewise, an agent that stops itself because of host load ends its turn normally: inspect its report before treating the turn as done.
+- `--with-history` without a value means `HEAD`. Use `--with-history=A..HEAD` for a range.
+
+### Exit codes at a glance
+
+| Code | Meaning |
+|---|---|
+| 0 | success |
+| 1 | failed turn or operation |
+| 2 | invalid arguments or controller error |
+| 3 / 4 / 5 | stalled / job or queue timeout / orphaned |
+| 6 | waiting for input |
+| 7 | duplicate job |
+| 8 | submission failed |
+| 9 | transport failure |
+| 10 | apply succeeded but Git status failed |
+| 11 | job registration not found |
+| 12 | `result`: background download in progress; retry or add `--wait` |
+| 44 | result unavailable, for example a missing sealed turn |
+| 124 / 130 | observation timeout / canceled; the job keeps running |
+
+Command jobs may return the command's own exit code. `cx COMMAND --help` lists the codes each command can return.
+
 ### Apply changes across turns
 
 By default, `cx patch JOB` and `cx apply JOB` use the cumulative changes from the dispatch snapshot to the latest selected turn. Once you have applied and committed turn 1, inspect turn 2 with `cx patch JOB --turn 2 --incremental`. Then use `cx apply JOB --since-turn 2` to apply turn 2 through the latest completed turn, using the sealed turn 1 tree as the merge base. The incremental patch for turn 1 is the cumulative patch for turn 1. Incremental operations use the dispatch snapshot stored by the submitting controller. If an older job lacks the required sealed turn, the command names the missing turn and exits 44.

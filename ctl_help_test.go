@@ -53,7 +53,7 @@ func TestControllerHelp(t *testing.T) {
 		out, err := exec.CommandContext(ctx, f.cx, args...).CombinedOutput()
 		cancel()
 		var exit *exec.ExitError
-		if !errors.As(err, &exit) || exit.ExitCode() != 2 || !bytes.Contains(out, []byte("Usage: cx")) {
+		if !errors.As(err, &exit) || exit.ExitCode() != 2 || !bytes.Contains(bytes.ToLower(out), []byte("usage: cx")) {
 			t.Errorf("%v: expected usage and exit 2, got %v, %s", args, err, out)
 		}
 	}

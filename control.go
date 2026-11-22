@@ -304,7 +304,7 @@ func control(ctx context.Context, op, dir string, args []string) error {
 		if !msgName.MatchString(v) {
 			return errors.New("invalid CXRUN_MSG_NAME")
 		}
-		for _, sub := range []string{"", "pending", "done", "uncertain"} {
+		for _, sub := range []string{"", "pending", "done", "uncertain", "withdrawn"} {
 			if ok, err := fileExists(filepath.Join(dir, "inbox", sub, v)); err != nil {
 				return err
 			} else if ok {

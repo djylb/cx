@@ -614,3 +614,15 @@ func (r *runner) localEvent(method, detail string) error {
 	temp := runner{log: f}
 	return temp.writeProgress(method, detail)
 }
+
+// appendProgress records a line without an open runner log, best effort.
+func appendProgress(dir, kind, detail string) {
+	f, err := os.OpenFile(filepath.Join(dir, "progress.log"), os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		return
+	}
+	defer closeBestEffort(f)
+	if fi, err := f.Stat(); err == nil {
+		_, _ = fmt.Fprintf(f, "%d\t%s\t%s\t%s\n", fi.Size()+1, time.Now().UTC().Format(time.RFC3339Nano), kind, brief(detail))
+	}
+}

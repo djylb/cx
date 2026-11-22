@@ -70,7 +70,11 @@ func (r *runner) serveCommand() (err error) {
 		} else if r.s.CompletedStatus == "" {
 			r.s.CompletedStatus = "failed"
 		}
-		err = errors.Join(err, r.save())
+		if saveErr := r.saveTerminal(); saveErr != nil {
+			err = errors.Join(err, saveErr)
+			// The pane's stderr is not retained; leave the cause where status readers look.
+			appendProgress(r.dir, "runner/error", r.c.secret.text(err.Error()))
+		}
 	}()
 	r.log, err = os.OpenFile(filepath.Join(r.dir, "progress.log"), os.O_APPEND|os.O_WRONLY, 0600)
 	if err != nil {

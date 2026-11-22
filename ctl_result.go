@@ -812,6 +812,38 @@ func agentReport(ctx context.Context, host string, h endpoint, id string, full b
 	return nil
 }
 
+// prefetchResult downloads the latest sealed turn's summary result into the controller
+// cache, the same variant `cx result` reads, and points the result marker at it. It is best
+// effort: the node may still be sealing the turn (44), so it retries until ctx ends, and an
+// interrupted transfer leaves its partial download for the next attempt to resume.
+func prefetchResult(ctx context.Context, h endpoint, host, id string) {
+	for {
+		r, e := h.call(ctx, 30*time.Second, "status", "--job", id)
+		if e != nil || r.code != 0 {
+			return
+		}
+		var s status
+		if json.Unmarshal(r.data, &s) != nil || s.Finished == 0 && !readyResult(s) {
+			return
+		}
+		turn := strconv.FormatInt(s.Finished, 10)
+		dest, e := resultDest(host, id, s.RunID, turn)
+		if e != nil {
+			return
+		}
+		dest = resultVariant(dest, false)
+		if e = fetchTurn(ctx, h, id, s.RunID, turn, dest, false); e == nil {
+			if marker, markerErr := resultMarker(host, id); markerErr == nil {
+				_ = writeJSON(marker, resultReference{s.RunID, s.Finished})
+			}
+			return
+		}
+		if !errors.Is(e, ctlExit(44)) || pause(ctx, 200*time.Millisecond) != nil {
+			return
+		}
+	}
+}
+
 type fetchFailure struct {
 	Message string
 	Code    int

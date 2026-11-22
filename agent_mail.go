@@ -122,7 +122,7 @@ func answerPath(dir string, id json.RawMessage) (string, error) {
 // Include archived messages because the runner may already have steered the turn.
 func agentInbox(dir string) (fields, error) {
 	messages := fields{}
-	for _, sub := range []string{"", "pending", "done", "uncertain"} {
+	for _, sub := range []string{"", "pending", "done", "uncertain", "withdrawn"} {
 		folder := filepath.Join(dir, "inbox", sub)
 		entries, err := os.ReadDir(folder)
 		if os.IsNotExist(err) {

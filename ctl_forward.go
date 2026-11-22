@@ -61,21 +61,44 @@ func ctlForward(ctx context.Context, op string, args []string) error {
 		if len(args) == 1 {
 			names = args
 		}
-		for _, name := range names {
+		// Query hosts concurrently with a per-host bound so one slow link cannot hold the others.
+		type factsReply struct {
+			r   reply
+			err error
+		}
+		replies := make([]chan factsReply, len(names))
+		for i, name := range names {
 			h, hostErr := hs.get(name)
 			if hostErr != nil {
 				return hostErr
 			}
-			r, hostErr := h.call(ctx, 30*time.Second, "facts")
-			if hostErr != nil {
+			replies[i] = make(chan factsReply, 1)
+			go func() {
+				hostCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+				defer cancel()
+				r, err := h.call(hostCtx, 30*time.Second, "facts")
+				if err == nil && r.code != 0 {
+					err = r.output()
+				}
+				replies[i] <- factsReply{r, err}
+			}()
+		}
+		var failed error
+		for i, name := range names {
+			v := <-replies[i]
+			if v.err != nil {
+				failed = errors.Join(failed, fmt.Errorf("%s: %w", name, v.err))
+				if hostErr := emitRows([]byte(fmt.Sprintf(`{"error":%q}`, v.err.Error())), "host", name); hostErr != nil {
+					return hostErr
+				}
+				continue
+			}
+			if hostErr := emitRows(v.r.data, "host", name); hostErr != nil {
 				return hostErr
 			}
-			if r.code != 0 {
-				return r.output()
-			}
-			if hostErr = emitRows(r.data, "host", name); hostErr != nil {
-				return hostErr
-			}
+		}
+		if failed != nil {
+			return failed
 		}
 		return nil
 	}

@@ -515,14 +515,23 @@ func controller(ctx context.Context, a []string) error {
 		if e != nil {
 			return e
 		}
-		return waitOne(ctx, h, id, limit)
+		return waitOne(ctx, h, name, id, limit)
 	}
 	return errors.New("invalid command")
 }
-func waitOne(ctx context.Context, h endpoint, id string, limit time.Duration) error {
+func waitOne(ctx context.Context, h endpoint, host, id string, limit time.Duration) error {
+	deadline := time.Now().Add(limit)
 	r, e := h.call(ctx, limit+2*time.Second, "observe-one", id, limit.String())
 	if e != nil {
 		return e
+	}
+	// A completed turn or terminal state: collect its result inside the same budget so a
+	// following `cx result` reads the local cache instead of returning 12 (collecting).
+	switch r.code {
+	case 0, 1, 3, 4, 5:
+		prefetchCtx, cancel := context.WithDeadline(ctx, deadline)
+		prefetchResult(prefetchCtx, h, host, id)
+		cancel()
 	}
 	// The node appends its terminal snapshot to the ordinary wait diagnostic.
 	first, last, ok := bytes.Cut(r.data, []byte("\n{"))

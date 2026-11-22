@@ -384,6 +384,26 @@ type runner struct {
 	dirty bool
 }
 
+// The terminal record is the only publication a finished job gets; a transient
+// filesystem refusal (for example a scanner holding the new file) must not turn
+// a completed job into an orphan.
+var terminalSaveBudget = 10 * time.Second
+
+func (r *runner) saveTerminal() error {
+	deadline := time.Now().Add(terminalSaveBudget)
+	delay := 50 * time.Millisecond
+	for {
+		err := r.save()
+		if err == nil || time.Now().Add(delay).After(deadline) {
+			return err
+		}
+		time.Sleep(delay)
+		delay = min(2*delay, time.Second)
+	}
+}
+
+var writeStatus = writeJSON
+
 func (r *runner) save() error {
 	r.dirty = false
 	var approvals []approval
@@ -392,7 +412,7 @@ func (r *runner) save() error {
 			approvals = append(approvals, a)
 		}
 	}
-	return writeJSON(filepath.Join(r.dir, "status.json"), struct {
+	return writeStatus(filepath.Join(r.dir, "status.json"), struct {
 		Legacy []approval `json:"waiting_approval,omitempty"`
 		status
 	}{Legacy: approvals, status: r.s})
