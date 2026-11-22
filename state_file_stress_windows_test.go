@@ -22,6 +22,44 @@ func TestWindowsReplaceUnderReaders(t *testing.T) {
 	}
 	report := ""
 	failed := false
+	for _, durable := range []bool{true, false} {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "status.json")
+		stale, errs := 0, 0
+		var first string
+		for i := 1; i <= 300; i++ {
+			reader, err := openShared(path)
+			write := writeJSONVolatile
+			if durable {
+				write = writeJSON
+			}
+			if err = write(path, i); err != nil {
+				errs++
+				if first == "" {
+					first = err.Error()
+				}
+			}
+			var got int
+			if err = readJSON(path, &got); err != nil || got != i {
+				stale++
+				if first == "" {
+					entries, _ := os.ReadDir(dir)
+					names := []string{}
+					for _, e := range entries {
+						names = append(names, e.Name())
+					}
+					first = fmt.Sprintf("write %d read %d %v entries %q", i, got, err, names)
+				}
+			}
+			if reader != nil {
+				_ = reader.Close()
+			}
+		}
+		report += fmt.Sprintf("writeJSON durable=%v: stale %d errors %d first %q\n", durable, stale, errs, first)
+		if stale > 0 || errs > 0 {
+			failed = true
+		}
+	}
 	for name, replace := range variants {
 		dir := t.TempDir()
 		path := filepath.Join(dir, "status.json")
