@@ -2,3 +2,4 @@
 /cx.exe
 /dist/
 *.test
+.idea/
