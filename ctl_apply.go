@@ -464,12 +464,12 @@ func applyTurn(ctx context.Context, dir, patchDir, id, host string, since int64,
 			}
 		}
 		plan, planErr := planApply(ctx, store, src, patch, temp, row, *base, since, o.allowConflicts)
-		for _, name := range plan.conflicts {
-			conflicts = append(conflicts, row.Path+"/"+name)
-		}
 		if planErr != nil {
 			failures = errors.Join(failures, fmt.Errorf("%s: %w", row.Path, planErr))
 			continue
+		}
+		for _, name := range plan.conflicts {
+			conflicts = append(conflicts, row.Path+"/"+name)
 		}
 		plans = append(plans, plan)
 	}
