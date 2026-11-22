@@ -614,6 +614,7 @@ func TestWaitKeepsOriginalTurn(t *testing.T) {
 type testRuns struct {
 	t                  *testing.T
 	ctx                context.Context
+	runs               map[string]chan error
 	root, work, prompt string
 }
 
@@ -622,13 +623,14 @@ func newRuns(t *testing.T, mode string) *testRuns {
 	t.Setenv("FIXMODE", mode)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	t.Cleanup(cancel)
-	return &testRuns{t, ctx, root, work, prompt}
+	return &testRuns{t: t, ctx: ctx, runs: map[string]chan error{}, root: root, work: work, prompt: prompt}
 }
 func (h *testRuns) args(id string, extra ...string) []string {
 	return append([]string{"start", "--job", id, "--dir", h.work, "--prompt-file", h.prompt, "--sandbox", "workspace-write", "--network", "--idle-exit", "100ms"}, extra...)
 }
 func (h *testRuns) start(id string, extra ...string) <-chan error {
 	done := make(chan error, 1)
+	h.runs[id] = done
 	go func() { done <- run(h.ctx, h.args(id, extra...)) }()
 	return done
 }
@@ -643,6 +645,14 @@ func (h *testRuns) await(id string, match func(status) bool) status {
 			// A stuck in-process runner is diagnosed from its goroutine stacks.
 			stacks := make([]byte, 1<<20)
 			h.t.Logf("goroutines:\n%s", stacks[:runtime.Stack(stacks, true)])
+			for job, done := range h.runs {
+				select {
+				case e := <-done:
+					h.t.Logf("runner %s already returned: %v", job, e)
+					done <- e
+				default:
+				}
+			}
 			h.t.Fatalf("%s: %+v: %v", id, s, err)
 		}
 	}
