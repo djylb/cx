@@ -17,9 +17,9 @@ import (
 // controller stays the only place they are edited; the receiver dispatches its own
 // jobs from the copy without contacting the source.
 type contextMirror struct {
+	Files  map[string][]byte `json:"files"`
 	Source string            `json:"source"`
 	Roots  []string          `json:"roots"`
-	Files  map[string][]byte `json:"files"`
 }
 
 // mirrorMarker records where a mirrored layer came from.

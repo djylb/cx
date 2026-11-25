@@ -419,10 +419,10 @@ func nodeOutboxAll(ctx context.Context, a []string) error {
 
 // outboxRow is one outbox line kept verbatim; only the fields used for selection are decoded.
 type outboxRow struct {
-	raw    json.RawMessage
+	Time   time.Time `json:"time"`
 	Source string    `json:"source_job"`
 	To     string    `json:"to"`
-	Time   time.Time `json:"time"`
+	raw    json.RawMessage
 }
 
 func appendOutboxRows(rows []outboxRow, data []byte, to string) ([]outboxRow, error) {
