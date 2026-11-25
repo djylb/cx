@@ -50,7 +50,7 @@ func TestJobStorageDoesNotReplaceFiles(t *testing.T) {
 		"ctl_queue.go":       {"queueJob": 1},
 		"ctl_setup.go":       {"receive": 1, "fileHash": 1, "installNode": 2, "upload": 1},
 		"ctl_ssh.go":         {"current": 1, "next": 1},
-		"ctl_submit.go":      {"controllerPolicy": 1, "ctlSubmit": 1, "submitBatch": 1, "attachContext": 1},
+		"ctl_submit.go":      {"controllerPolicy": 1, "ctlSubmit": 1, "submitBatch": 1, "readContextLayer": 1},
 		"facts.go":           {"osVersion": 1, "platformFacts": 3, "fingerprint": 1},
 		"main.go":            {"atomicWriteSync": 2},
 		"snap_freeze.go":     {"snapStage": 1, "snapCapture": 1},

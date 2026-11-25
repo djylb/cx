@@ -94,7 +94,7 @@ Admission checks the host's disk threshold, load check, and available slots. A q
 | `CX_SESSION` | Session label. Fallback order is `CLAUDE_CODE_HOST_SESSION_ID`, `CLAUDE_CODE_SESSION_ID`, then `CODEX_THREAD_ID`. |
 | `CX_PARENT` | Default parent job or session for a submission. Use `--parent` to override it. |
 | `CX_DEFAULT_HOST`, `CX_HOSTS` | Automatic submission host override and comma-separated host selection for multi-host views and waits. |
-| `CX_CONTEXT_DIR`, `CX_POLICY_DIR` | Override project context and policy template directories. Default context is under the projects configuration directory at `PROJECT/context/`; the job gets its copy at `$CX_CONTEXT`. |
+| `CX_CONTEXT_DIR`, `CX_POLICY_DIR` | Override project context and policy template directories. Context merges the shared `context/` next to the projects directory with `PROJECT/context/` (project wins); the job gets its copy at `$CX_CONTEXT`, and a `MEMORY.md` there is named in the preamble. |
 | `CX_SNAPSHOT_STORE`, `CX_HOME` | Override the local snapshot store and the base directory for collected results and the apply log, respectively. |
 | `CX_MODULE`, `CX_SETUP_BINARY` | Source module directory (the directory containing `go.mod` in the public checkout) or a prebuilt node binary for setup. |
 | `CXRUN_PREAMBLE_FILE` | Default first-turn preamble file for direct `cx node start`. |

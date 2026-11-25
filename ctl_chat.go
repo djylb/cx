@@ -148,6 +148,9 @@ func ctlChat(ctx context.Context, hs endpoints, action string, o ctlOptions) err
 		if len(o.pos) != 1 || o.since != "" && o.cursor != "" {
 			return errors.New("chat requires CH and one cursor or offset")
 		}
+		if o.latest && o.cursor != "" {
+			return errors.New("--latest reads a snapshot and takes no cursor")
+		}
 		if o.since != "" {
 			q.Since, e = strconv.ParseInt(o.since, 10, 64)
 			if e != nil || q.Since < 0 {
@@ -196,6 +199,9 @@ func ctlChat(ctx context.Context, hs endpoints, action string, o ctlOptions) err
 	}
 	if e != nil {
 		return e
+	}
+	if o.latest {
+		rows = latestPerAuthor(rows)
 	}
 	enc := json.NewEncoder(os.Stdout)
 	for _, r := range rows {
@@ -405,4 +411,20 @@ func channelCenter(hs endpoints) (endpoint, string, error) {
 	}
 	h, e := hs.get(host)
 	return h, root, e
+}
+
+// latestPerAuthor keeps each author's newest row, in sequence order, so a channel
+// that agents post progress to reads as one line per agent.
+func latestPerAuthor(rows []channelRow) []channelRow {
+	last := map[string]int{}
+	for i, r := range rows {
+		last[r.Author] = i
+	}
+	out := make([]channelRow, 0, len(last))
+	for i, r := range rows {
+		if last[r.Author] == i {
+			out = append(out, r)
+		}
+	}
+	return out
 }

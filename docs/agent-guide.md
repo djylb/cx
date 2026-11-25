@@ -44,6 +44,11 @@ The wait returns one JSON event. Reuse the cursor for the same stream and dedupl
 
 `ls`, `overview`, and `wait --any` use the current [session](reference.md#environment-variables) when detected. Use `--session NAME` or `--all` to change the selection.
 
+## Share memory and progress
+
+- **Memory.** Files in `~/.config/cx/context/` (shared) and `~/.config/cx/projects/PROJECT/context/` (project, wins on name clashes) ship with every agent job as `$CX_CONTEXT`. Keep `MEMORY.md` a short index; agents read it first and open linked files only when relevant. The manager maintains these files: stable rules that hold for every agent, no credentials or host details.
+- **Progress board.** Status, plan step and report outcome need no agent effort: `cx ls --fields brief`. For extra notes, ask agents to `send` one line to `#board` when they start, finish or block, and read it with `cx chat read board --latest` (newest line per agent).
+
 ## Collect, review, and clean up
 
 1. Use `cx result JOB --wait` for the report, `--json` for metadata and artifact paths, or `--log` for the full log. Choose a historical sealed turn with `--turn N`. Without `--wait`, exit 12 means collection is underway. For a full report, add `--full`.

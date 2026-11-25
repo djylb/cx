@@ -33,7 +33,7 @@ type ctlOptions struct {
 	cleanBase, all, explicitSession                                    bool
 	full, json, log, watch, any, wait, raw, refresh, fromStart         bool
 	inplace, interactive, web, hard, network, noNetwork                bool
-	command, reuse, sync, force, noTools, messages                     bool
+	command, reuse, sync, force, noTools, messages, latest             bool
 	incremental, allowConflicts                                        bool
 }
 
@@ -48,7 +48,7 @@ func ctlFlags(op string, o *ctlOptions) *flag.FlagSet {
 		"hard": &o.hard, "network": &o.network, "no-network": &o.noNetwork,
 		"force": &o.force, "sync": &o.sync, "no-tools": &o.noTools,
 		"full": &o.full, "json": &o.json, "log": &o.log, "watch": &o.watch,
-		"messages": &o.messages, "any": &o.any, "wait": &o.wait, "raw": &o.raw, "from-start": &o.fromStart,
+		"messages": &o.messages, "any": &o.any, "wait": &o.wait, "raw": &o.raw, "from-start": &o.fromStart, "latest": &o.latest,
 	}
 	stringsByName := map[string]*string{
 		"type": &o.kind, "mention": &o.mention, "repo": &o.repo,

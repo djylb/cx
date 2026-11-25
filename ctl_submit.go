@@ -415,39 +415,22 @@ func submitBatch(ctx context.Context, hs endpoints, o ctlOptions) error {
 	return first
 }
 
+// attachContext ships context files with the job: the shared layer next to the
+// project definitions, then the project layer, whose files replace same-named shared ones.
 func attachContext(req *jobSubmission, p string, interactive bool) error {
+	base, e := projectDirectory()
+	if e != nil {
+		return e
+	}
 	dir := os.Getenv("CX_CONTEXT_DIR")
 	if dir == "" {
-		base, e := projectDirectory()
-		if e != nil {
-			return e
-		}
 		dir = filepath.Join(base, p, "context")
 	}
 	req.Context = map[string][]byte{}
-	e := filepath.WalkDir(dir, func(path string, d fs.DirEntry, e error) error {
-		if path == dir && os.IsNotExist(e) {
-			return nil
-		}
-		if e != nil {
+	for _, root := range []string{filepath.Join(filepath.Dir(base), "context"), dir} {
+		if e = readContextLayer(root, req.Context); e != nil {
 			return e
 		}
-		if d.IsDir() {
-			return nil
-		}
-		if !d.Type().IsRegular() {
-			return fmt.Errorf("context requires regular files: %s", path)
-		}
-		k, e := filepath.Rel(dir, path)
-		if e != nil {
-			return e
-		}
-		b, e := os.ReadFile(path)
-		req.Context[filepath.ToSlash(k)] = b
-		return e
-	})
-	if e != nil {
-		return e
 	}
 	if len(req.Command) > 0 {
 		return nil
@@ -470,7 +453,37 @@ func attachContext(req *jobSubmission, p string, interactive bool) error {
 	if len(req.Context) > 0 {
 		req.Preamble += "\nProject context is available in $CX_CONTEXT.\n"
 	}
+	if _, ok := req.Context[contextIndex]; ok {
+		req.Preamble += "Read $CX_CONTEXT/" + contextIndex + " before starting; open the files it points to only when relevant.\n"
+	}
 	return nil
+}
+
+// contextIndex is the context file agents read first when it exists.
+const contextIndex = "MEMORY.md"
+
+func readContextLayer(dir string, into map[string][]byte) error {
+	return filepath.WalkDir(dir, func(path string, d fs.DirEntry, e error) error {
+		if path == dir && os.IsNotExist(e) {
+			return nil
+		}
+		if e != nil {
+			return e
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if !d.Type().IsRegular() {
+			return fmt.Errorf("context requires regular files: %s", path)
+		}
+		k, e := filepath.Rel(dir, path)
+		if e != nil {
+			return e
+		}
+		b, e := os.ReadFile(path)
+		into[filepath.ToSlash(k)] = b
+		return e
+	})
 }
 
 func legacyGate(ctx context.Context, args []string) error {
