@@ -323,8 +323,11 @@ func ctlSubmit(ctx context.Context, hs endpoints, op string, o ctlOptions) error
 			return r.output()
 		}
 	}
-	if e = attachContext(&req, p, o.interactive); e != nil {
+	if e = attachContext(&req, p, o.interactive, o.context); e != nil {
 		return e
+	}
+	if jobTools && req.Preamble != "" {
+		req.Preamble = strings.TrimRight(req.Preamble, "\n") + "\n" + jobToolsNote
 	}
 	if !o.inplace {
 		req.Snapshot, e = submitSnapshot(ctx, src, o)
@@ -416,8 +419,13 @@ func submitBatch(ctx context.Context, hs endpoints, o ctlOptions) error {
 }
 
 // attachContext ships context files with the job: the shared layer next to the
-// project definitions, then the project layer, whose files replace same-named shared ones.
-func attachContext(req *jobSubmission, p string, interactive bool) error {
+// project definitions, then the project layer, whose files replace same-named shared
+// ones, and the target host's notes under host/. All layers live only on the controller.
+func attachContext(req *jobSubmission, p string, interactive bool, layers string) error {
+	use, e := contextLayers(layers)
+	if e != nil {
+		return e
+	}
 	base, e := projectDirectory()
 	if e != nil {
 		return e
@@ -427,9 +435,25 @@ func attachContext(req *jobSubmission, p string, interactive bool) error {
 		dir = filepath.Join(base, p, "context")
 	}
 	req.Context = map[string][]byte{}
-	for _, root := range []string{filepath.Join(filepath.Dir(base), "context"), dir} {
-		if e = readContextLayer(root, req.Context); e != nil {
+	config := filepath.Dir(base)
+	for _, layer := range []struct{ name, root string }{{"shared", filepath.Join(config, "context")}, {"project", dir}} {
+		if !use[layer.name] {
+			continue
+		}
+		if e = readContextLayer(layer.root, req.Context); e != nil {
 			return e
+		}
+	}
+	host := map[string][]byte{}
+	if use["host"] {
+		if _, e = jobPath("", req.Host); e != nil {
+			return e
+		}
+		if e = readContextLayer(filepath.Join(config, "hosts", req.Host, "context"), host); e != nil {
+			return e
+		}
+		for k, b := range host {
+			req.Context["host/"+k] = b
 		}
 	}
 	if len(req.Command) > 0 {
@@ -456,8 +480,38 @@ func attachContext(req *jobSubmission, p string, interactive bool) error {
 	if _, ok := req.Context[contextIndex]; ok {
 		req.Preamble += "Read $CX_CONTEXT/" + contextIndex + " before starting; open the files it points to only when relevant.\n"
 	}
+	if _, ok := host[contextIndex]; ok {
+		req.Preamble += "Read $CX_CONTEXT/host/" + contextIndex + " for this host's environment.\n"
+	}
 	return nil
 }
+
+// contextLayers parses --context: a comma list of shared, project and host, or none.
+// The default sends all three.
+func contextLayers(v string) (map[string]bool, error) {
+	use := map[string]bool{"shared": true, "project": true, "host": true}
+	if v == "" {
+		return use, nil
+	}
+	use = map[string]bool{}
+	if v == "none" {
+		return use, nil
+	}
+	for _, name := range strings.Split(v, ",") {
+		switch name {
+		case "shared", "project", "host":
+			use[name] = true
+		default:
+			return nil, fmt.Errorf("invalid --context layer %q (shared, project, host or none)", name)
+		}
+	}
+	return use, nil
+}
+
+// jobToolsNote tells an agent what the job tools reach and how to wait for a
+// manager that may be offline: a blocking ask is bounded by the tool timeout.
+const jobToolsNote = "Job tools: ask (the parent), send (parent, PROJECT/JOB or #CHANNEL; the manager relays channel posts) and inbox. " +
+	"A blocking ask waits only a few minutes. To wait longer for an answer, end the turn with STATUS: QUESTION and the question; the job keeps its state and continues when answered.\n"
 
 // contextIndex is the context file agents read first when it exists.
 const contextIndex = "MEMORY.md"
@@ -480,7 +534,7 @@ func readContextLayer(dir string, into map[string][]byte) error {
 		if e != nil {
 			return e
 		}
-		b, e := os.ReadFile(path)
+		b, e := readSharedFile(path)
 		into[filepath.ToSlash(k)] = b
 		return e
 	})

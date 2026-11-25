@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -337,18 +338,30 @@ func ctlOutbox(ctx context.Context, hs endpoints, o ctlOptions) error {
 	}
 	if o.any && len(o.pos) == 0 {
 		var failed bool
+		var board []outboxRow
 		for _, name := range hs.names() {
 			h, e := hs.get(name)
 			if e == nil {
 				var r reply
 				r, e = h.call(ctx, 30*time.Second, "outbox-all", name, o.project, o.since)
-				if e == nil {
+				if e == nil && r.code == 0 && (o.to != "" || o.latest) {
+					board, e = appendOutboxRows(board, r.data, o.to)
+				} else if e == nil {
 					e = r.output()
 				}
 			}
 			if e != nil {
 				diagnosticf("%v %v\n", name, e)
 				failed = true
+			}
+		}
+		if o.latest {
+			board = latestPerJob(board)
+		}
+		enc := json.NewEncoder(os.Stdout)
+		for _, row := range board {
+			if e := enc.Encode(row.raw); e != nil {
+				return e
 			}
 		}
 		if failed {
@@ -402,4 +415,49 @@ func nodeOutboxAll(ctx context.Context, a []string) error {
 			}{Source: a[0] + ":" + id, agentMail: m})
 		})
 	})
+}
+
+// outboxRow is one outbox line kept verbatim; only the fields used for selection are decoded.
+type outboxRow struct {
+	raw    json.RawMessage
+	Source string    `json:"source_job"`
+	To     string    `json:"to"`
+	Time   time.Time `json:"time"`
+}
+
+func appendOutboxRows(rows []outboxRow, data []byte, to string) ([]outboxRow, error) {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	for dec.More() {
+		var raw json.RawMessage
+		if e := dec.Decode(&raw); e != nil {
+			return rows, e
+		}
+		var row outboxRow
+		if e := json.Unmarshal(raw, &row); e != nil {
+			return rows, e
+		}
+		if to == "" || row.To == to {
+			row.raw = raw
+			rows = append(rows, row)
+		}
+	}
+	return rows, nil
+}
+
+// latestPerJob keeps each job's newest message, oldest first, so progress notes read as a board.
+func latestPerJob(rows []outboxRow) []outboxRow {
+	last := map[string]int{}
+	for i, r := range rows {
+		if j, ok := last[r.Source]; !ok || !rows[j].Time.After(r.Time) {
+			last[r.Source] = i
+		}
+	}
+	out := make([]outboxRow, 0, len(last))
+	for i := range rows {
+		if last[rows[i].Source] == i {
+			out = append(out, rows[i])
+		}
+	}
+	sort.SliceStable(out, func(a, b int) bool { return out[a].Time.Before(out[b].Time) })
+	return out
 }

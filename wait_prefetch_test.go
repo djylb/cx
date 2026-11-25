@@ -22,7 +22,7 @@ func TestWaitPrefetchesResult(t *testing.T) {
 	t.Setenv("CX_POLICY_DIR", f.home)
 	t.Setenv("CX_CONTEXT_DIR", t.TempDir())
 	t.Setenv("FIXMODE", "sealed-patches")
-	t.Setenv("FIXPROMPT", "Fixture\n\ntask")
+	t.Setenv("FIXPROMPT", "Fixture\n"+strings.TrimRight(jobToolsNote, "\n")+"\n\ntask")
 	if err := os.WriteFile(filepath.Join(f.home, "preamble.md"), []byte("Fixture"), 0600); err != nil {
 		t.Fatal(err)
 	}

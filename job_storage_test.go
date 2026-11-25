@@ -15,12 +15,14 @@ func TestJobStorageDoesNotReplaceFiles(t *testing.T) {
 	// snapshot storage, and publication/cleanup of whole directories.
 	allowed := map[string]map[string]int{
 		// These records are private cache maintenance metadata outside all job directories.
-		"build_cache.go":         {"prepareCaches": 1, "prepareCacheEntry": 1, "scanCaches": 1, "startCachedCommand": 1},
-		"main.go":                {"atomicWrite": 1, "atomicWriteSync": 1, "writeJSON": 1, "detachCleanJob": 1},
-		"ctl_apply.go":           {"installPlans": 2, "applyTurn": 2},
-		"ctl_baseline.go":        {"rebaseTurn": 1},
-		"ctl_center.go":          {"freezeCompilerSource": 2, "compileSnapshot": 1},
-		"ctl_chat.go":            {"ctlChat": 1},
+		"build_cache.go":  {"prepareCaches": 1, "prepareCacheEntry": 1, "scanCaches": 1, "startCachedCommand": 1},
+		"main.go":         {"atomicWrite": 1, "atomicWriteSync": 1, "writeJSON": 1, "detachCleanJob": 1},
+		"ctl_apply.go":    {"installPlans": 2, "applyTurn": 2},
+		"ctl_baseline.go": {"rebaseTurn": 1},
+		"ctl_center.go":   {"freezeCompilerSource": 2, "compileSnapshot": 1},
+		"ctl_chat.go":     {"ctlChat": 1},
+		// Controller configuration mirrors, outside every job directory.
+		"ctl_context.go":         {"writeConfigFile": 1},
 		"ctl_deploy.go":          {"configRelease": 1, "rememberPlatformVersion": 1, "cacheArtifact": 1, "cacheNode": 1},
 		"ctl_follow.go":          {"follow": 1},
 		"ctl_incremental.go":     {"incrementalResult": 1},
@@ -50,7 +52,7 @@ func TestJobStorageDoesNotReplaceFiles(t *testing.T) {
 		"ctl_queue.go":       {"queueJob": 1},
 		"ctl_setup.go":       {"receive": 1, "fileHash": 1, "installNode": 2, "upload": 1},
 		"ctl_ssh.go":         {"current": 1, "next": 1},
-		"ctl_submit.go":      {"controllerPolicy": 1, "ctlSubmit": 1, "submitBatch": 1, "readContextLayer": 1},
+		"ctl_submit.go":      {"controllerPolicy": 1, "ctlSubmit": 1, "submitBatch": 1},
 		"facts.go":           {"osVersion": 1, "platformFacts": 3, "fingerprint": 1},
 		"main.go":            {"atomicWriteSync": 2},
 		"snap_freeze.go":     {"snapStage": 1, "snapCapture": 1},

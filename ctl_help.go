@@ -14,7 +14,7 @@ type ctlCommand struct {
 	usage, summary, flags string
 }
 
-const submitFlags = "profile engine model effort sandbox role parent snapshot with-history input-json image idle-exit turn-timeout approval-timeout stall queue-timeout inplace interactive web-search hard network no-network force sync no-tools clean-base"
+const submitFlags = "profile engine model effort sandbox role parent snapshot with-history input-json image idle-exit turn-timeout approval-timeout stall queue-timeout inplace interactive web-search hard network no-network force sync no-tools clean-base context"
 
 var ctlCommands = map[string]ctlCommand{
 	"agent":        {"[--host HOST] [--dir DIR] TEXT|@FILE|-\n  cx agent --continue JOB TEXT|@FILE|-", "Submit or continue an agent and read its report.", submitFlags + " dir host tag continue full"},
@@ -38,6 +38,7 @@ var ctlCommands = map[string]ctlCommand{
 	"history":      {"JOB [read|turns|items]", "Read agent thread history.", ""},
 	"host":         {"HOST", "Read or update node configuration.", "set"},
 	"hosts":        {"[HOST]", "Print current execution host facts.", ""},
+	"context":      {"push HOST", "Copy this controller's context layers to HOST for a manager running there.", ""},
 	"interrupt":    {"JOB", "Stop an active turn or command.", ""},
 	"limits":       {"JOB", "Read the engine account's rate limits.", ""},
 	"ls":           {"[JOB]", "List jobs.", "json watch interval project session role all all-hosts max-bytes"},
@@ -45,7 +46,7 @@ var ctlCommands = map[string]ctlCommand{
 	"mirror":       {"[DIR | --project PROJECT]", "Publish a source baseline.", "project"},
 	"models":       {"JOB", "List the engine's available models.", ""},
 	"node":         {"COMMAND [ARGS ...]", "Run an execution-node command.", ""},
-	"outbox":       {"JOB [--since N]\n  cx outbox --any [--project PROJECT] [--since N]", "Read job messages after a sequence.", "any project since"},
+	"outbox":       {"JOB [--since N]\n  cx outbox --any [--project PROJECT] [--since N] [--to TARGET] [--latest]", "Read job messages after a sequence.", "any project since to latest"},
 	"overview":     {"", "Summarize jobs and project channels.", "json project session all max-bytes"},
 	"patch":        {"JOB", "Show collected patch statistics or contents.", "turn incremental full repo max-bytes"},
 	"plan":         {"JOB", "Read recorded plan events.", ""},
@@ -209,7 +210,9 @@ var ctlFlagDescriptions = map[string]string{
 	"dir": "source `DIR` (defaults to the current directory)", "effort": "reasoning `LEVEL` (engine default, or high with --hard)",
 	"engine": "agent `ENGINE`: " + strings.Join(engineNames(), " or ") + " (default " + defaultEngine + ")", "env": "set `NAME=VALUE` (repeatable)",
 	"messages": "follow complete agent messages from the event log",
-	"latest":   "print only the newest message from each author, oldest first (a status board)",
+	"context":  "context `LAYERS` sent to the agent: comma list of shared, project, host, or none (defaults to all)",
+	"latest":   "print only the newest message from each author or job, oldest first (a status board)",
+	"to":       "keep messages addressed to `TARGET` (parent, PROJECT/JOB or #CHANNEL)",
 	"force":    "bypass duplicate detection", "from-start": "follow from the beginning, resetting any saved cursor",
 	"full": "show full output", "hard": "use high reasoning effort",
 	"host":  "limit to one or more `HOST` values (repeatable, defaults to all configured hosts)",

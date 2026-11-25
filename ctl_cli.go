@@ -21,20 +21,20 @@ import (
 )
 
 type ctlOptions struct {
-	env                                                                map[string]string
-	project, session, tag, cwd, dir, host                              string
-	engine, model, effort, sandbox, role, parent                       string
-	batch, snapshot, history, previous, input, profile                 string
-	quiet, timeout, idle, turnLimit, approval, stall, queue            string
-	turn, sinceTurn, cursor, since, kind, mention, repo, script, shell string
-	hosts, channels, sets, argv, pos, images                           []string
-	interval                                                           time.Duration
-	max                                                                int
-	cleanBase, all, explicitSession                                    bool
-	full, json, log, watch, any, wait, raw, refresh, fromStart         bool
-	inplace, interactive, web, hard, network, noNetwork                bool
-	command, reuse, sync, force, noTools, messages, latest             bool
-	incremental, allowConflicts                                        bool
+	env                                                                             map[string]string
+	project, session, tag, cwd, dir, host                                           string
+	engine, model, effort, sandbox, role, parent                                    string
+	batch, snapshot, history, previous, input, profile                              string
+	quiet, timeout, idle, turnLimit, approval, stall, queue                         string
+	turn, sinceTurn, cursor, since, kind, mention, repo, script, shell, context, to string
+	hosts, channels, sets, argv, pos, images                                        []string
+	interval                                                                        time.Duration
+	max                                                                             int
+	cleanBase, all, explicitSession                                                 bool
+	full, json, log, watch, any, wait, raw, refresh, fromStart                      bool
+	inplace, interactive, web, hard, network, noNetwork                             bool
+	command, reuse, sync, force, noTools, messages, latest                          bool
+	incremental, allowConflicts                                                     bool
 }
 
 func ctlFlags(op string, o *ctlOptions) *flag.FlagSet {
@@ -61,7 +61,7 @@ func ctlFlags(op string, o *ctlOptions) *flag.FlagSet {
 		"script": &o.script, "shell": &o.shell, "project": &o.project,
 		"session": &o.session, "tag": &o.tag, "cwd": &o.cwd,
 		"timeout": &o.timeout, "quiet-timeout": &o.quiet, "turn": &o.turn,
-		"cursor": &o.cursor, "since": &o.since, "since-turn": &o.sinceTurn,
+		"cursor": &o.cursor, "since": &o.since, "since-turn": &o.sinceTurn, "context": &o.context, "to": &o.to,
 	}
 	const defaultPreviewBytes = 8192
 	o.max = defaultPreviewBytes
@@ -311,6 +311,9 @@ func controller(ctx context.Context, a []string) error {
 	}
 	if op == "project" {
 		return ctlProject(ctx, a[1:])
+	}
+	if op == "context" {
+		return ctlContext(ctx, a[1:])
 	}
 	if op == "version" {
 		if len(a) != 1 {

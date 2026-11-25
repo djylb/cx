@@ -46,8 +46,14 @@ The wait returns one JSON event. Reuse the cursor for the same stream and dedupl
 
 ## Share memory and progress
 
-- **Memory.** Files in `~/.config/cx/context/` (shared) and `~/.config/cx/projects/PROJECT/context/` (project, wins on name clashes) ship with every agent job as `$CX_CONTEXT`. Keep `MEMORY.md` a short index; agents read it first and open linked files only when relevant. The manager maintains these files: stable rules that hold for every agent, no credentials or host details.
-- **Progress board.** Status, plan step and report outcome need no agent effort: `cx ls --fields brief`. For extra notes, ask agents to `send` one line to `#board` when they start, finish or block, and read it with `cx chat read board --latest` (newest line per agent).
+- **Memory.** The dispatching controller sends three context layers with every agent job as `$CX_CONTEXT`: shared `~/.config/cx/context/`, project `~/.config/cx/projects/PROJECT/context/` (wins on name clashes) and host `~/.config/cx/hosts/HOST/context/` (as `host/`). Keep each `MEMORY.md` a short index; agents read it first and open linked files only when relevant. Only the manager edits these files; agents propose changes by sending them to the parent.
+- **Sub-managers.** A manager running on another host dispatches from its own `~/.config/cx/`. Before handing work to it, run `cx context push HOST` to copy this controller's layers there; the copy is read-only (marked `.mirror.json`), so changes go back through the parent and are pushed again. Its own extra project layers are left untouched.
+- **Opting out.** Use `--context project`, `--context shared,host` or `--context none` on `run` and `agent` to start a job without some or all layers.
+- **Progress board.** Status, plan step and report outcome need no agent effort: `cx ls --fields brief`. For extra notes, ask agents to `send` one line to `#board` when they start, finish or block, and read `cx outbox --any --to '#board' --latest` (newest line per job).
+
+## Work while the manager is away
+
+Jobs run on their hosts without the controller: a dispatched job needs no connection back to finish, and its state stays on the node. An agent that needs an answer ends its turn with `STATUS: QUESTION`; the job keeps its thread and continues when the manager replies with `cx say`. After reconnecting, `cx wait --any` (or `cx ls`) reports what finished or is waiting.
 
 ## Collect, review, and clean up
 

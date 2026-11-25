@@ -272,6 +272,11 @@ func nodeCLI(ctx context.Context, args []string) error {
 				return continueNode(ctx, args[1], args[2], args[3], args[4])
 			}
 			return errors.New("invalid continue arguments")
+		case "context-put":
+			if len(args) == 2 {
+				return nodeContextPut(args[1])
+			}
+			return errors.New("invalid context push")
 		case "mirror-refs":
 			if len(args) == 3 {
 				return mirrorRefs(ctx, args[1], args[2])

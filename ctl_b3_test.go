@@ -231,7 +231,7 @@ func TestB3InteractiveContinuation(t *testing.T) {
 		t.Fatal(e)
 	}
 	t.Setenv("CX_CONTEXT_DIR", ctxDir)
-	t.Setenv("FIXPROMPT", "Workflow\nProject context is available in $CX_CONTEXT.\n\ntask")
+	t.Setenv("FIXPROMPT", "Workflow\nProject context is available in $CX_CONTEXT.\n"+strings.TrimRight(jobToolsNote, "\n")+"\n\ntask")
 	out := cliOutput(t, 6, nil, f.cx, "agent", "--host", "local", "--dir", src, "--inplace", "--interactive", "--tag", "conversation", "--idle-exit", "5s", "task")
 	defer cliOutput(t, 0, nil, f.cx, "close", "local:p/conversation")
 	if !bytes.Contains(out, []byte("STATUS: QUESTION")) || !bytes.Contains(out, []byte("JOB=p/conversation STATUS=QUESTION")) {

@@ -18,6 +18,16 @@ import (
 
 // The subprocess fixture exercises real pipes, files and locks. It needs no model account.
 func TestMain(m *testing.M) {
+	// Keep the controller configuration (context layers, projects) of the machine
+	// running the tests out of every test; tests that need it set their own.
+	if os.Getenv("CX_TEST_CONFIG") == "" {
+		dir, err := os.MkdirTemp("", "cx-test-config-")
+		if err != nil {
+			panic(err)
+		}
+		_ = os.Setenv("CX_TEST_CONFIG", dir)
+		_ = os.Setenv("XDG_CONFIG_HOME", dir)
+	}
 	// Tests that exercise the disk watermark set min_free_bytes explicitly.
 	defaultMinFreeBytes, defaultMinFreeDivisor = 0, 0
 	trackFixtureWorkerStarts()
