@@ -205,6 +205,11 @@ func ctlSubmit(ctx context.Context, hs endpoints, op string, o ctlOptions) error
 	if e != nil {
 		return e
 	}
+	if h.Manager {
+		if e = pushContext(ctx, h, host, false); e != nil {
+			return fmt.Errorf("refresh context copy on %s: %w", host, e)
+		}
+	}
 	src, e = filepath.Abs(src)
 	if e != nil {
 		return e
@@ -511,7 +516,8 @@ func contextLayers(v string) (map[string]bool, error) {
 // jobToolsNote tells an agent what the job tools reach and how to wait for a
 // manager that may be offline: a blocking ask is bounded by the tool timeout.
 const jobToolsNote = "Job tools: ask (the parent), send (parent, PROJECT/JOB or #CHANNEL; the manager relays channel posts) and inbox. " +
-	"A blocking ask waits only a few minutes. To wait longer for an answer, end the turn with STATUS: QUESTION and the question; the job keeps its state and continues when answered.\n"
+	"A blocking ask waits only a few minutes. To wait longer for an answer, end the turn with STATUS: QUESTION and the question; the job keeps its state and continues when answered. " +
+	"$CX_CONTEXT is a read-only copy: to add or change shared memory (for example host tools or environment you discovered), send the proposed text to the parent, which decides.\n"
 
 // contextIndex is the context file agents read first when it exists.
 const contextIndex = "MEMORY.md"

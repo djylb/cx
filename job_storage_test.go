@@ -22,7 +22,7 @@ func TestJobStorageDoesNotReplaceFiles(t *testing.T) {
 		"ctl_center.go":   {"freezeCompilerSource": 2, "compileSnapshot": 1},
 		"ctl_chat.go":     {"ctlChat": 1},
 		// Controller configuration mirrors, outside every job directory.
-		"ctl_context.go":         {"writeConfigFile": 1},
+		"ctl_context.go":         {"writeConfigFile": 1, "pushContext": 1},
 		"ctl_deploy.go":          {"configRelease": 1, "rememberPlatformVersion": 1, "cacheArtifact": 1, "cacheNode": 1},
 		"ctl_follow.go":          {"follow": 1},
 		"ctl_incremental.go":     {"incrementalResult": 1},

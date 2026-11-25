@@ -160,3 +160,19 @@ func TestContextMirrorPut(t *testing.T) {
 		t.Fatal("escaping root accepted")
 	}
 }
+
+func TestMirrorDigest(t *testing.T) {
+	a := contextMirror{Roots: []string{"context"}, Files: map[string][]byte{"context/a": []byte("1"), "context/b": []byte("2")}}
+	b := contextMirror{Roots: []string{"context"}, Files: map[string][]byte{"context/b": []byte("2"), "context/a": []byte("1")}}
+	if mirrorDigest(a) != mirrorDigest(b) {
+		t.Fatal("digest depends on map order")
+	}
+	b.Files["context/b"] = []byte("3")
+	if mirrorDigest(a) == mirrorDigest(b) {
+		t.Fatal("content change not detected")
+	}
+	c := contextMirror{Roots: []string{"context", "hosts/h/context"}, Files: a.Files}
+	if mirrorDigest(a) == mirrorDigest(c) {
+		t.Fatal("removed root not detected")
+	}
+}

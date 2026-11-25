@@ -27,12 +27,15 @@ type ctlExit int
 func (e ctlExit) Error() string { return fmt.Sprintf("exit %d", e) }
 
 type endpoint struct {
-	relay     *endpoint
-	Via       string `toml:"via"`
-	SSH       string `toml:"ssh"`
-	CX        string `toml:"cx"`
-	State     string `toml:"state"`
-	Platform  string `toml:"platform"`
+	relay    *endpoint
+	Via      string `toml:"via"`
+	SSH      string `toml:"ssh"`
+	CX       string `toml:"cx"`
+	State    string `toml:"state"`
+	Platform string `toml:"platform"`
+	// Manager marks a host that runs its own managing session: submissions to it
+	// first bring its read-only copy of the context layers up to date.
+	Manager   bool `toml:"manager"`
 	defaultCX bool
 }
 type endpoints map[string]endpoint

@@ -70,6 +70,12 @@ func ctlContext(ctx context.Context, a []string) error {
 	if e != nil {
 		return e
 	}
+	return pushContext(ctx, h, a[1], true)
+}
+
+// pushContext copies the controller's context layers to name. Unless forced it
+// skips the transfer when the content matches the last copy pushed from here.
+func pushContext(ctx context.Context, h endpoint, name string, force bool) error {
 	config, e := configRoot()
 	if e != nil {
 		return e
@@ -78,7 +84,7 @@ func ctlContext(ctx context.Context, a []string) error {
 	if e != nil {
 		return e
 	}
-	m := contextMirror{Files: map[string][]byte{}}
+	m := contextMirror{Files: map[string][]byte{}, Roots: roots}
 	m.Source, _ = os.Hostname()
 	for _, root := range roots {
 		layer := map[string][]byte{}
@@ -90,7 +96,17 @@ func ctlContext(ctx context.Context, a []string) error {
 			m.Files[root+"/"+k] = b
 		}
 	}
-	m.Roots = roots
+	digest := mirrorDigest(m)
+	home, e := os.UserHomeDir()
+	if e != nil {
+		return e
+	}
+	stamp := filepath.Join(home, ".cache", "cx", "context-push", name)
+	if !force {
+		if old, readErr := readSharedFile(stamp); readErr == nil && string(old) == digest {
+			return nil
+		}
+	}
 	b, e := json.Marshal(m)
 	if e != nil {
 		return e
@@ -99,7 +115,37 @@ func ctlContext(ctx context.Context, a []string) error {
 	if e != nil {
 		return e
 	}
-	return r.output()
+	if r.code != 0 {
+		return r.output()
+	}
+	if e = os.MkdirAll(filepath.Dir(stamp), 0o700); e != nil {
+		return e
+	}
+	if e = atomicWrite(stamp, []byte(digest)); e != nil {
+		return e
+	}
+	if force {
+		_, e = os.Stdout.Write(r.data)
+	}
+	return e
+}
+
+// mirrorDigest identifies a mirror's roots and file contents.
+func mirrorDigest(m contextMirror) string {
+	sum := sha256.New()
+	keys := make([]string, 0, len(m.Files))
+	for k := range m.Files {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, root := range m.Roots {
+		_, _ = fmt.Fprintf(sum, "root %s\n", root)
+	}
+	for _, k := range keys {
+		_, _ = fmt.Fprintf(sum, "file %s %d\n", k, len(m.Files[k]))
+		sum.Write(m.Files[k])
+	}
+	return fmt.Sprintf("%x", sum.Sum(nil))
 }
 
 // nodeContextPut replaces each pushed layer directory with the pushed files.
