@@ -92,7 +92,7 @@ func jobWaitPoll(h endpoint, name, file string, req waitPollRequest) func(contex
 			if result.Row != nil {
 				return waitDelivery{}, waitUnavailable{errors.New("unexpected event during cursor initialization")}
 			}
-			_, err = updateWaitCursor(ctx, file, nil, result.Cursor)
+			_, _, err = updateWaitCursor(ctx, file, nil, result.Cursor, nil)
 			return waitDelivery{}, err
 		}
 		if result.Row == nil {
@@ -185,31 +185,44 @@ func waitForAny(ctx context.Context, sources []*waitSource, out io.Writer, warn 
 		delivery waitDelivery
 	}
 	results := make(chan watched, len(sources))
-	for _, s := range sources {
+	start := func(s *waitSource) {
 		workers.Go(func() {
 			delivery, err := s.watch(ctx, warn)
 			results <- watched{err: err, source: s, delivery: delivery}
 		})
 	}
-	select {
-	case result := <-results:
-		if result.err == nil && ctx.Err() == nil {
+	for _, s := range sources {
+		start(s)
+	}
+	for ctx.Err() == nil {
+		select {
+		case <-ctx.Done():
+		case result := <-results:
+			if ctx.Err() != nil {
+				break
+			}
+			if result.err != nil {
+				return result.err
+			}
 			d := result.delivery
-			if err := json.NewEncoder(out).Encode(d.row); err != nil {
+			_, advanced, err := updateWaitCursor(ctx, result.source.file, d.before, d.cursor, func() error {
+				return json.NewEncoder(out).Encode(d.row)
+			})
+			if err != nil {
+				if cause := ctx.Err(); cause != nil && errors.Is(err, cause) {
+					break
+				}
 				return err
 			}
-			if _, err := updateWaitCursor(ctx, result.source.file, d.before, d.cursor); err != nil {
-				return err
+			if !advanced {
+				start(result.source)
+				continue
 			}
 			if d.code != 0 {
 				return ctlExit(d.code)
 			}
 			return nil
 		}
-		if ctx.Err() == nil {
-			return result.err
-		}
-	case <-ctx.Done():
 	}
 	if !errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return ctx.Err()

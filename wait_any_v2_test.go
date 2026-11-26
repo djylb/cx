@@ -283,11 +283,14 @@ func TestWaitAnyConcurrentCursorNeverRegresses(t *testing.T) {
 	if err := atomicWrite(path, old); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := updateWaitCursor(t.Context(), path, old, latest); err != nil {
+	if _, advanced, err := updateWaitCursor(t.Context(), path, old, latest, nil); err != nil || !advanced {
 		t.Fatal(err)
 	}
-	got, err := updateWaitCursor(t.Context(), path, old, []byte("{\"stale\":true}"))
-	if err != nil || !bytes.Equal(got, latest) {
+	got, advanced, err := updateWaitCursor(t.Context(), path, old, []byte("{\"stale\":true}"), func() error {
+		t.Fatal("emitted a stale event")
+		return nil
+	})
+	if err != nil || advanced || !bytes.Equal(got, latest) {
 		t.Fatalf("stale delivery moved cursor to %s (%v)", got, err)
 	}
 }

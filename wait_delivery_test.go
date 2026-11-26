@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func waitFixture(t *testing.T, root, id string, s status) *runner {
@@ -34,6 +36,116 @@ func waitFixture(t *testing.T, root, id string, s status) *runner {
 	r := &runner{dir: dir, c: c, s: s, ctx: t.Context()}
 	startFixtureWriter(t, r)
 	return r
+}
+
+func TestWaitAnyFollowupIgnoresCompletionInNewStatusFrame(t *testing.T) {
+	ctx, cancel := fixtureContext(t)
+	defer cancel()
+	root := t.TempDir()
+	t.Setenv("CXRUN_STATE", root)
+	r := waitFixture(t, root, "j", status{Job: "j", RunID: "followup", Engine: "codex", State: "waiting",
+		Finished: 1, Turn: "one", LastCompleted: "one", CompletedStatus: "completed"})
+	if err := run(ctx, []string{"say", "--job", "j", "second round"}); err != nil {
+		t.Fatal(err)
+	}
+	baseline := make(map[string]waitCursor)
+	ticks, done := startFixtureWaitAny(t, ctx, root, "", "", baseline)
+	// An ordinary status update still carries the first completion while
+	// the follow-up is pending. Publish it after the observer has seeded.
+	if err := r.save(); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		select {
+		case early := <-done:
+			t.Fatalf("reported the previous turn during follow-up: %+v (%v)", early.report, early.err)
+		case ticks <- time.Time{}:
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		}
+	}
+	r.s.Finished, r.s.Turn, r.s.LastCompleted = 2, "two", "two"
+	if err := r.save(); err != nil {
+		t.Fatal(err)
+	}
+	var got fixtureWaitAnswer
+	select {
+	case got = <-done:
+	case ticks <- time.Time{}:
+		select {
+		case got = <-done:
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	if got.err != nil || got.report == nil || got.report.Event != "completion" || got.report.Turn != 2 || baseline["j"].Finished != 2 {
+		t.Fatalf("wanted the new turn: %+v (%v), cursor %+v", got.report, got.err, baseline)
+	}
+	assertNoWaitAnyEvent(t, ctx, root, "", "", baseline)
+}
+
+func TestWaitAnyConcurrentDeliveryRepollsAfterFollowup(t *testing.T) {
+	f := newControllerFixture(t)
+	ctx, cancel := fixtureContext(t)
+	defer cancel()
+	root := os.Getenv("CXRUN_STATE")
+	const job = "p/job"
+	r := waitFixture(t, root, job, status{Project: "p", Job: "job", RunID: "shared", Engine: "codex", State: "waiting",
+		Finished: 1, Turn: "one", LastCompleted: "one", CompletedStatus: "completed"})
+	file := filepath.Join(f.home, "shared.json")
+	if err := atomicWrite(file, []byte("{}")); err != nil {
+		t.Fatal(err)
+	}
+	req := waitPollRequest{Projects: []string{"p"}, Limit: waitPollInterval}
+	poll := jobWaitPoll(endpoint{State: root}, "local", file, req)
+	first, err := poll(ctx)
+	if err != nil || first.row == nil {
+		t.Fatalf("first poll: %+v (%v)", first, err)
+	}
+	second, err := poll(ctx)
+	if err != nil || second.row == nil || !bytes.Equal(first.before, second.before) {
+		t.Fatalf("second poll: %+v (%v)", second, err)
+	}
+	deliver := func(candidate waitDelivery) waitReport {
+		t.Helper()
+		source := &waitSource{file: file, label: "local", jobHost: true, poll: func(ctx context.Context) (waitDelivery, error) {
+			if candidate.row != nil {
+				event := candidate
+				candidate = waitDelivery{}
+				return event, nil
+			}
+			return poll(ctx)
+		}}
+		var out bytes.Buffer
+		if err := waitForAny(ctx, []*waitSource{source}, &out, diagnosticf); err != nil {
+			t.Fatal(err)
+		}
+		var got waitReport
+		if err := json.Unmarshal(out.Bytes(), &got); err != nil || got.Event != "completion" || got.EventID == "" {
+			t.Fatalf("unexpected output: %s (%v)", &out, err)
+		}
+		return got
+	}
+	one := deliver(first)
+	if one.Turn != 1 {
+		t.Fatalf("unexpected first completion: %+v", one)
+	}
+	cliOutput(t, 0, nil, f.cx, "node", "say", "--job", job, "second round")
+	r.s.Finished, r.s.Turn, r.s.LastCompleted = 2, "two", "two"
+	if err := r.save(); err != nil {
+		t.Fatal(err)
+	}
+	two := deliver(second)
+	if two.Turn != 2 || two.EventID == one.EventID {
+		t.Fatalf("stale poll replayed the previous turn: first %+v, second %+v", one, two)
+	}
+	var saved map[string]waitCursor
+	if err := readJSON(file, &saved); err != nil || saved[job].Finished != 2 {
+		t.Fatalf("cursor after follow-up: %+v (%v)", saved, err)
+	}
+	assertNoWaitAnyEvent(t, ctx, root, "p", "", saved)
 }
 
 func TestWaitAnyWithdrawalBetweenCallsAndTurnsBeforeTerminal(t *testing.T) {
@@ -208,12 +320,14 @@ func TestWaitAnySinceFileLockCoversOutput(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal(ctx.Err())
 	}
-	lock, err := lockPath(file+".lock", os.O_CREATE)
-	if err != nil || lock != nil {
-		if lock != nil {
-			closeBestEffort(lock)
+	for _, suffix := range []string{".lock", ".update"} {
+		lock, err := lockPath(file+suffix, os.O_CREATE)
+		if err != nil || lock != nil {
+			if lock != nil {
+				closeBestEffort(lock)
+			}
+			t.Fatalf("cursor lock %s released before stdout and commit: %v", suffix, err)
 		}
-		t.Fatalf("cursor lock released before stdout and commit: %v", err)
 	}
 	release <- struct{}{}
 	select {

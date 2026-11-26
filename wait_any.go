@@ -119,25 +119,33 @@ func readWaitCursorFile(path string) ([]byte, error) {
 	return b, err
 }
 
-// Compare under a short lock. A concurrent delivery may have moved the
-// cursor already, in which case the caller's event can be replayed.
-func updateWaitCursor(ctx context.Context, path string, before, next []byte) ([]byte, error) {
+// Compare, deliver and advance under the same lock. A stale candidate must
+// be selected again from the current cursor before it can be delivered.
+func updateWaitCursor(ctx context.Context, path string, before, next []byte, output func() error) (current []byte, advanced bool, err error) {
 	lock, err := lockUntil(ctx, path+".update")
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	defer closeBestEffort(lock)
-	current, err := readWaitCursorFile(path)
+	current, err = readWaitCursorFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("write wait baseline: %w", err)
+		return nil, false, fmt.Errorf("write wait baseline: %w", err)
 	}
 	if (current == nil) != (before == nil) || !bytes.Equal(current, before) {
-		return current, nil
+		return current, false, nil
+	}
+	if err = ctx.Err(); err != nil {
+		return nil, false, err
+	}
+	if output != nil {
+		if err = output(); err != nil {
+			return nil, false, err
+		}
 	}
 	if err = atomicWrite(path, next); err != nil {
-		return nil, fmt.Errorf("write wait baseline: %w", err)
+		return nil, false, fmt.Errorf("write wait baseline: %w", err)
 	}
-	return next, nil
+	return next, true, nil
 }
 
 // Holding a shared lock registers this observer without excluding its peers.
@@ -160,7 +168,7 @@ func registerWaitObserver(ctx context.Context, path, label string) (*os.File, er
 		return nil, errors.New("could not register wait observer")
 	}
 	if err == nil && probe == nil {
-		diagnosticf("cx wait --any: another process is waiting on %s; events may repeat\n", label)
+		diagnosticf("cx wait --any: another process is waiting on %s\n", label)
 	}
 	return observer, err
 }
@@ -252,72 +260,88 @@ func waitAny(ctx context.Context, root string, projects []string, session, since
 			err = errObserveTimeout
 		}
 	}()
-	var baseline map[string]waitCursor
-	var saved []byte
 	if sinceFile != "" {
 		lock, lockErr := registerWaitObserver(ctx, sinceFile+".lock", fmt.Sprintf("cursor file %q", sinceFile))
 		if lockErr != nil {
 			return lockErr
 		}
 		defer closeBestEffort(lock)
-		saved, err = readWaitCursorFile(sinceFile)
-		if err != nil {
-			return fmt.Errorf("read wait baseline: %w", err)
-		}
-	}
-	if saved == nil && (sinceFile != "" || fromStart) {
-		baseline, err = initialWaitBaseline(ctx, root, projects, session, fromStart)
-		if err != nil {
-			return err
-		}
-		if sinceFile != "" {
-			b, marshalErr := json.Marshal(baseline)
-			if marshalErr != nil {
-				return marshalErr
-			}
-			saved, err = updateWaitCursor(ctx, sinceFile, nil, b)
-			if err != nil {
-				return err
-			}
-		}
-	}
-	if saved != nil {
-		baseline, err = decodeWaitBaseline(saved)
-		if err != nil {
-			return err
-		}
 	}
 	emit := func(row *waitReport) error {
 		row.setNext("local")
 		return json.NewEncoder(out).Encode(row)
 	}
-	tick := timeshim.NewTicker(timeshim.Or(contextClock(ctx)), time.Second)
-	defer tick.Stop()
-	report, err := selectWaitAny(ctx, root, projects, session, baseline, tick.C, emit)
+	baseline, saved, err := loadWaitBaseline(ctx, root, projects, session, sinceFile, fromStart)
 	if err != nil {
 		return err
 	}
-	if baseline != nil {
-		if err = emit(report); err != nil {
+	tick := timeshim.NewTicker(timeshim.Or(contextClock(ctx)), time.Second)
+	defer tick.Stop()
+	for {
+		report, err := selectWaitAny(ctx, root, projects, session, baseline, tick.C, emit)
+		if err != nil {
 			return err
 		}
+		if sinceFile != "" {
+			next, marshalErr := json.Marshal(baseline)
+			if marshalErr != nil {
+				return marshalErr
+			}
+			var advanced bool
+			_, advanced, err = updateWaitCursor(ctx, sinceFile, saved, next, func() error { return emit(report) })
+			if err != nil {
+				return err
+			}
+			if !advanced {
+				baseline, saved, err = loadWaitBaseline(ctx, root, projects, session, sinceFile, fromStart)
+				if err != nil {
+					return err
+				}
+				continue
+			}
+		} else if baseline != nil {
+			if err = emit(report); err != nil {
+				return err
+			}
+		}
+		switch report.Code {
+		case 6:
+			return errQuestion
+		case exitQueued:
+			return ctlExit(exitQueued)
+		}
+		return nil
 	}
+}
+
+func loadWaitBaseline(ctx context.Context, root string, projects []string, session, sinceFile string, fromStart bool) (map[string]waitCursor, []byte, error) {
+	var saved []byte
 	if sinceFile != "" {
-		next, marshalErr := json.Marshal(baseline)
-		if marshalErr != nil {
-			return marshalErr
-		}
-		if _, err = updateWaitCursor(ctx, sinceFile, saved, next); err != nil {
-			return err
+		var err error
+		saved, err = readWaitCursorFile(sinceFile)
+		if err != nil {
+			return nil, nil, fmt.Errorf("read wait baseline: %w", err)
 		}
 	}
-	if report.Code == 6 {
-		return errQuestion
+	if saved == nil && (sinceFile != "" || fromStart) {
+		baseline, err := initialWaitBaseline(ctx, root, projects, session, fromStart)
+		if err != nil || sinceFile == "" {
+			return baseline, nil, err
+		}
+		b, err := json.Marshal(baseline)
+		if err != nil {
+			return nil, nil, err
+		}
+		saved, _, err = updateWaitCursor(ctx, sinceFile, nil, b, nil)
+		if err != nil {
+			return nil, nil, err
+		}
 	}
-	if report.Code == exitQueued {
-		return ctlExit(exitQueued)
+	if saved == nil {
+		return nil, nil, nil
 	}
-	return nil
+	baseline, err := decodeWaitBaseline(saved)
+	return baseline, saved, err
 }
 
 func pollWaitAny(ctx context.Context, root string, projects []string, session string, baseline map[string]waitCursor) (*waitReport, error) {
@@ -378,10 +402,20 @@ func selectWaitAny(ctx context.Context, root string, projects []string, session 
 				if openErr != nil {
 					return false, false, openErr
 				}
-				if baseline != nil && (before.RunID == "" || before.RunID == observer.s.RunID) {
-					observer.floor = &status{RunID: observer.s.RunID, Finished: before.Finished}
-					observer.watchWithdrawals = before.StateCursor != ""
-					observer.deliveredWithdrawals = before.Withdrawals
+				if baseline != nil {
+					finished := observer.s.Finished
+					if !replacedRun(before.RunID, observer.s.RunID) {
+						if from != nil && *from == observer.tail.Cursor() {
+							finished = before.Finished
+							observer.watchWithdrawals = true
+							observer.deliveredWithdrawals = before.Withdrawals
+						} else {
+							// Without a history position, snapshots written after
+							// the seed may still carry its previous completion.
+							finished = max(finished, before.Finished)
+						}
+					}
+					observer.floor = &status{RunID: observer.s.RunID, Finished: finished}
 				}
 				job = &observedJob{jobStateObserver: observer, key: key, anchor: observer.tail.Cursor()}
 				jobs[dir] = job
