@@ -38,7 +38,7 @@ It watches every job this session dispatched, on every host, and returns one JSO
 1. Handle the event: `cx show JOB` for the report, `cx result JOB` to collect it, `cx say JOB TEXT` to continue. A `say` starts a new turn, and its completion arrives as a new event.
 2. Start the same command again. Its cursor remembers what was delivered, so nothing repeats or goes missing. On exit 124 nothing happened: start it again.
 
-A new cursor starts from the current state; add `--from-start` to replay retained events. Narrow the watch with `--project P` or `--host H` (both repeatable). A disconnected host is retried on its own while the others keep being watched. Do not poll `cx status` in a loop, wait on each job separately, or use `cx result --wait` to watch jobs.
+A new cursor starts from the current state, so jobs that finished before it existed are not reported: when you first start watching (or switch cursors), check `cx ls --fields brief` once, or add `--from-start` to replay retained events. Narrow the watch with `--project P` or `--host H` (both repeatable). A disconnected host is retried on its own while the others keep being watched. Do not poll `cx status` in a loop, wait on each job separately, or use `cx result --wait` to watch jobs.
 
 **Sessions.** Jobs belong to the session that dispatched them, detected from `CX_SESSION`, then Claude Code, Codex and OpenCode session variables. Where none is set, dispatching and `wait --any` stop with exit 2: set `CX_SESSION`, pass `--session NAME`, or dispatch with `--no-session` on purpose. `cx adopt JOB [--session NAME]` moves an existing job into a session. Agents dispatching their own jobs get `CX_SESSION=HOST:PROJECT/JOB`.
 
