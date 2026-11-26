@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-func TestAgentToolsUseResolvedStateRoot(t *testing.T) {
+func TestAgentToolsAppServerConfig(t *testing.T) {
 	ambient, work, _ := runnerFixture(t)
 	root := t.TempDir()
 	dir := filepath.Join(root, "p", "job")
@@ -30,6 +30,9 @@ func TestAgentToolsUseResolvedStateRoot(t *testing.T) {
 			t.Error(shutdownErr)
 		}
 	})
+	if !slices.Contains(s.cmd.Args, `mcp_servers.cxrun.default_tools_approval_mode="approve"`) {
+		t.Error("cxrun MCP tools require an explicit approval mode under approvalPolicy=never")
+	}
 	for _, arg := range s.cmd.Args {
 		raw, ok := strings.CutPrefix(arg, "mcp_servers.cxrun.args=")
 		if !ok {

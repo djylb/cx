@@ -176,3 +176,21 @@ func TestMirrorDigest(t *testing.T) {
 		t.Fatal("removed root not detected")
 	}
 }
+
+func TestPsmuxLaunchTarget(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("CX_PSMUX", "psmux")
+	t.Setenv("CXRUN_TMUX_SOCKET", "sock")
+	t.Setenv("CX_MUX_SESSION", "")
+	_, args := psmuxLaunch(root, "cx-1", "cx.exe", "node")
+	if strings.Join(args, " ") != "-L sock new-session -d -s cx-1 -- cx.exe node" {
+		t.Fatal(args)
+	}
+	if err := os.WriteFile(filepath.Join(root, hostConfigName), []byte(`{"mux_session":"development"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, args = psmuxLaunch(root, "cx-1", "cx.exe", "node")
+	if strings.Join(args, " ") != "-L sock new-window -d -t development -n cx-1 -- cx.exe node" {
+		t.Fatal(args)
+	}
+}

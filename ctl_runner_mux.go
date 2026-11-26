@@ -81,8 +81,8 @@ func launchMuxRunner(ctx context.Context, root, exe, dir, work string, argv []st
 	}
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	program, socket := psmuxSettings(root)
-	cmd := exec.CommandContext(ctx, program, "-L", socket, "new-session", "-d", "-s", session, "--", exe, "node", "runner-worker", path)
+	program, args := psmuxLaunch(root, session, exe, "node", "runner-worker", path)
+	cmd := exec.CommandContext(ctx, program, args...)
 	cmd.Stderr = os.Stderr
 	if e := cmd.Run(); e != nil {
 		return errors.Join(e, ctx.Err())

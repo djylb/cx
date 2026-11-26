@@ -61,8 +61,13 @@ func openServer(c config, root, dir string) (*server, error) {
 		}
 		binary, _ := json.Marshal(exe)
 		argv, _ := json.Marshal(toolArgs)
-		args = append(args, "-c", "mcp_servers."+jobToolServerName+".command="+string(binary), "-c", "mcp_servers."+jobToolServerName+".args="+string(argv),
-			"-c", fmt.Sprintf("mcp_servers.%s.tool_timeout_sec=%d", jobToolServerName, int(jobToolTimeout/time.Second)))
+		prefix := "mcp_servers." + jobToolServerName + "."
+		args = append(args,
+			"-c", prefix+"command="+string(binary),
+			"-c", prefix+"args="+string(argv),
+			"-c", fmt.Sprintf("%stool_timeout_sec=%d", prefix, int(jobToolTimeout/time.Second)),
+			"-c", prefix+`default_tools_approval_mode="approve"`,
+		)
 	}
 	cmd := exec.Command("codex", args...)
 	cmd.Dir = c.Dir

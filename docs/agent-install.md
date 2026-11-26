@@ -37,7 +37,7 @@ psmux -L cx new-session -d -s cx-bootstrap
 psmux -L cx list-sessions
 ```
 
-Check `psmux_session` in `cx doctor` and verify the engine CLI is on the session's PATH. For binary and state paths, cross-platform setup, and host policy, see the [reference](reference.md#host-configuration).
+Then set `cx host TARGET --set mux_session=cx-bootstrap` so jobs open as windows of that desktop session. Jobs started from an SSH session otherwise run without a desktop, where sandboxed GUI-linked programs (Git, Node, PowerShell) fail to start. Check `psmux_session` and `mux_session_present` in `cx doctor` and verify the engine CLI is on the session's PATH. For binary and state paths, cross-platform setup, and host policy, see the [reference](reference.md#host-configuration).
 
 ## Configure execution credentials
 

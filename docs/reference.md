@@ -30,6 +30,7 @@ Review the execution host's `host.json` with `cx host HOST`. Update an individua
 | `profiles.<name>.engine_homes` | Maps `codex` to its `CODEX_HOME` directory and `claude` to its `CLAUDE_CONFIG_DIR` directory. |
 | `profiles.<name>.env_file` | Uses the profile's file in place of the host file. An omitted value inherits the host file. Relative profile and environment-file paths are resolved from the node state root. |
 | `psmux`, `mux_socket` | Windows psmux executable and server namespace. Defaults are `psmux` on PATH and `cx`. |
+| `mux_session` | Existing psmux session started from the signed-in desktop; jobs open as its windows. Unset starts each job in its own session. |
 
 Use `cx hosts [HOST]` or `cx node facts` for host facts. `engines.<name>` reports `path`, `version`, and `login_status` (`logged_in`, `logged_out`, or null). After setup, `cx doctor HOST --json` also reports state and cache checks and profile login probes. Use a smoke turn to verify credentials supplied through `env_file`.
 

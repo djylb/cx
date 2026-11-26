@@ -35,8 +35,9 @@ type hostConfig struct {
 	EnvFile        string                 `json:"env_file,omitempty"`
 	DefaultProfile string                 `json:"default_profile,omitempty"`
 	LoadCmd        string                 `json:"load_cmd"`
-	Psmux          string                 `json:"psmux,omitempty"`      // Windows: path of psmux.exe when it is not on PATH
-	MuxSocket      string                 `json:"mux_socket,omitempty"` // tmux/psmux -L socket (e.g. a logged-in psmux server)
+	Psmux          string                 `json:"psmux,omitempty"`       // Windows: path of psmux.exe when it is not on PATH
+	MuxSocket      string                 `json:"mux_socket,omitempty"`  // tmux/psmux -L socket (e.g. a logged-in psmux server)
+	MuxSession     string                 `json:"mux_session,omitempty"` // existing psmux session that hosts jobs as windows
 	CacheMaxBytes  uint64                 `json:"cache_max_bytes"`
 }
 
@@ -90,6 +91,27 @@ func (h *hostConfig) slotCount(class string) int {
 		return count
 	}
 	return defaultSlots()
+}
+
+// psmuxLaunch returns the psmux arguments that start argv detached under name.
+// With mux_session set, the job opens as a window of that existing session, so
+// it runs in whatever logon session hosts it (an interactive desktop), not in the
+// session of the caller, which over SSH has no window station for GUI-linked
+// programs. Without it each job gets its own detached session.
+func psmuxLaunch(root, name string, argv ...string) (program string, args []string) {
+	program, socket := psmuxSettings(root)
+	target := os.Getenv("CX_MUX_SESSION")
+	if target == "" {
+		if cfg, err := readHostConfig(root); err == nil {
+			target = cfg.MuxSession
+		}
+	}
+	if target != "" {
+		args = []string{"-L", socket, "new-window", "-d", "-t", target, "-n", name, "--"}
+	} else {
+		args = []string{"-L", socket, "new-session", "-d", "-s", name, "--"}
+	}
+	return program, append(args, argv...)
 }
 
 // psmuxSettings uses the operation's resolved state root. Environment
