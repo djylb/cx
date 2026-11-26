@@ -7,6 +7,8 @@ import (
 	"syscall"
 )
 
+func reclaimTrackedJob(string) error { return nil }
+
 func marked(env []byte, run string) bool {
 	if run == "" {
 		return false

@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"sort"
 	"time"
@@ -92,20 +93,26 @@ func printProcesses(dir string) error {
 	return json.NewEncoder(os.Stdout).Encode(r.inventory())
 }
 
-// Only an explicit close or clean calls reclaim. Tree-only matches belong
-// in ps, but cannot authorize a signal.
+// Tree-only matches belong in ps, but cannot authorize a signal.
 func (r *runner) reclaim() error {
 	if r.c.RunID == "" {
 		return nil
 	}
+	var logErr error
 	if r.log == nil {
 		f, err := openJobFile(filepath.Join(r.dir, "progress.log"), jobFileAppend)
-		if err != nil {
-			return err
+		logErr = err
+		if err == nil {
+			defer closeBestEffort(f)
+			r.log = f
+			defer func() { r.log = nil }()
 		}
-		defer closeBestEffort(f)
-		r.log = f
-		defer func() { r.log = nil }()
+	}
+	note := func(message string) error {
+		if r.log == nil {
+			return nil
+		}
+		return r.note("process/reap", message)
 	}
 	type identity struct {
 		pid   int
@@ -113,11 +120,13 @@ func (r *runner) reclaim() error {
 	}
 	sent := map[identity]time.Time{}
 	deadline := time.Now().Add(30 * time.Second)
-	var logErr error
+	if err := reclaimTrackedJob(r.c.RunID); err != nil {
+		logErr = errors.Join(logErr, err, note(err.Error()))
+	}
 	for {
 		view := r.inventory()
 		if view.scanErr != nil {
-			return errors.Join(logErr, view.scanErr, r.note("process/reap", view.scanErr.Error()))
+			return errors.Join(logErr, view.scanErr, note(view.scanErr.Error()))
 		}
 		active := 0
 
@@ -128,7 +137,7 @@ func (r *runner) reclaim() error {
 			active++
 			key := identity{p.PID, p.Start}
 			since, already := sent[key]
-			force := already && time.Since(since) >= 10*time.Second
+			force := runtime.GOOS == "windows" || (already && time.Since(since) >= 10*time.Second)
 			if time.Now().After(deadline) || (already && time.Since(since) > 11*time.Second) {
 				return errors.Join(logErr, fmt.Errorf("pid %d still present during reap; retry", p.PID))
 			}
@@ -139,11 +148,10 @@ func (r *runner) reclaim() error {
 				sent[key] = time.Now()
 			}
 			err := signalMember(p, force, r.c.RunID)
-			logErr = errors.Join(logErr, r.note("process/reap", fmt.Sprintf("pid=%d force=%t result=%v", p.PID, force, err)))
-
+			logErr = errors.Join(logErr, note(fmt.Sprintf("pid=%d force=%t result=%v", p.PID, force, err)))
 		}
 		if active == 0 {
-			return errors.Join(logErr, r.note("process/reap", fmt.Sprintf("finished signalled=%d unreadable=%d %s", len(sent), view.Unreadable, view.Warning)))
+			return errors.Join(logErr, note(fmt.Sprintf("finished signalled=%d unreadable=%d %s", len(sent), view.Unreadable, view.Warning)))
 		}
 		time.Sleep(100 * time.Millisecond)
 	}

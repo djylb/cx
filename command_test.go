@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -44,11 +45,27 @@ func commandFixture(args []string) int {
 		return 0
 	case "detached-parent":
 		child := exec.Command(os.Args[0], "fixture-command", "spawn-sleep")
+		if len(args) > 2 && args[2] == "unmarked" {
+			child.Env = slices.DeleteFunc(child.Environ(), func(entry string) bool {
+				name, _, _ := strings.Cut(entry, "=")
+				return strings.EqualFold(name, "CXRUN_RUN")
+			})
+		}
 		if err := child.Run(); err != nil {
 			return 2
 		}
 		if len(args) > 1 {
-			return 0
+			switch args[1] {
+			case "exit":
+				return 0
+			case "gated":
+				ctx, cancel := context.WithTimeout(context.Background(), fixtureLimit)
+				defer cancel()
+				if err := awaitFixtureFile(ctx, "allow-exit"); err != nil {
+					return 2
+				}
+				return 0
+			}
 		}
 		time.Sleep(fixtureLimit)
 	case "sleep":

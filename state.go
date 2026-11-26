@@ -232,7 +232,7 @@ func projectJobStatusWithBarrier(ctx context.Context, dir string, s *status, bar
 	if err = barrier(r.stateLog); err != nil {
 		return false, errors.Join(err, r.stateLog.Close())
 	}
-	if err = r.saveTerminal(); err != nil {
+	if err = errors.Join(r.saveTerminal(), r.s.Mux.close(ctx)); err != nil {
 		return false, err
 	}
 	*s = r.s

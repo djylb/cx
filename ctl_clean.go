@@ -255,7 +255,8 @@ func (r *runner) releaseClosedWorkspace() error {
 	if err := releaseSnapshotWorktrees(ctx, work); err != nil {
 		return err
 	}
-	return os.RemoveAll(filepath.Join(work, "work"))
+	checkout := filepath.Join(work, "work")
+	return cleanupError(os.RemoveAll(checkout), checkout)
 }
 
 func cleanControllerJob(ctx context.Context, h endpoint, host, id string) error {
@@ -315,7 +316,7 @@ func cleanPrivateWork(ctx context.Context, work, scripts string) error {
 	if err := releaseSnapshotWorktrees(ctx, work); err != nil {
 		return err
 	}
-	return errors.Join(os.RemoveAll(work), os.RemoveAll(scripts))
+	return errors.Join(cleanupError(os.RemoveAll(work), work), cleanupError(os.RemoveAll(scripts), scripts))
 }
 func releaseSnapshotWorktrees(ctx context.Context, work string) error {
 	var m Manifest

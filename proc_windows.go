@@ -11,6 +11,8 @@ import (
 	"syscall"
 	"time"
 	"unsafe"
+
+	"golang.org/x/sys/windows"
 )
 
 func ownGroup(cmd *exec.Cmd) {}
@@ -34,14 +36,11 @@ func shellCommand(script string) *exec.Cmd {
 	return cmd
 }
 
-var kernel = syscall.NewLazyDLL("kernel32.dll")
-var createJob = kernel.NewProc("CreateJobObjectW")
-var assignJob = kernel.NewProc("AssignProcessToJobObject")
-var terminateJob = kernel.NewProc("TerminateJobObject")
-var resumeProcess = syscall.NewLazyDLL("ntdll.dll").NewProc("NtResumeProcess")
+var kernel = windows.NewLazySystemDLL("kernel32.dll")
+var resumeProcess = windows.NewLazySystemDLL("ntdll.dll").NewProc("NtResumeProcess")
 
 type commandTree struct {
-	job, process syscall.Handle
+	job, process windows.Handle
 }
 
 func startCommand(cmd *exec.Cmd, id string) (commandTree, error) {
@@ -49,43 +48,92 @@ func startCommand(cmd *exec.Cmd, id string) (commandTree, error) {
 	// remain reachable after the parent exits.
 	var name *uint16
 	if id != "" {
-		name, _ = syscall.UTF16PtrFromString(jobObjectName(id))
+		var err error
+		name, err = windows.UTF16PtrFromString(jobObjectName(id))
+		if err != nil {
+			return commandTree{}, err
+		}
 	}
-	job, _, e := createJob.Call(0, uintptr(unsafe.Pointer(name)))
-	if job == 0 {
-		return commandTree{}, e
+	job, err := windows.CreateJobObject(nil, name)
+	if err != nil {
+		return commandTree{}, err
+	}
+	var limits windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+	limits.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+	if _, err = windows.SetInformationJobObject(job, windows.JobObjectExtendedLimitInformation,
+		uintptr(unsafe.Pointer(&limits)), uint32(unsafe.Sizeof(limits))); err != nil {
+		_ = windows.CloseHandle(job)
+		return commandTree{}, fmt.Errorf("set job limits: %w", err)
 	}
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
 	}
-	cmd.SysProcAttr.CreationFlags |= syscall.CREATE_NEW_PROCESS_GROUP | 4 // CREATE_SUSPENDED
+	cmd.SysProcAttr.CreationFlags |= windows.CREATE_NEW_PROCESS_GROUP | windows.CREATE_SUSPENDED
 	if err := cmd.Start(); err != nil {
-		syscall.CloseHandle(syscall.Handle(job))
+		_ = windows.CloseHandle(job)
 		return commandTree{}, err
 	}
-	h, err := syscall.OpenProcess(0x0100|0x0800|0x0001|0x1000|0x100000, false, uint32(cmd.Process.Pid))
+	h, err := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_SUSPEND_RESUME|
+		windows.PROCESS_TERMINATE|windows.PROCESS_QUERY_LIMITED_INFORMATION, false, uint32(cmd.Process.Pid))
 	if err == nil {
-		ok, _, e := assignJob.Call(job, uintptr(h))
-		if ok == 0 {
-			err = e
-		} else if status, _, _ := resumeProcess.Call(uintptr(h)); status != 0 {
-			err = fmt.Errorf("NtResumeProcess: %#x", status)
+		if err = windows.AssignProcessToJobObject(job, h); err == nil {
+			if status, _, _ := resumeProcess.Call(uintptr(h)); status != 0 {
+				err = fmt.Errorf("NtResumeProcess: %#x", status)
+			}
 		}
 	}
 	if err != nil {
-		cmd.Process.Kill()
+		_ = cmd.Process.Kill()
 		_ = waitProcess(cmd, 5*time.Second, nil)
 		if h != 0 {
-			syscall.CloseHandle(h)
+			_ = windows.CloseHandle(h)
 		}
-		syscall.CloseHandle(syscall.Handle(job))
+		_ = windows.CloseHandle(job)
 		return commandTree{}, err
 	}
-	return commandTree{syscall.Handle(job), h}, nil
+	return commandTree{job, h}, nil
 }
-func (t commandTree) kill() { terminateJob.Call(uintptr(t.job), 1) }
-func (t commandTree) cleanup() {
-	syscall.CloseHandle(t.job)
-	syscall.CloseHandle(t.process)
+
+type jobAccounting struct {
+	_               [4]int64
+	_               [2]uint32
+	activeProcesses uint32
+	_               uint32
+}
+
+func stopJob(job windows.Handle) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var info jobAccounting
+	for sent := false; ; sent = true {
+		if err := windows.QueryInformationJobObject(job, windows.JobObjectBasicAccountingInformation,
+			uintptr(unsafe.Pointer(&info)), uint32(unsafe.Sizeof(info)), nil); err != nil {
+			return fmt.Errorf("query job processes: %w", err)
+		}
+		if info.activeProcesses == 0 {
+			return nil
+		}
+		if !sent {
+			if err := windows.TerminateJobObject(job, 1); err != nil {
+				return fmt.Errorf("terminate job: %w", err)
+			}
+		}
+		if err := pause(ctx, 20*time.Millisecond); err != nil {
+			return fmt.Errorf("%d processes still in Job Object: %w", info.activeProcesses, err)
+		}
+	}
+}
+
+func (t *commandTree) cleanup() error {
+	if t.job == 0 {
+		return nil
+	}
+	// An inventory reader can hold a query handle after the runner closes
+	// its handle. Explicit termination also makes normal teardown synchronous.
+	err := stopJob(t.job)
+	_ = windows.CloseHandle(t.job)
+	_ = windows.CloseHandle(t.process)
+	*t = commandTree{}
+	return err
 }
 func commandExitCode(state *os.ProcessState) int64 { return int64(uint32(state.ExitCode())) }

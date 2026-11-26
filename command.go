@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"syscall"
 	"time"
 
@@ -129,7 +130,7 @@ func (r *runner) serveCommand() (err error) {
 		if !exited {
 			_ = cmd.Process.Kill()
 		}
-		tree.cleanup()
+		err = errors.Join(err, tree.cleanup())
 		if !exited {
 			select {
 			case <-done:
@@ -193,8 +194,10 @@ func (r *runner) serveCommand() (err error) {
 			} else if ok {
 				reason = "interrupted"
 				closing = true
-				if err = r.reclaim(); err != nil {
-					return err
+				if runtime.GOOS != "windows" {
+					if err = r.reclaim(); err != nil {
+						return err
+					}
 				}
 			} else if r.c.Quiet > 0 && timeshim.Since(clock, lastOutput) >= r.c.Quiet {
 				reason = "stalled"
@@ -202,12 +205,17 @@ func (r *runner) serveCommand() (err error) {
 				continue
 			}
 		}
-		if err = r.note("command/stop", reason+"; graceful signal, 10s grace"); err != nil {
+		if err = r.note("command/stop", reason); err != nil {
 			return err
 		}
-		// Deadlines stop the foreground payload only. Background processes
-		// remain available for inspection until an explicit close or clean.
-		_ = cmd.Process.Signal(syscall.SIGTERM)
+		if runtime.GOOS == "windows" {
+			if err = tree.cleanup(); err != nil {
+				return err
+			}
+		} else {
+			// The Unix process group remains available for explicit close or clean.
+			_ = cmd.Process.Signal(syscall.SIGTERM)
+		}
 		select {
 		case <-done:
 		case <-time.After(10 * time.Second):

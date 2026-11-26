@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -84,6 +85,35 @@ func TestStateLogWindowsSharing(t *testing.T) {
 	if _, err := reader.ReadAt(first[:], 0); err != nil || first[0] != '{' {
 		t.Fatalf("protected reader: %q, %v", first, err)
 	}
+}
+
+func TestWindowsCleanReportsHolderAndIdleTailDoesNotPinState(t *testing.T) {
+	h := commands(t)
+	h.start("held", nil, "sleep")
+	h.cli(0, "close", "--job", "p/held")
+	dir := filepath.Join(h.root, "p", "held")
+	tail, err := openStateTail(dir, stateCursor{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeBestEffort(tail)
+	if _, err := tail.Next(); err != nil {
+		t.Fatal(err)
+	}
+	segment := segmentPath(filepath.Join(dir, "state"), tail.Cursor().Seg)
+	holder, err := openJobFile(segment, jobFileRead)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeBestEffort(holder)
+	out := h.cli(1, "clean", "--job", "p/held")
+	if !strings.Contains(out, segment+": open in PID "+strconv.Itoa(os.Getpid())) {
+		t.Fatalf("clean did not identify the open segment and PID: %s", out)
+	}
+	if err := holder.Close(); err != nil {
+		t.Fatal(err)
+	}
+	h.cli(0, "clean", "--job", "p/held")
 }
 
 func TestWindowsRetiredSegmentDoesNotUseLegacyDelete(t *testing.T) {

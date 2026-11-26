@@ -31,5 +31,5 @@ func startCommand(cmd *exec.Cmd, _ string) (commandTree, error) {
 	}
 	return commandTree{}, nil
 }
-func (commandTree) cleanup()                       {}
+func (*commandTree) cleanup() error                { return nil }
 func commandExitCode(state *os.ProcessState) int64 { return int64(state.ExitCode()) }

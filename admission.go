@@ -282,8 +282,10 @@ func (r *runner) reserve(ctx context.Context, t *queueTicket, controls bool, rep
 			if _, ok, e := r.takeMarker("close"); e != nil {
 				return e
 			} else if ok {
-				if err := r.reclaim(); err != nil {
-					return err
+				if runtime.GOOS != "windows" {
+					if err := r.reclaim(); err != nil {
+						return err
+					}
 				}
 				r.closeCompleted = true
 				return errQueuedClose

@@ -96,18 +96,19 @@ type status struct {
 	Engine      string `json:"engine,omitempty"`
 	RunID       string `json:"run_id,omitempty"`
 
-	Thread          string `json:"thread_id"`
-	Turn            string `json:"turn_id"`
-	TurnStatus      string `json:"turn_status"`
-	LastCompleted   string `json:"last_completed_turn_id,omitempty"`
-	CompletedStatus string `json:"last_completed_status,omitempty"`
-	InputKind       string `json:"input_kind,omitempty"`
-	ReviewThread    string `json:"review_thread_id,omitempty"`
-	ReviewTurn      string `json:"review_turn_id,omitempty"`
-	CompactOp       string `json:"compact_op,omitempty"`
-	Error           string `json:"error,omitempty"`
-	LastAction      string `json:"last_action,omitempty"`
-	LaunchID        string `json:"launch_id,omitempty"`
+	Thread          string     `json:"thread_id"`
+	Turn            string     `json:"turn_id"`
+	TurnStatus      string     `json:"turn_status"`
+	LastCompleted   string     `json:"last_completed_turn_id,omitempty"`
+	CompletedStatus string     `json:"last_completed_status,omitempty"`
+	InputKind       string     `json:"input_kind,omitempty"`
+	ReviewThread    string     `json:"review_thread_id,omitempty"`
+	ReviewTurn      string     `json:"review_turn_id,omitempty"`
+	CompactOp       string     `json:"compact_op,omitempty"`
+	Error           string     `json:"error,omitempty"`
+	LastAction      string     `json:"last_action,omitempty"`
+	LaunchID        string     `json:"launch_id,omitempty"`
+	Mux             *muxWindow `json:"mux_window,omitempty"`
 
 	rateLimitStatus
 	turnSummary
@@ -244,7 +245,7 @@ func detachCleanJob(root, dir string, s status) error {
 		return err
 	}
 	if err := os.Rename(dir, filepath.Join(trash, rand.Text())); err != nil {
-		return err
+		return cleanupError(err, dir)
 	}
 	return errors.Join(syncJobDir(filepath.Dir(dir)), syncJobTree(trash, root))
 }
@@ -259,7 +260,8 @@ func reapDetachedJobs(root, project, job string) error {
 		return err
 	}
 	for _, entry := range entries {
-		err = errors.Join(err, os.RemoveAll(filepath.Join(trash, entry.Name())))
+		path := filepath.Join(trash, entry.Name())
+		err = errors.Join(err, cleanupError(os.RemoveAll(path), path))
 	}
 	return err
 }
@@ -386,7 +388,7 @@ func recordLaunchFailure(ctx context.Context, dir string, c config, launchErr er
 	if err := r.openState(); err != nil {
 		return errors.Join(launchErr, err)
 	}
-	return r.failStart(launchErr)
+	return errors.Join(r.failStart(launchErr), r.s.Mux.close(ctx))
 }
 
 func run(ctx context.Context, args []string) error { return runNode(ctx, args, false) }
@@ -789,7 +791,12 @@ func runNodeWithRegistration(ctx context.Context, args []string, directSubmit bo
 			closeBestEffort(owner)
 		}
 		if maintainCacheOnExit {
-			maintainReleasedCaches(ctx, root)
+			limit := transferLimit
+			if workerWindow(ctx) != nil {
+				// Host cache contention must not keep a terminal pane alive.
+				limit = muxCleanupTimeout
+			}
+			maintainReleasedCaches(ctx, root, limit)
 		}
 	}()
 	if op == "start" || op == "resume" {
@@ -929,6 +936,16 @@ func runNodeWithRegistration(ctx context.Context, args []string, directSubmit bo
 			}
 		}
 		s.LaunchID = launchID
+		if len(c.Argv) == 0 {
+			s.Mux = workerWindow(ctx)
+		} else if directSubmit && runtime.GOOS == "windows" {
+			// Publish the command pane identity before the worker handoff.
+			// Orphan recovery can close it even if the worker never started.
+			s.Mux, startErr = newMuxWindow(root)
+			if startErr != nil {
+				return startErr
+			}
+		}
 		// An in-process worker keeps the registration lock handle. On Unix,
 		// a concurrent fork can keep a closed handle's flock alive until exec.
 		if owner, startErr = register(ctx, parent, dir, c, s, (*stateWriter).sync); startErr != nil {
@@ -954,8 +971,12 @@ func runNodeWithRegistration(ctx context.Context, args []string, directSubmit bo
 			_ = guard.Close()
 			guard = nil
 			var done <-chan error
-			if directSubmit && runtime.GOOS == "windows" {
-				startErr = launchMuxCommand(ctx, root, *project, *job, c.RunID, key)
+			if s.Mux != nil {
+				var dispose func()
+				dispose, startErr = launchMuxCommand(ctx, s.Mux, root, *project, *job, c.RunID, key)
+				if startErr == nil {
+					defer dispose()
+				}
 			} else {
 				done, startErr = launchCommand(root, *project, *job, c.RunID, key)
 			}
@@ -1096,7 +1117,7 @@ func runNodeWithRegistration(ctx context.Context, args []string, directSubmit bo
 			_ = guard.Close()
 			guard = nil
 		}
-		if err = r.reclaim(); err != nil {
+		if err = errors.Join(r.reclaim(), s.Mux.close(ctx)); err != nil {
 			return err
 		}
 		if terminalClose {
@@ -1137,6 +1158,7 @@ func runNodeWithRegistration(ctx context.Context, args []string, directSubmit bo
 	if op != "_command" {
 		r.s.LaunchID = launchID
 	}
+	r.s.Mux = workerWindow(ctx)
 	r.s.RunnerStart = processStart(os.Getpid())
 	r.s.PID = os.Getpid()
 	r.s.EnginePID = 0

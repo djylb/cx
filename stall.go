@@ -103,7 +103,7 @@ func (r *runner) restartServer() error {
 	_ = old.cmd.Process.Kill()
 	close(old.stop)
 	_ = old.in.Close()
-	old.tree.cleanup()
+	reapErr := old.tree.cleanup()
 	done := make(chan struct{})
 	go func() {
 		_ = old.wait() // The old server was killed. Only reap completion matters.
@@ -111,9 +111,13 @@ func (r *runner) restartServer() error {
 	}()
 	select {
 	case <-done:
+		if reapErr != nil {
+			r.srv = nil
+			return reapErr
+		}
 	case <-time.After(5 * time.Second):
 		r.srv = nil
-		return errReapDeadline
+		return errors.Join(reapErr, errReapDeadline)
 	}
 	r.srv = nil
 	r.s.Approvals = nil

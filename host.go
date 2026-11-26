@@ -93,12 +93,12 @@ func (h *hostConfig) slotCount(class string) int {
 	return defaultSlots()
 }
 
-// psmuxLaunch returns the psmux arguments that start argv detached under name.
+// psmuxLaunch selects the psmux target for a detached worker.
 // With mux_session set, the job opens as a window of that existing session, so
 // it runs in whatever logon session hosts it (an interactive desktop), not in the
 // session of the caller, which over SSH has no window station for GUI-linked
 // programs. Without it each job gets its own detached session.
-func psmuxLaunch(root, name string, argv ...string) (program string, args []string) {
+func psmuxLaunch(root, name string) muxWindow {
 	program, socket := psmuxSettings(root)
 	target := os.Getenv("CX_MUX_SESSION")
 	if target == "" {
@@ -106,12 +106,10 @@ func psmuxLaunch(root, name string, argv ...string) (program string, args []stri
 			target = cfg.MuxSession
 		}
 	}
-	if target != "" {
-		args = []string{"-L", socket, "new-window", "-d", "-t", target, "-n", name, "--"}
-	} else {
-		args = []string{"-L", socket, "new-session", "-d", "-s", name, "--"}
+	if target == "" {
+		target = name
 	}
-	return program, append(args, argv...)
+	return muxWindow{Program: program, Socket: socket, Session: target, Name: name}
 }
 
 // psmuxSettings uses the operation's resolved state root. Environment

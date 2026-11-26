@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -464,7 +465,6 @@ func (r *runner) startClaude(input any, id string) error {
 	}()
 	go func() {
 		defer close(done)
-		defer tree.cleanup()
 		defer closeBestEffort(out)
 		send := func(f claudeFrame) bool {
 			select {
@@ -486,7 +486,7 @@ func (r *runner) startClaude(input any, id string) error {
 		if errors.Is(waitErr, exec.ErrWaitDelay) {
 			waitErr = nil
 		}
-		waitErr = errors.Join(waitErr, flush(), log.Close())
+		waitErr = errors.Join(waitErr, tree.cleanup(), flush(), log.Close())
 		if errors.Is(streamErr, io.EOF) {
 			streamErr = nil
 		}
@@ -590,7 +590,7 @@ func (r *runner) serveClaude() (err error) {
 	r.claude = s
 	defer func() {
 		err = errors.Join(err, s.shutdown())
-		if !r.closing.IsZero() {
+		if runtime.GOOS != "windows" && !r.closing.IsZero() {
 			err = errors.Join(err, r.reclaim())
 		}
 	}()

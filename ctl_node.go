@@ -362,18 +362,17 @@ func checkSubmission(dir string, want config, profile string, args []string) err
 	}
 	return nil
 }
-func launchMuxCommand(ctx context.Context, root, p, j, runID, directory string) error {
+func launchMuxCommand(ctx context.Context, window *muxWindow, root, p, j, runID, directory string) (func(), error) {
 	exe, e := os.Executable()
 	if e != nil {
-		return e
+		return nil, e
 	}
 	ctx, cancel := context.WithTimeout(ctx, 8*time.Second)
 	defer cancel()
-	program, args := psmuxLaunch(root, "cx-"+runID, exe, "_command", "--state", root, "--project", p, "--job", j, "--expect-run", runID, "--expect-dir", directory)
-	cmd := exec.CommandContext(ctx, program, args...)
-	cmd.Stderr = os.Stderr
-	err := cmd.Run()
-	return errors.Join(err, ctx.Err())
+	work := filepath.Join(root, ".work", p, j)
+	argv := []string{"_command", "--state", root, "--project", p, "--job", j, "--expect-run", runID, "--expect-dir", directory}
+	_, dispose, err := startMuxWorker(ctx, window, root, exe, work, argv, nil)
+	return dispose, err
 }
 
 func lockCommandWorkspace(ctx context.Context, root, id, cwd string) (string, func(), error) {

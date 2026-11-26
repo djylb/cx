@@ -12,6 +12,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -633,7 +634,19 @@ type frameReader struct {
 }
 
 func readFrames(f *os.File, off uint64) frameReader {
-	return frameReader{reader: bufio.NewReader(io.NewSectionReader(f, int64(off), math.MaxInt64-int64(off)))}
+	var frames frameReader
+	frames.reset(f, off)
+	return frames
+}
+
+func (r *frameReader) reset(f *os.File, off uint64) {
+	source := io.NewSectionReader(f, int64(off), math.MaxInt64-int64(off))
+	if r.reader == nil {
+		r.reader = bufio.NewReader(source)
+	} else {
+		r.reader.Reset(source)
+	}
+	r.partial = nil
 }
 
 func (r *frameReader) line() ([]byte, error) {
@@ -757,6 +770,12 @@ func (t *stateTail) Next() ([]stateRecord, error) {
 	if t.damage != nil {
 		return nil, t.damage
 	}
+	if runtime.GOOS == "windows" {
+		// An open descendant handle prevents renaming a job directory on
+		// NTFS, even when the handle shares deletion. Keep the cursor
+		// between polls and reacquire the handle at its committed offset.
+		defer func() { _ = t.releaseFile() }()
+	}
 	if err := t.advance(); err != nil {
 		return nil, err
 	}
@@ -788,6 +807,7 @@ func (t *stateTail) advance() error {
 		}
 		_ = t.file.Close()
 		t.file, t.seg, t.off, t.seal, t.stop = nil, next, 0, 0, false
+		t.nextScan = time.Time{}
 	}
 }
 
@@ -896,9 +916,10 @@ func (t *stateTail) openNext() (bool, error) {
 		if t.mailbox && seg != max(t.seg, 1) {
 			return false, t.damaged("missing segment")
 		}
-		t.seg, t.off = seg, 0
+		t.seg, t.off, t.seal, t.stop = seg, 0, 0, false
 		ok, err := t.openFile(segmentPath(t.dir, seg))
 		if ok || err != nil {
+			t.nextScan = time.Time{}
 			return ok, err
 		}
 	}
@@ -923,10 +944,8 @@ func (t *stateTail) openFile(path string) (bool, error) {
 			return false, t.damaged("checkpoint past end of segment")
 		}
 	}
-	t.file, t.frames = f, readFrames(f, t.off)
-	// A gap after a newly opened segment needs its own immediate probe.
-	// Throttle only repeated misses at the same segment.
-	t.nextScan = time.Time{}
+	t.file = f
+	t.frames.reset(f, t.off)
 	return true, nil
 }
 
@@ -936,6 +955,11 @@ func (t *stateTail) Close() error {
 		return nil
 	}
 	t.closed = true
+	return t.releaseFile()
+}
+
+func (t *stateTail) releaseFile() error {
+	t.pending = nil
 	if t.file == nil {
 		return nil
 	}

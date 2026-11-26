@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"time"
 
@@ -147,8 +148,10 @@ func (s *server) wait() error {
 
 func (r *runner) shutdown() (result error) {
 	s := r.srv
-	defer s.tree.cleanup()
-	closing := !r.closing.IsZero()
+	// The Windows driver owns a Job Object and terminal publication also
+	// reclaims processes that kept the run marker outside that object.
+	closing := runtime.GOOS != "windows" && !r.closing.IsZero()
+	defer func() { result = errors.Join(result, s.tree.cleanup()) }()
 	if closing {
 		defer func() {
 			if closing {
@@ -194,6 +197,7 @@ drain:
 		}
 	}
 	_ = s.cmd.Process.Kill()
+	drainErr = errors.Join(drainErr, s.tree.cleanup())
 	select {
 	case <-done:
 		return errors.Join(drainErr, r.note("shutdown", "app-server exceeded EOF deadline; killed owned PID"))
@@ -421,7 +425,7 @@ func (r *runner) openState() error {
 	return nil
 }
 
-func (r *runner) saveTerminal() error {
+func (r *runner) saveTerminal() (result error) {
 	defer closeBestEffort(r.stateLog)
 	r.s.QueueReason = ""
 	defer func() {
@@ -430,6 +434,22 @@ func (r *runner) saveTerminal() error {
 			closeBestEffort(r.inbox.outboxTail)
 		}
 	}()
+	if runtime.GOOS == "windows" && r.root != "" && r.c.RunID != "" {
+		// The drivers have finished logging before calling saveTerminal.
+		reaper := runner{root: r.root, dir: r.dir, c: r.c, s: r.s, ctx: r.ctx}
+		if err := reaper.reclaim(); err != nil {
+			r.closeCompleted = false
+			if r.s.Error == "" {
+				r.s.Error = err.Error()
+			} else {
+				r.s.Error += "\n" + err.Error()
+			}
+			if r.s.State != "orphaned" {
+				r.s.State = "failed"
+			}
+			defer func() { result = errors.Join(result, err) }()
+		}
+	}
 	ctx := r.ctx
 	if ctx == nil {
 		ctx = context.Background()

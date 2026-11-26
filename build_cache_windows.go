@@ -23,7 +23,7 @@ func cacheMountID(f *os.File) (uint64, error) {
 func cacheProcessGroup(*exec.Cmd) int { return 0 }
 
 func cacheRunAlive(run string, _ []int) bool {
-	job, err := openTrackedJob(run)
+	job, err := openTrackedJob(run, jobQuery)
 	if err == nil {
 		var counts struct {
 			Times      [4]int64
@@ -34,7 +34,7 @@ func cacheRunAlive(run string, _ []int) bool {
 		}
 		err = windows.QueryInformationJobObject(job, windows.JobObjectBasicAccountingInformation,
 			uintptr(unsafe.Pointer(&counts)), uint32(unsafe.Sizeof(counts)), nil)
-		windows.CloseHandle(job)
+		_ = windows.CloseHandle(job)
 		if err != nil || counts.Active != 0 {
 			return true
 		}

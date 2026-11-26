@@ -341,10 +341,11 @@ func useCacheFixture() error {
 }
 
 func TestBackgroundCacheUseOutlivesForegroundRunner(t *testing.T) {
-	t.Run("marked-detached", func(t *testing.T) { assertBackgroundCacheUse(t, false) })
-	if runtime.GOOS != "windows" {
-		t.Run("unmarked-in-group", func(t *testing.T) { assertBackgroundCacheUse(t, true) })
+	if runtime.GOOS == "windows" {
+		t.Skip("the Windows runner reaps the process tree before terminal publication")
 	}
+	t.Run("marked-detached", func(t *testing.T) { assertBackgroundCacheUse(t, false) })
+	t.Run("unmarked-in-group", func(t *testing.T) { assertBackgroundCacheUse(t, true) })
 }
 
 func assertBackgroundCacheUse(t *testing.T, dropTracking bool) {

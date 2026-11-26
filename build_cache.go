@@ -397,7 +397,7 @@ func (c *config) startCachedCommand(cmd *exec.Cmd) (commandTree, error) {
 			if err := writeJSON(use.path, use.pin); err != nil {
 				killTree(cmd)
 				err = errors.Join(err, waitProcess(cmd, 5*time.Second, nil))
-				tree.cleanup()
+				err = errors.Join(err, tree.cleanup())
 				return commandTree{}, fmt.Errorf("record cache process group: %w", err)
 			}
 		}
@@ -440,10 +440,10 @@ func activeCachePins(root string) (map[string]bool, bool, error) {
 	return targets, packagesPinned, nil
 }
 
-func maintainReleasedCaches(ctx context.Context, root string) {
+func maintainReleasedCaches(ctx context.Context, root string, limit time.Duration) {
 	// A payload may leave caches larger than they were at admission. Run
 	// maintenance after releasing the leases, even on cancellation.
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), transferLimit)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), limit)
 	defer cancel()
 	host, err := readHostConfig(root)
 	if err == nil {
