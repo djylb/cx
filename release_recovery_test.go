@@ -314,7 +314,7 @@ func TestRegistrationWaitsForOwnerProbe(t *testing.T) {
 	}
 	defer closeBestEffort(owner)
 	err = expireLockWait(t, func(ctx context.Context) error {
-		return registerJob(ctx, root, dir, config{}, status{Job: "j", State: "queued"}, (*stateWriter).sync)
+		return registerFixtureJob(ctx, root, dir, config{}, status{Job: "j", State: "queued"}, (*stateWriter).sync)
 	})
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("register treated a read-side probe as a live owner: %v", err)
@@ -322,7 +322,7 @@ func TestRegistrationWaitsForOwnerProbe(t *testing.T) {
 	if err := errors.Join(owner.Close(), gate.Close()); err != nil {
 		t.Fatal(err)
 	}
-	if err := registerJob(t.Context(), root, dir, config{}, status{Job: "j", State: "queued"}, (*stateWriter).sync); err != nil {
+	if err := registerFixtureJob(t.Context(), root, dir, config{}, status{Job: "j", State: "queued"}, (*stateWriter).sync); err != nil {
 		t.Fatal(err)
 	}
 }

@@ -1,11 +1,24 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 )
+
+func register(parent, dir string, c config, s status) error {
+	return registerFixtureJob(context.Background(), parent, dir, c, s, (*stateWriter).sync)
+}
+
+func registerFixtureJob(ctx context.Context, parent, dir string, c config, s status, syncConfig func(*stateWriter) error) error {
+	owner, err := registerJob(ctx, parent, dir, c, s, syncConfig)
+	if err != nil {
+		return err
+	}
+	return owner.Close()
+}
 
 func writeFixtureStatus(dir string, s status, report ...string) error {
 	if err := os.MkdirAll(dir, 0700); err != nil {

@@ -120,7 +120,7 @@ func TestRegistrationConfigBarrierPrecedesMutableFiles(t *testing.T) {
 	c := config{RunID: "retry", Engine: "codex", Dir: root}
 	s := status{Job: "agent", Engine: c.Engine, State: "queued"}
 	fault := errors.New("config flush failed")
-	err := registerJob(t.Context(), root, dir, c, s, func(w *stateWriter) error {
+	err := registerFixtureJob(t.Context(), root, dir, c, s, func(w *stateWriter) error {
 		record, err := jobConfigRecord(dir)
 		if err != nil || record.Seq == 0 {
 			t.Fatalf("barrier ran before config append: %v %v", record, err)

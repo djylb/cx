@@ -272,21 +272,18 @@ func printStatus(dir string) error {
 }
 
 // The caller holds the registry lock. The first status record publishes the job.
-func register(parent, dir string, c config, s status) error {
-	return registerJob(context.Background(), parent, dir, c, s, (*stateWriter).sync)
-}
-
-func registerJob(ctx context.Context, parent, dir string, c config, s status, syncConfig func(*stateWriter) error) error {
+// On success the caller keeps owner.lock for worker startup or command handoff.
+func registerJob(ctx context.Context, parent, dir string, c config, s status, syncConfig func(*stateWriter) error) (*os.File, error) {
 	if err := os.MkdirAll(parent, 0700); err != nil {
-		return err
+		return nil, err
 	}
 	if err := os.Mkdir(dir, 0700); err != nil {
 		if !os.IsExist(err) {
-			return err
+			return nil, err
 		}
 		entries, readErr := os.ReadDir(dir)
 		if readErr != nil {
-			return readErr
+			return nil, readErr
 		}
 		for _, entry := range entries {
 			switch entry.Name() {
@@ -299,18 +296,24 @@ func registerJob(ctx context.Context, parent, dir string, c config, s status, sy
 					continue
 				}
 			}
-			return fmt.Errorf("%w: retire incompatible or populated job directory %s", os.ErrExist, dir)
+			return nil, fmt.Errorf("%w: retire incompatible or populated job directory %s", os.ErrExist, dir)
 		}
 	}
 
 	owner, err := openJobOwner(ctx, dir, jobFileLock)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if owner == nil {
-		return &os.PathError{Op: "register", Path: dir, Err: os.ErrExist}
+		return nil, &os.PathError{Op: "register", Path: dir, Err: os.ErrExist}
 	}
-	defer closeBestEffort(owner)
+	if err := publishRegistration(parent, dir, c, s, syncConfig); err != nil {
+		return nil, errors.Join(err, owner.Close())
+	}
+	return owner, nil
+}
+
+func publishRegistration(parent, dir string, c config, s status, syncConfig func(*stateWriter) error) error {
 	if record, _, err := latestState(dir); err != nil {
 		return err
 	} else if record.Seq != 0 {
@@ -386,6 +389,10 @@ func recordLaunchFailure(ctx context.Context, dir string, c config, launchErr er
 
 func run(ctx context.Context, args []string) error { return runNode(ctx, args, false) }
 func runNode(ctx context.Context, args []string, directSubmit bool) error {
+	return runNodeWithRegistration(ctx, args, directSubmit, registerJob)
+}
+
+func runNodeWithRegistration(ctx context.Context, args []string, directSubmit bool, register func(context.Context, string, string, config, status, func(*stateWriter) error) (*os.File, error)) error {
 	if len(args) == 0 {
 		return errors.New("usage: cxrun host [--state PATH] or cxrun start|resume|status|say|interrupt|close|wait|tail --job ID [options]")
 	}
@@ -754,6 +761,16 @@ func runNode(ctx context.Context, args []string, directSubmit bool) error {
 			_ = guard.Close()
 		}
 	}()
+	var owner *os.File
+	maintainCacheOnExit := false
+	defer func() {
+		if owner != nil {
+			closeBestEffort(owner)
+		}
+		if maintainCacheOnExit {
+			maintainReleasedCaches(ctx, root)
+		}
+	}()
 	if op == "start" || op == "resume" {
 		if formatErr := ensureNodeStateFormat(ctx, root); formatErr != nil {
 			return formatErr
@@ -883,7 +900,9 @@ func runNode(ctx context.Context, args []string, directSubmit bool) error {
 			}
 		}
 		s.LaunchID = launchID
-		if startErr = registerJob(ctx, parent, dir, c, s, (*stateWriter).sync); startErr != nil {
+		// An in-process worker keeps the registration lock handle. On Unix,
+		// a concurrent fork can keep a closed handle's flock alive until exec.
+		if owner, startErr = register(ctx, parent, dir, c, s, (*stateWriter).sync); startErr != nil {
 			return startErr
 		}
 		if len(c.Argv) > 0 {
@@ -899,6 +918,10 @@ func runNode(ctx context.Context, args []string, directSubmit bool) error {
 				return errors.New("command handoff already active")
 			}
 			defer closeBestEffort(handoff)
+			if closeErr := owner.Close(); closeErr != nil {
+				return closeErr
+			}
+			owner = nil
 			_ = guard.Close()
 			guard = nil
 			var done <-chan error
@@ -957,20 +980,17 @@ func runNode(ctx context.Context, args []string, directSubmit bool) error {
 			return err
 		}
 	}
-	f, err := openJobFile(filepath.Join(dir, "owner.lock"), jobFileLockExisting)
-	if err != nil {
-		return err
-	}
-	maintainCacheOnExit := false
-	defer func() {
-		if maintainCacheOnExit {
-			maintainReleasedCaches(ctx, root)
+	ownerPath := filepath.Join(dir, "owner.lock")
+	owned := owner != nil
+	if !owned {
+		owner, err = openJobFile(ownerPath, jobFileLockExisting)
+		if err != nil {
+			return err
 		}
-	}()
-	defer func() { _ = f.Close() }()
-	owned, err := tryAcquireJobOwner(ctx, dir, f)
-	if err != nil {
-		return err
+		owned, err = tryAcquireJobOwner(ctx, dir, owner)
+		if err != nil {
+			return err
+		}
 	}
 	resumeTerminal := op == "resume" && s.final
 	if !owned && (terminalClose || resumeTerminal) {
@@ -993,19 +1013,19 @@ func runNode(ctx context.Context, args []string, directSubmit bool) error {
 					return err
 				}
 			}
-			owned, err = tryAcquireJobOwner(deadline, dir, f)
+			owned, err = tryAcquireJobOwner(deadline, dir, owner)
 			if err != nil {
 				return err
 			}
 		}
 	}
 	if !owned {
-		if op == "clean" || launchID != "" || op == "_command" {
-			return errJobOwnerBusy
+		if op == "resume" && launchID == "" {
+			return printStatus(dir)
 		}
-		return printStatus(dir)
+		return errJobOwnerBusy
 	}
-	if handleErr := checkJobHandle(f, filepath.Join(dir, "owner.lock")); handleErr != nil {
+	if handleErr := checkJobHandle(owner, ownerPath); handleErr != nil {
 		return handleErr
 	}
 	s, cursor, err = loadJobStatus(dir)
@@ -1055,9 +1075,10 @@ func runNode(ctx context.Context, args []string, directSubmit bool) error {
 		}
 		// Reacquire locks in registry -> owner order and pin the terminal
 		// cursor that was actually reclaimed.
-		if err = f.Close(); err != nil {
+		if err = owner.Close(); err != nil {
 			return err
 		}
+		owner = nil
 		guard, err = registryLock(ctx, root)
 		if err != nil {
 			return err
