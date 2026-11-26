@@ -35,7 +35,7 @@ func TestWaitAnyIgnoresQuietClose(t *testing.T) {
 	ctx, cancel := fixtureContext(t)
 	defer cancel()
 	var out bytes.Buffer
-	if err := waitAny(ctx, root, "p", "", since, &out); err != nil || out.Len() == 0 {
+	if err := waitAny(ctx, root, []string{"p"}, "", since, true, &out); err != nil || out.Len() == 0 {
 		t.Fatal("first completion was not reported", err)
 	}
 	first.State = "done"

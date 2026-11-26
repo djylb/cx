@@ -25,14 +25,15 @@ import (
 type ctlOptions struct {
 	env                                                                             map[string]string
 	project, session, tag, cwd, dir, host                                           string
+	child, through                                                                  string
 	engine, model, effort, sandbox, role, parent                                    string
 	batch, snapshot, history, previous, input, profile                              string
 	quiet, timeout, idle, turnLimit, approval, stall, queue                         string
 	turn, sinceTurn, cursor, since, kind, mention, repo, script, shell, context, to string
-	hosts, channels, sets, argv, pos, images                                        []string
+	hosts, projects, channels, sets, argv, pos, images                              []string
 	interval                                                                        time.Duration
 	max                                                                             int
-	cleanBase, all, explicitSession                                                 bool
+	cleanBase, all, explicitSession, noSession                                      bool
 	full, json, log, watch, any, wait, raw, refresh, fromStart                      bool
 	inplace, interactive, web, hard, network, noNetwork                             bool
 	command, reuse, sync, force, noTools, messages, latest                          bool
@@ -45,7 +46,8 @@ func ctlFlags(op string, o *ctlOptions) *flag.FlagSet {
 	bools := map[string]*bool{
 		"incremental": &o.incremental, "allow-conflicts": &o.allowConflicts,
 		"all": &o.all, "clean-base": &o.cleanBase,
-		"refresh": &o.refresh, "cmd": &o.command, "reuse": &o.reuse,
+		"no-session": &o.noSession,
+		"refresh":    &o.refresh, "cmd": &o.command, "reuse": &o.reuse,
 		"inplace": &o.inplace, "interactive": &o.interactive, "web-search": &o.web,
 		"hard": &o.hard, "network": &o.network, "no-network": &o.noNetwork,
 		"force": &o.force, "sync": &o.sync, "no-tools": &o.noTools,
@@ -62,12 +64,17 @@ func ctlFlags(op string, o *ctlOptions) *flag.FlagSet {
 		"approval-timeout": &o.approval, "stall": &o.stall, "queue-timeout": &o.queue,
 		"script": &o.script, "shell": &o.shell, "project": &o.project,
 		"session": &o.session, "tag": &o.tag, "cwd": &o.cwd,
+		"job": &o.child, "through": &o.through,
 		"timeout": &o.timeout, "quiet-timeout": &o.quiet, "turn": &o.turn,
 		"cursor": &o.cursor, "since": &o.since, "since-turn": &o.sinceTurn, "context": &o.context, "to": &o.to,
 	}
 	const defaultPreviewBytes = 8192
 	o.max = defaultPreviewBytes
 	for _, k := range strings.Fields(cmd.flags) {
+		if op == "wait" && k == "project" {
+			f.Func(k, ctlFlagHelp(op, k), func(v string) error { o.projects = append(o.projects, v); return nil })
+			continue
+		}
 		if p := bools[k]; p != nil {
 			f.BoolVar(p, k, false, ctlFlagHelp(op, k))
 			continue
@@ -163,7 +170,7 @@ func parseCtl(op string, args []string) (ctlOptions, error) {
 				return o, fmt.Errorf("%s needs a value", v)
 			}
 			flags = append(flags, args[i])
-			if key == "chat" || key == "env" || key == "host" && op == "wait" {
+			if key == "chat" || key == "env" || (key == "host" || key == "project") && op == "wait" {
 				for i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
 					i++
 					flags = append(flags, "--"+key, args[i])
@@ -191,6 +198,15 @@ func parseCtl(op string, args []string) (ctlOptions, error) {
 	if o.all && o.explicitSession {
 		return o, errors.New("--all and --session are mutually exclusive")
 	}
+	if o.noSession && o.explicitSession {
+		return o, errors.New("--session and --no-session are mutually exclusive")
+	}
+	if o.explicitSession && strings.TrimSpace(o.session) == "" && (op == "wait" || f.Lookup("no-session") != nil) {
+		return o, errors.New("--session requires a non-empty name")
+	}
+	if op == "agent" && o.previous != "" && (o.explicitSession || o.noSession) {
+		return o, errors.New("session options apply to new jobs")
+	}
 	if o.raw && o.messages {
 		return o, errors.New("--raw and --messages are mutually exclusive")
 	}
@@ -207,14 +223,6 @@ func parseCtl(op string, args []string) (ctlOptions, error) {
 		return o, errors.New("negative output budget")
 	}
 	return o, e
-}
-func currentSession() string {
-	for _, key := range []string{"CX_SESSION", "CLAUDE_CODE_HOST_SESSION_ID", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"} {
-		if v := os.Getenv(key); v != "" {
-			return v
-		}
-	}
-	return ""
 }
 func defaultProject(ctx context.Context) (string, error) {
 	return projectAt(ctx, ".")
@@ -311,9 +319,6 @@ func controller(ctx context.Context, a []string) error {
 		}
 		return legacyGate(ctx, a)
 	}
-	if op == "fork" || op == "resume" {
-		return ctlRestart(ctx, op, a[1:])
-	}
 	if op == "project" {
 		return ctlProject(ctx, a[1:])
 	}
@@ -333,12 +338,31 @@ func controller(ctx context.Context, a []string) error {
 	if e != nil {
 		return ctlUsage(op, e)
 	}
-	if op == "wait" && !o.any && (o.all || o.explicitSession || len(o.hosts) > 0 || o.project != "" || o.session != "" || o.cursor != "" || len(o.channels) > 0) {
+	if op == "adopt" {
+		if !o.explicitSession {
+			o.session = currentSession()
+		}
+		if strings.TrimSpace(o.session) == "" {
+			return ctlUsage(op, errors.New("current session unknown; set CX_SESSION or use --session NAME"))
+		}
+	}
+	if op == "fork" || op == "resume" {
+		return ctlRestart(ctx, op, o)
+	}
+	if op == "wait" && !o.any && (o.all || o.explicitSession || len(o.hosts) > 0 || len(o.projects) > 0 || o.cursor != "" || len(o.channels) > 0 || o.fromStart) {
 		return ctlUsage(op, errors.New("wait filters require --any"))
+	}
+	if op == "wait" && o.any {
+		if err := validateWaitProjects(o.projects); err != nil {
+			return ctlUsage(op, err)
+		}
 	}
 	if (op == "ls" || op == "overview" || op == "wait" && o.any) && !o.all && !o.explicitSession {
 		o.session = currentSession()
 		if o.session == "" {
+			if op == "wait" {
+				return ctlUsage(op, errors.New("current session unknown; set CX_SESSION or use --session or --all"))
+			}
 			diagnosticf("cx %s: current session unknown, showing jobs from all sessions\n", op)
 		}
 	}
@@ -359,6 +383,10 @@ func controller(ctx context.Context, a []string) error {
 	if op == "rebase" {
 		if len(o.pos) != 2 {
 			return ctlUsage(op, errors.New("rebase requires JOB and TEXT"))
+		}
+		o.session, e = o.submissionSession()
+		if e != nil {
+			return ctlUsage(op, e)
 		}
 		o.dir = o.pos[1]
 		o.pos = o.pos[:1]
@@ -383,11 +411,14 @@ func controller(ctx context.Context, a []string) error {
 	}
 	if id != "" && op != "clean" && (op != "result" || !o.wait) {
 		var d time.Duration
-		if op == "tail" || op == "wait" {
+		switch op {
+		case "tail", "wait":
 			d, e = observation(o.timeout)
 			if e != nil {
 				return e
 			}
+		case "adopt":
+			d = adoptLimit
 		}
 		started := time.Now()
 		if handled, observeErr := observeSubmission(ctx, name, id, op, d); handled || observeErr != nil {
@@ -402,6 +433,8 @@ func controller(ctx context.Context, a []string) error {
 		}
 	}
 	switch op {
+	case "adopt":
+		return ctlAdopt(ctx, h, id, o.session)
 	case "clean":
 		return cleanControllerJob(ctx, h, name, id)
 	case "result", "patch", "apply", "rebase":
@@ -451,12 +484,13 @@ func controller(ctx context.Context, a []string) error {
 				return reuseErr
 			}
 		}
-		args := []string{"submit-command", id, o.cwd}
+		o.session, e = o.submissionSession()
+		if e != nil {
+			return ctlUsage(op, e)
+		}
+		args := []string{"submit-command", id, o.cwd, "--job-host", name}
 		for k, v := range o.env {
 			args = append(args, "--env", k+"="+v)
-		}
-		if o.session == "" {
-			o.session = currentSession()
 		}
 		for _, kv := range [][2]string{{"--profile", o.profile}, {"--session", o.session}, {"--queue-timeout", o.queue}, {"--quiet-timeout", o.quiet}, {"--timeout", o.timeout}} {
 			if kv[1] != "" {

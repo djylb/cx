@@ -56,6 +56,7 @@ type config struct {
 	RunID                               string            `json:"run_id,omitempty"`
 	SlotClass                           string            `json:"slot_class,omitempty"`
 	Project                             string            `json:"project,omitempty"`
+	Host                                string            `json:"host,omitempty"`
 	Session                             string            `json:"session,omitempty"`
 	DedupKey                            string            `json:"dedup_key,omitempty"`
 	StallNudge                          string            `json:"stall_nudge,omitempty"`
@@ -113,20 +114,21 @@ type status struct {
 	Usage     json.RawMessage `json:"token_usage"`
 	Approvals []approval      `json:"pending_requests,omitempty"`
 
-	QueueGeneration uint64 `json:"queue_generation,omitempty"`
-	Generation      uint64 `json:"generation,omitempty"`
-	CompactAfter    int64  `json:"compact_after_seq,omitempty"`
-	CompactSeq      int64  `json:"compact_event_seq,omitempty"`
-	RunnerStart     uint64 `json:"runner_start,omitempty"`
-	Restarts        int    `json:"restarts,omitempty"`
-	EngineRestarts  int    `json:"engine_restarts,omitempty"`
-	CommandPID      int    `json:"command_pid,omitempty"`
-	PID             int    `json:"pid,omitempty"`
-	EnginePID       int    `json:"engine_pid,omitempty"`
-	Finished        int64  `json:"completed_turns"`
-	StallCount      int    `json:"stall_count,omitempty"`
-	Privileged      bool   `json:"privileged,omitempty"`
-	final           bool
+	QueueGeneration      uint64 `json:"queue_generation,omitempty"`
+	Generation           uint64 `json:"generation,omitempty"`
+	CompactAfter         int64  `json:"compact_after_seq,omitempty"`
+	CompactSeq           int64  `json:"compact_event_seq,omitempty"`
+	RunnerStart          uint64 `json:"runner_start,omitempty"`
+	Restarts             int    `json:"restarts,omitempty"`
+	EngineRestarts       int    `json:"engine_restarts,omitempty"`
+	CommandPID           int    `json:"command_pid,omitempty"`
+	PID                  int    `json:"pid,omitempty"`
+	EnginePID            int    `json:"engine_pid,omitempty"`
+	Finished             int64  `json:"completed_turns"`
+	StallCount           int    `json:"stall_count,omitempty"`
+	CompletedRateLimited bool   `json:"last_completed_rate_limited,omitempty"`
+	Privileged           bool   `json:"privileged,omitempty"`
+	final                bool
 }
 
 // diagnosticf writes advisory text or reports an existing failure. A broken
@@ -448,23 +450,36 @@ func runNodeWithRegistration(ctx context.Context, args []string, directSubmit bo
 		fs.StringVar(&marker.ID, "cmd-id", os.Getenv("CXRUN_CMD_ID"), "idempotency key")
 		fs.Func("turn-id", "target turn", func(v string) error { marker.Turn = &v; return nil })
 	}
-	project := fs.String("project", "", "project namespace")
+	project := new(string)
+	if op != "wait" {
+		fs.StringVar(project, "project", "", "project namespace")
+	}
 	session := fs.String("session", "", "session label")
 	var limit time.Duration
-	var anyJob bool
+	var anyJob, fromStart bool
+	var waitProjects []string
 	var sinceFile, listFields string
 	if op == "wait" {
 		fs.DurationVar(&limit, "timeout", 0, "wait deadline")
 		fs.BoolVar(&anyJob, "any", false, "wait for any matching job")
 		fs.StringVar(&sinceFile, "since-file", "", "consumer baseline file for --any")
+		fs.BoolVar(&fromStart, "from-start", false, "replay retained job history for a new baseline")
+		fs.Func("project", "project namespace (repeatable with --any)", func(p string) error {
+			*project = p
+			waitProjects = append(waitProjects, p)
+			return nil
+		})
 	}
 	if op == "list" {
 		fs.StringVar(&listFields, "fields", "", "brief for compact status")
 	}
 	var force, command, network, noNetwork bool
-	var requestedProfile string
+	var requestedProfile, jobHost string
 	if op == "start" || op == "resume" || op == "fork" {
 		fs.StringVar(&requestedProfile, "profile", "", "execution host profile")
+	}
+	if op == "start" || op == "fork" {
+		fs.StringVar(&jobHost, "job-host", "", "execution host label for the job session")
 	}
 	newProfile := op == "start"
 
@@ -570,15 +585,21 @@ func runNodeWithRegistration(ctx context.Context, args []string, directSubmit bo
 		if *job != "" || fs.NArg() != 0 {
 			return errors.New("wait --any accepts filters only")
 		}
+		if filterErr := validateWaitProjects(waitProjects); filterErr != nil {
+			return filterErr
+		}
 		waitCtx, cancel, monitorErr := monitorContext(ctx, limit)
 		if monitorErr != nil {
 			return monitorErr
 		}
 		defer cancel()
-		return waitAny(waitCtx, root, *project, *session, sinceFile, os.Stdout)
+		return waitAny(waitCtx, root, waitProjects, *session, sinceFile, fromStart, os.Stdout)
 	}
 	if sinceFile != "" {
 		return errors.New("--since-file requires --any")
+	}
+	if fromStart {
+		return errors.New("--from-start requires --any")
 	}
 	dir, err := jobPath(parent, *job)
 	if err != nil {
@@ -784,6 +805,14 @@ func runNodeWithRegistration(ctx context.Context, args []string, directSubmit bo
 	c.Project, c.Session = *project, *session
 	s := status{Job: *job, Project: *project, Session: *session, State: "queued", LastEvent: time.Now().UTC()}
 	if op == "start" {
+		if jobHost != "" {
+			c.Host = jobHost
+		}
+		if c.Host != "" {
+			if _, err = jobPath("", c.Host); err != nil {
+				return fmt.Errorf("invalid job host: %w", err)
+			}
+		}
 		s.Profile, _, err = selectedProfile(root, profile, newProfile)
 		if err != nil {
 			return err

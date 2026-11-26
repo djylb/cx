@@ -277,8 +277,8 @@ func TestB3ChatInteroperability(t *testing.T) {
 	waitBoth := func(want int, limit string) {
 		t.Helper()
 		args := []string{"wait", "--any", "--chat", "reports", "--timeout", limit}
-		goOut := cliOutput(t, want, nil, f.cx, args...)
-		if want == 124 || want == 9 {
+		goOut := cliOutput(t, want, nil, f.cx, append(args, "--all", "--from-start")...)
+		if want == 124 {
 			if len(goOut) != 0 {
 				t.Fatalf("unexpected Go wait output: %s", goOut)
 			}
@@ -323,13 +323,16 @@ func TestB3ChatInteroperability(t *testing.T) {
 			t.Fatal(string(d), e)
 		}
 	}
-	// One failed observer and one idle observer must preserve the failure.
+	// One failed observer and one idle observer keep waiting until the deadline.
 	brokenRoot := filepath.Join(f.home, "broken")
 	if err := os.MkdirAll(filepath.Join(brokenRoot, "p-meta.git"), 0700); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("CX_CHAT_LOCAL_ROOT", brokenRoot)
-	waitBoth(9, "1s")
+	if out, diag := cliStreams(t, 124, nil, f.cx, "wait", "--any", "--all", "--chat", "reports", "--timeout", "1s"); len(out) != 0 ||
+		!strings.Contains(diag, "#reports unavailable, retrying") {
+		t.Fatalf("failed channel wait: %s (%s)", out, diag)
+	}
 }
 
 func TestB3LinuxCenterSetup(t *testing.T) {
@@ -651,6 +654,7 @@ esac
 
 func TestB3SessionScope(t *testing.T) {
 	f := newControllerFixture(t)
+	t.Setenv("CX_SESSION", "")
 	if f.python == "" {
 		t.Log("cx-control.py unavailable: skipping session listing comparisons")
 	}

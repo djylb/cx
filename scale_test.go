@@ -52,13 +52,17 @@ func TestWaitAnyConsumers(t *testing.T) {
 		if err := json.Unmarshal([]byte(line), &got); err != nil || got.Event == "" || got.EventID == "" || strings.Count(line, "\n") != 1 {
 			t.Fatalf("wanted %+v, got %s %v", expected, line, err)
 		}
+		if expected.Finished > 0 && expected.Outcome != "" {
+			expected.Turn = expected.Finished
+			expected.setNext("local")
+		}
 		got.Event, got.EventID = "", ""
 		if got != expected {
 			t.Fatalf("wanted %+v, got %s", expected, line)
 		}
 	}
 	var out bytes.Buffer
-	if err := waitAny(ctx, root, "p", "s", a, &out); err != nil {
+	if err := waitAny(ctx, root, []string{"p"}, "s", a, true, &out); err != nil {
 		t.Fatal(err)
 	}
 	failedTurn := waitReport{Project: "p", Job: "work", State: "waiting", Outcome: "failed", Finished: 1, Code: 1}
@@ -69,7 +73,7 @@ func TestWaitAnyConsumers(t *testing.T) {
 		var out bytes.Buffer
 		ctx, cancel := fixtureContext(t)
 		defer cancel()
-		if err := waitAny(ctx, root, project, session, file, &out); err != nil {
+		if err := waitAny(ctx, root, []string{project}, session, file, true, &out); err != nil {
 			t.Fatal(err)
 		}
 		return out.String()

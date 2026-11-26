@@ -37,7 +37,7 @@ func TestJobStorageDoesNotReplaceFiles(t *testing.T) {
 		"ctl_route.go":           {"rememberRoute": 1},
 		"ctl_transfer.go":        {"receiveTask": 1},
 		"snap_publish.go":        {"snapPrerequisites": 1, "snapArchive": 1, "Publish": 1},
-		"wait_any.go":            {"waitAny": 1},
+		"wait_any.go":            {"updateWaitCursor": 1},
 	}
 	// Every standard-library file open, including references through a
 	// function variable, must belong to one of these non-job scopes.

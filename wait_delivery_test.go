@@ -46,7 +46,7 @@ func TestWaitAnyWithdrawalBetweenCallsAndTurnsBeforeTerminal(t *testing.T) {
 	seen := make(map[string]bool)
 	expect := func(event, outcome string, code int, finished int64) {
 		t.Helper()
-		row, err := pollWaitAny(ctx, root, "", "", baseline)
+		row, err := pollWaitAny(ctx, root, nil, "", baseline)
 		if err != nil || row == nil || row.Event != event || row.Outcome != outcome || row.Code != code || row.Finished != finished ||
 			row.EventID == "" || seen[row.EventID] {
 			t.Fatalf("wanted %s/%s (%d, %d), got %+v (%v)", event, outcome, code, finished, row, err)
@@ -118,7 +118,7 @@ func TestWaitAnyReportsTerminalFailureWithDamagedOutbox(t *testing.T) {
 		t.Fatalf("expected failure diagnostic, got %v", terminalErr)
 	}
 	baseline := make(map[string]waitCursor)
-	row, err := pollWaitAny(ctx, root, "", "", baseline)
+	row, err := pollWaitAny(ctx, root, nil, "", baseline)
 	if err != nil || row == nil || row.Event != "terminal" || row.State != "failed" || row.Code != 1 ||
 		row.OutboxSeq != 0 || baseline["j"].OutboxSeq != 0 || baseline["j"].OutboxCursor != "" {
 		t.Fatalf("terminal result or mail acknowledgement incorrect: %+v (%v), %+v", row, err, baseline)
@@ -149,11 +149,14 @@ func TestWaitAnyRetriesFailedOutputAndCursorWithStableID(t *testing.T) {
 					return 0, err
 				}
 				if mode == "persist cursor" {
+					if err := os.Remove(file); err != nil {
+						return 0, err
+					}
 					return len(p), os.Mkdir(file, 0700)
 				}
 				return 0, io.ErrClosedPipe
 			})
-			err := waitAny(ctx, root, "", "", file, out)
+			err := waitAny(ctx, root, nil, "", file, true, out)
 			if mode == "persist cursor" {
 				if err == nil || !strings.Contains(err.Error(), "write wait baseline") {
 					t.Fatalf("wanted cursor persistence failure, got %v", err)
@@ -165,7 +168,7 @@ func TestWaitAnyRetriesFailedOutputAndCursorWithStableID(t *testing.T) {
 				t.Fatalf("wanted stdout failure, got %v", err)
 			}
 			var output bytes.Buffer
-			if err = waitAny(ctx, root, "", "", file, &output); !errors.Is(err, ctlExit(exitQueued)) {
+			if err = waitAny(ctx, root, nil, "", file, true, &output); !errors.Is(err, ctlExit(exitQueued)) {
 				t.Fatalf("failed event did not replay: %s (%v)", &output, err)
 			}
 			var second waitReport
@@ -188,7 +191,7 @@ func TestWaitAnySinceFileLockCoversOutput(t *testing.T) {
 	enter, release := make(chan struct{}), make(chan struct{}, 1)
 	done := make(chan error, 1)
 	go func() {
-		done <- waitAny(ctx, root, "", "", file, waitWriterFunc(func(p []byte) (int, error) {
+		done <- waitAny(ctx, root, nil, "", file, true, waitWriterFunc(func(p []byte) (int, error) {
 			close(enter)
 			select {
 			case <-release:
@@ -282,7 +285,7 @@ func TestWaitThirteenMachineContract(t *testing.T) {
 			t.Fatalf("closed controller stdout should fail before acknowledgement: %v", err)
 		}
 		one := cliOutput(t, 13, nil, f.cx, "wait", "local:q/queue-thirteen", "--timeout", "2m")
-		anyJob := cliOutput(t, 13, nil, f.cx, "wait", "--any", "--project", "q", "--timeout", "2m")
+		anyJob := cliOutput(t, 13, nil, f.cx, "wait", "--any", "--all", "--from-start", "--project", "q", "--timeout", "2m")
 		for _, body := range [][]byte{one, anyJob} {
 			var row waitObservation
 			if err := json.Unmarshal(body, &row); err != nil || row.State != "queued" || row.QueueReason != r.s.QueueReason ||

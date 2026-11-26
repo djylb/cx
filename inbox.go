@@ -350,6 +350,7 @@ func (r *runner) terminalMailboxOutcomes() ([]stateRecord, error) {
 		}
 	}
 	var records []stateRecord
+	session := r.s.Session
 	appendValue := func(kind string, v any) error {
 		frame, err := newRecord(kind, v)
 		if err == nil {
@@ -363,6 +364,12 @@ func (r *runner) terminalMailboxOutcomes() ([]stateRecord, error) {
 			result = "uncertain"
 		}
 		if item.Kind == "close" && item.Seq == r.closeRequest && r.closeCompleted {
+			result = "delivered"
+		}
+		if item.Kind == adoptKind {
+			if err := json.Unmarshal(item.Value, &session); err != nil {
+				return nil, err
+			}
 			result = "delivered"
 		}
 		if item.Kind == "rpc" {
@@ -413,6 +420,7 @@ func (r *runner) terminalMailboxOutcomes() ([]stateRecord, error) {
 			return nil, err
 		}
 	}
+	r.s.Session = session
 	return records, nil
 }
 

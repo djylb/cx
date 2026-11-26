@@ -86,6 +86,30 @@ Direct agent starts can set `--cmd-stall` (30 minutes for a silent command withi
 
 Admission checks the host's disk threshold, load check, and available slots. A queued notice includes `queue_reason` and `event_id`. Single-job `wait` and `agent` share notification acknowledgement; `wait --any` tracks deliveries by cursor.
 
+## Wait for any job
+
+```sh
+cx wait --any --host local --host worker --project alpha --project beta --timeout 2m
+```
+
+`cx wait --any` prints one JSON event. It watches the current session across configured hosts and projects. Repeat `--host` or `--project` to select a union. Set `--session NAME` to select a session explicitly or `--all` to watch every session. If cx cannot determine the current session, it exits 2 and asks for an explicit session or scope.
+
+cx selects the first nonempty value among `CX_SESSION`, `CLAUDE_CODE_HOST_SESSION_ID`, `CLAUDE_CODE_SESSION_ID`, `CODEX_THREAD_ID`, and `OPENCODE_SESSION_ID`, in that order. This detects Claude Code, Codex (including desktop when it exports `CODEX_THREAD_ID`), and OpenCode. Set `CX_SESSION` when your tool does not export a recognized variable. When creating a job, use `--session NAME` to override detection or `--no-session` to explicitly leave it ungrouped. With neither flag and no detected session, submission exits 2. Inside an agent or command job, cx clears inherited session identifiers and sets `CX_SESSION` to the job's own `HOST:PROJECT/JOB`. A child submission therefore belongs to that job's session.
+
+Use `cx adopt JOB [--session NAME]` to move an existing job into the given session or, by default, the current session. `wait --any`, `ls`, and `overview` use the new session after adoption. Cursors keep acknowledgements already recorded for the same job and run.
+
+A new named cursor (default `default`) records each host's current job state on first successful contact. The node form, `cx node wait --any --since-file PATH`, records its initial state in the supplied file. Both save the baseline even when no event arrives before the deadline. For a new cursor, use `--from-start` to replay retained turn completions and pending events. An existing cursor resumes from its saved position. Use a separate cursor for each independent filter set. Multiple processes using the same session cursor can wait concurrently and print a warning. Delivery is at least once, so deduplicate retries by `event_id`.
+
+Job events include these fields.
+
+| Field | Meaning |
+| --- | --- |
+| `turn` | Number of the completed turn associated with this event, or `0` when the event has no completed turn. |
+| `next` | Suggested command such as `cx result worker:alpha/check --turn 2`, or an empty string when the event has no result. |
+| `rate_limited` | Boolean set when a usage or rate limit ended the selected turn. The existing outcome and exit code still describe the turn result. |
+
+When a host disconnects, cx reports the outage on stderr and backs off independently while it watches the other hosts. A previously initialized host resumes from its saved position when it reconnects. The command exits 124 when its deadline expires without an event, with a stderr message if every selected host is unavailable. `--chat CHANNEL` includes channel messages for the selected projects (or the current project when no project is specified).
+
 ## Environment variables
 
 | Variable | Use |
@@ -94,7 +118,7 @@ Admission checks the host's disk threshold, load check, and available slots. A q
 | `CXRUN_MONITOR_TIMEOUT` | Default observation duration, for example `20s`. |
 | `CX_PSMUX`, `CXRUN_TMUX_SOCKET` | Override the Windows psmux executable and namespace. |
 | `CX_PROJECT`, `XDG_CONFIG_HOME` | Select a project explicitly or relocate the projects configuration directory. Project membership and source directory supply the fallback name. |
-| `CX_SESSION` | Session label. Fallback order is `CLAUDE_CODE_HOST_SESSION_ID`, `CLAUDE_CODE_SESSION_ID`, then `CODEX_THREAD_ID`. |
+| `CX_SESSION` | Explicit session label for submissions and observation. |
 | `CX_PARENT` | Default parent job or session for a submission. Use `--parent` to override it. |
 | `CX_DEFAULT_HOST`, `CX_HOSTS` | Automatic submission host override and comma-separated host selection for multi-host views and waits. |
 | `CX_CONTEXT_DIR`, `CX_POLICY_DIR` | Override project context and policy template directories. Context merges the shared `context/` next to the projects directory with `PROJECT/context/` (project wins); the job gets its copy at `$CX_CONTEXT`, and a `MEMORY.md` there is named in the preamble.  Host notes come from `hosts/HOST/context/` beside it, under `host/`; `--context` selects layers. |

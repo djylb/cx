@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"time"
 )
@@ -38,7 +39,13 @@ func (c *config) mark(cmd *exec.Cmd, dir string) {
 	for k, v := range c.Env {
 		env = append(env, k+"="+v)
 	}
-	cmd.Env = append(env, "CXRUN_JOB="+c.Project+"/"+filepath.Base(dir), "CXRUN_RUN="+c.RunID)
+	env = slices.DeleteFunc(env, isSessionEnv)
+	host := c.Host
+	if host == "" {
+		host = "local"
+	}
+	job := c.Project + "/" + filepath.Base(dir)
+	cmd.Env = append(env, "CXRUN_JOB="+job, "CXRUN_RUN="+c.RunID, sessionEnv+"="+host+":"+job)
 }
 func sameProcess(start, current uint64) bool { return start != 0 && start == current }
 

@@ -296,6 +296,7 @@ func (r *runner) clearCurrentTurn() {
 	r.s.Turn = ""
 	r.s.LastCompleted = ""
 	r.s.CompletedStatus = ""
+	r.s.CompletedRateLimited = false
 	r.s.TurnStatus = ""
 	r.s.InputKind = ""
 	r.s.turnSummary = turnSummary{}

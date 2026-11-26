@@ -92,6 +92,10 @@ func ctlSubmit(ctx context.Context, hs endpoints, op string, o ctlOptions) error
 		fmt.Println(id)
 		return nil
 	}
+	session, sessionErr := o.submissionSession()
+	if o.previous == "" && !o.reuse && sessionErr != nil {
+		return ctlUsage(op, sessionErr)
+	}
 	var host, src, tag, prompt string
 	if op == "agent" {
 		if len(o.pos) != 1 {
@@ -205,11 +209,6 @@ func ctlSubmit(ctx context.Context, hs endpoints, op string, o ctlOptions) error
 	if e != nil {
 		return e
 	}
-	if h.Manager {
-		if e = pushContext(ctx, h, host, false); e != nil {
-			return fmt.Errorf("refresh context copy on %s: %w", host, e)
-		}
-	}
 	src, e = filepath.Abs(src)
 	if e != nil {
 		return e
@@ -226,7 +225,7 @@ func ctlSubmit(ctx context.Context, hs endpoints, op string, o ctlOptions) error
 	if _, e = jobDir("", id); e != nil {
 		return e
 	}
-	req := jobSubmission{ID: id, Host: host, Role: o.role, Parent: o.parent, Session: currentSession(), Command: o.argv, Prompt: prompt}
+	req := jobSubmission{ID: id, Host: host, Role: o.role, Parent: o.parent, Session: session, Command: o.argv, Prompt: prompt}
 	if req.Role == "" {
 		req.Role = "worker"
 	}
@@ -352,6 +351,14 @@ func ctlSubmit(ctx context.Context, hs endpoints, op string, o ctlOptions) error
 			if reuseErr != nil || found {
 				return reuseErr
 			}
+		}
+	}
+	if sessionErr != nil {
+		return ctlUsage(op, sessionErr)
+	}
+	if h.Manager {
+		if e = pushContext(ctx, h, host, false); e != nil {
+			return fmt.Errorf("refresh context copy on %s: %w", host, e)
 		}
 	}
 	canonical, e := filepath.EvalSymlinks(src)

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 )
@@ -38,7 +39,7 @@ func ensureNodeStateFormat(ctx context.Context, root string) error {
 	if known, err := checkNodeStateFormat(root); err != nil || known {
 		return err
 	}
-	err := walkJobDirs(ctx, root, "", func(dir, project, name string) (bool, bool, error) {
+	err := walkJobDirs(ctx, root, nil, func(dir, project, name string) (bool, bool, error) {
 		if project == "" && strings.EqualFold(name, "cache") {
 			return true, false, nil
 		}
@@ -214,7 +215,7 @@ func archiveReceipt(root string, c config, s status, syncArchive func(string, st
 
 // The root may contain flat jobs and project directories. A top-level
 // directory without a published job status may be a project.
-func walkJobDirs(ctx context.Context, root, project string, visit func(dir, project, job string) (registered, stop bool, err error)) error {
+func walkJobDirs(ctx context.Context, root string, projects []string, visit func(dir, project, job string) (registered, stop bool, err error)) error {
 	var scan func(string, string) (bool, error)
 	scan = func(dir, p string) (bool, error) {
 		entries, err := os.ReadDir(dir)
@@ -231,7 +232,7 @@ func walkJobDirs(ctx context.Context, root, project string, visit func(dir, proj
 			if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
 				continue
 			}
-			if p == "" && project != "" && entry.Name() != project {
+			if p == "" && len(projects) > 0 && !slices.Contains(projects, entry.Name()) {
 				continue
 			}
 			path := filepath.Join(dir, entry.Name())
@@ -252,7 +253,11 @@ func walkJobDirs(ctx context.Context, root, project string, visit func(dir, proj
 }
 
 func scanJobs(ctx context.Context, root, project, session string, visit func(status) (bool, error)) error {
-	return walkJobDirs(ctx, root, project, func(path, p, _ string) (bool, bool, error) {
+	var projects []string
+	if project != "" {
+		projects = []string{project}
+	}
+	return walkJobDirs(ctx, root, projects, func(path, p, _ string) (bool, bool, error) {
 		id, s, _, err := captureJobIdentity(path)
 		if errors.Is(err, os.ErrNotExist) {
 			return false, false, nil

@@ -130,7 +130,7 @@ func mirrorRefs(ctx context.Context, sid, data string) error {
 	}
 	return nil
 }
-func rebaseTurn(ctx context.Context, dir, host, id, text string, m turnResult) error {
+func rebaseTurn(ctx context.Context, dir, host, id, text, session string, m turnResult) error {
 	if strings.TrimSpace(text) == "" {
 		return errors.New("rebase requires follow-up text")
 	}
@@ -210,6 +210,9 @@ func rebaseTurn(ctx context.Context, dir, host, id, text string, m turnResult) e
 	opts.cleanBase = origin.CleanBase
 	opts.role = origin.Role
 	opts.parent = origin.Parent
+	opts.session = session
+	opts.explicitSession = session != ""
+	opts.noSession = session == ""
 	if e = ctlSubmit(ctx, hs, "run", opts); e != nil {
 		return e
 	}

@@ -216,6 +216,7 @@ func (r *runner) publishTurnReport(id string, report []byte) error {
 type turnCompletion struct {
 	Outcome string `json:"outcome"`
 	observedResult
+	RateLimited bool `json:"rate_limited,omitempty"`
 }
 
 func completedTurn(s status) turnCompletion {
@@ -228,6 +229,7 @@ func completedTurn(s status) turnCompletion {
 	return turnCompletion{
 		Outcome:        outcome,
 		observedResult: observedResult{RunID: s.RunID, Number: s.Finished, TurnID: s.LastCompleted},
+		RateLimited:    s.CompletedRateLimited,
 	}
 }
 
@@ -442,6 +444,7 @@ func (r *runner) finish(t turn) error {
 		r.s.LastCompleted = t.ID
 	}
 	r.s.CompletedStatus = t.Status
+	r.s.CompletedRateLimited = t.Error != nil && t.Error.rateLimited()
 	r.s.InputKind = ""
 	line, _, _ := strings.Cut(r.lastText, "\n")
 	if r.c.Interactive && t.Status == "completed" && reportStatus(line) == "QUESTION" {

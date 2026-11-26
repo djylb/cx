@@ -63,14 +63,22 @@ func (o *jobStateObserver) Close() error { return o.tail.Close() }
 // Seed the view once. A reconnect can still consume the tail from its saved
 // position. The seed prevents intermediate records from regressing the view.
 func openJobObservation(dir string, from stateCursor, runID string) (*jobStateObserver, error) {
+	if from == (stateCursor{}) {
+		return openJobObservationFrom(dir, nil, runID)
+	}
+	return openJobObservationFrom(dir, &from, runID)
+}
+
+func openJobObservationFrom(dir string, from *stateCursor, runID string) (*jobStateObserver, error) {
 	identity, s, cur, err := captureJobIdentity(dir)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
-	if from == (stateCursor{}) || runID != "" && runID != s.RunID || runID == "" && from.Seg > cur.Seg {
-		from = cur
+	anchor := cur
+	if from != nil && (runID != "" && runID == s.RunID || runID == "" && from.Seg <= cur.Seg) {
+		anchor = *from
 	}
-	tail, err := openStateTail(dir, from)
+	tail, err := openStateTail(dir, anchor)
 	if err != nil {
 		return nil, err
 	}

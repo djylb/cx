@@ -328,7 +328,7 @@ func nodeCLI(ctx context.Context, args []string) error {
 			return cacheNode(ctx, args)
 		case "recv":
 			return receive(ctx, args[1:])
-		case "follow", "observe-one", "wait-ack", "submit-if-version", "install", "host-config", "check-profile", "doctor", "show", "overview", "rows", "wait-poll", "submit-command":
+		case "adopt-job", "follow", "observe-one", "wait-ack", "submit-if-version", "install", "host-config", "check-profile", "doctor", "show", "overview", "rows", "wait-poll", "submit-command":
 			return nodeControl(ctx, args)
 		}
 	}
@@ -409,7 +409,7 @@ func (h endpoint) transportCommand(ctx context.Context, args []string, idle time
 	for len(watch) > 2 && watch[0] == "forward" {
 		watch = watch[2:]
 	}
-	live := len(watch) > 0 && (watch[0] == "channel" || watch[0] == "wait-poll" || watch[0] == "observe-one" || watch[0] == "observe-result" || watch[0] == "follow")
+	live := len(watch) > 0 && (watch[0] == "adopt-job" || watch[0] == "channel" || watch[0] == "wait-poll" || watch[0] == "observe-one" || watch[0] == "observe-result" || watch[0] == "follow")
 	if live {
 		argv[1] = "watch-wire"
 	}
@@ -464,6 +464,10 @@ func (h endpoint) call(ctx context.Context, per time.Duration, args ...string) (
 	return h.invoke(ctx, per, true, args...)
 }
 func (h endpoint) invoke(parent context.Context, per time.Duration, replay bool, args ...string) (reply, error) {
+	return h.invokeWithDiagnostics(parent, per, replay, true, args...)
+}
+
+func (h endpoint) invokeWithDiagnostics(parent context.Context, per time.Duration, replay, diagnose bool, args ...string) (reply, error) {
 	connect := h.connectionBudget(per)
 	ctx, cancel := context.WithTimeout(parent, connect+3*per+15*time.Second)
 	defer cancel()
@@ -490,7 +494,7 @@ func (h endpoint) invoke(parent context.Context, per time.Duration, replay bool,
 			return reply{b, 0}, nil
 		}
 		if errors.As(err, &exit) && (exit.ExitCode() != 255 || h.SSH == "") {
-			if diag.Len() > 0 {
+			if diagnose && diag.Len() > 0 {
 				diagnosticf("%s", cleanDiag(diag.Bytes()))
 			}
 			return reply{b, exit.ExitCode()}, nil
@@ -499,6 +503,9 @@ func (h endpoint) invoke(parent context.Context, per time.Duration, replay bool,
 			return reply{}, errors.Join(ctlExit(9), cause)
 		}
 		if !replay || i == 3 || ctx.Err() != nil || h.SSH == "" {
+			if !diagnose {
+				return reply{}, fmt.Errorf("%w: %v %s", ctlExit(9), err, cleanDiag(diag.Bytes()))
+			}
 			diagnosticf("node invocation: %v %s\n", err, cleanDiag(diag.Bytes()))
 			return reply{}, ctlExit(9)
 		}

@@ -216,6 +216,13 @@ func (r *runner) takeMarker(op string) (controlMarker, bool, error) {
 	if err := r.refreshInbox(); err != nil {
 		return controlMarker{}, false, err
 	}
+	if op == "close" {
+		// All runners check for close, including during admission. Publish
+		// pending session changes before acting on that terminal control.
+		if err := r.consumeAdoptions(); err != nil {
+			return controlMarker{}, false, err
+		}
+	}
 	for _, record := range r.inbox.queue {
 		if record.Kind != op {
 			continue

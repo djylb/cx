@@ -5,7 +5,6 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"os"
 	"os/exec"
@@ -94,7 +93,7 @@ func startNodeJob(ctx context.Context, raw string) error {
 		}
 		env["CX_CONTEXT"] = d
 	}
-	argv := []string{"start", "--job", req.ID, "--dir", prep.Source, "--session", req.Session}
+	argv := []string{"start", "--job", req.ID, "--dir", prep.Source, "--session", req.Session, "--job-host", req.Host}
 	argv = append(argv, req.Options...)
 	for i := range argv {
 		if argv[i] == "--input-json" && i+1 < len(argv) {
@@ -239,33 +238,26 @@ func awaitRunner(ctx context.Context, dir, runID, token string, pid int, done <-
 	}
 }
 
-func restartFlags(op string, child, through, profile *string) *flag.FlagSet {
-	fs := cliFlags(op)
-	fs.StringVar(profile, "profile", "", "execution host profile")
-	if op == "fork" {
-		fs.StringVar(child, "job", "", "required child job tag")
-		fs.StringVar(through, "through", "", "last turn to include (defaults to all turns)")
-	}
-	return fs
-}
-
-func ctlRestart(ctx context.Context, op string, a []string) error {
-	if len(a) == 0 || strings.HasPrefix(a[0], "-") {
+func ctlRestart(ctx context.Context, op string, o ctlOptions) error {
+	if len(o.pos) != 1 {
 		return ctlUsage(op, fmt.Errorf("%s needs a job", op))
 	}
-	child, through, profile := "", "", ""
-	fs := restartFlags(op, &child, &through, &profile)
-	if e := fs.Parse(a[1:]); e != nil {
-		return ctlUsage(op, e)
-	}
-	if fs.NArg() > 0 {
-		return ctlUsage(op, errors.New("unexpected arguments"))
+	var session string
+	if op == "fork" {
+		if _, e := jobPath("", o.child); e != nil {
+			return ctlUsage(op, e)
+		}
+		var e error
+		session, e = o.submissionSession()
+		if e != nil {
+			return ctlUsage(op, e)
+		}
 	}
 	hs, e := loadEndpoints()
 	if e != nil {
 		return e
 	}
-	host, id, e := resolveJob(ctx, a[0])
+	host, id, e := resolveJob(ctx, o.pos[0])
 	if e != nil {
 		return e
 	}
@@ -273,20 +265,12 @@ func ctlRestart(ctx context.Context, op string, a []string) error {
 	if e != nil {
 		return e
 	}
-	if op == "fork" {
-		if _, e = jobPath("", child); e != nil {
-			return e
-		}
-	}
 	if op == "resume" {
 		if e = forgetResult(host, id); e != nil {
 			return e
 		}
 	}
-	argv := []string{"restart-job", op, host, id, child, through}
-	if profile != "" {
-		argv = append(argv, profile)
-	}
+	argv := []string{"restart-job", op, host, id, o.child, o.through, o.profile, session}
 	r, e := h.invoke(ctx, 20*time.Second, false, argv...)
 	if e != nil {
 		return e
@@ -295,6 +279,7 @@ func ctlRestart(ctx context.Context, op string, a []string) error {
 		return r.output()
 	}
 	p, _, ok := strings.Cut(id, "/")
+	child := o.child
 	if ok {
 		child = p + "/" + child
 	}
@@ -305,14 +290,11 @@ func ctlRestart(ctx context.Context, op string, a []string) error {
 	return nil
 }
 func restartNode(ctx context.Context, a []string) error {
-	if len(a) != 5 && len(a) != 6 {
+	if len(a) != 7 {
 		return errors.New("invalid restart arguments")
 	}
 	op, host, id := a[0], a[1], a[2]
-	var profile string
-	if len(a) == 6 {
-		profile = a[5]
-	}
+	profile, session := a[5], a[6]
 	root, e := stateRoot()
 	if e != nil {
 		return e
@@ -429,7 +411,7 @@ func restartNode(ctx context.Context, a []string) error {
 		} else if !os.IsNotExist(e) {
 			return e
 		}
-		argv = []string{"fork", id, "--job", child, "--session", host + ":" + id}
+		argv = []string{"fork", id, "--job", child, "--job-host", host, "--session", session}
 		if a[4] != "" {
 			argv = append(argv, "--through", a[4])
 		}
@@ -459,7 +441,7 @@ func continueNode(ctx context.Context, host, id, text, profile string) error {
 		return e
 	}
 	if isTerminal(s.State) && s.Thread != "" {
-		if e = restartNode(ctx, []string{"resume", host, id, "", ""}); e != nil {
+		if e = restartNode(ctx, []string{"resume", host, id, "", "", "", ""}); e != nil {
 			return e
 		}
 	}

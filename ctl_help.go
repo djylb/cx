@@ -14,9 +14,11 @@ type ctlCommand struct {
 	usage, summary, flags string
 }
 
-const submitFlags = "profile engine model effort sandbox role parent snapshot with-history input-json image idle-exit turn-timeout approval-timeout stall queue-timeout inplace interactive web-search hard network no-network force sync no-tools clean-base context"
+const submissionSessionFlags = "session no-session"
+const submitFlags = "profile engine model effort sandbox role parent snapshot with-history input-json image idle-exit turn-timeout approval-timeout stall queue-timeout inplace interactive web-search hard network no-network force sync no-tools clean-base context " + submissionSessionFlags
 
 var ctlCommands = map[string]ctlCommand{
+	"adopt":        {"JOB [--session NAME]", "Move an existing job into a session.", "session"},
 	"agent":        {"[--host HOST] [--dir DIR] TEXT|@FILE|-\n  cx agent --continue JOB TEXT|@FILE|-", "Submit or continue an agent and read its report.", submitFlags + " dir host tag continue full"},
 	"apply":        {"JOB [DIR]", "Check and apply a collected patch.", "turn since-turn allow-conflicts repo max-bytes"},
 	"approve":      {"JOB", "Approve a pending request.", ""},
@@ -32,8 +34,8 @@ var ctlCommands = map[string]ctlCommand{
 	"diff":         {"JOB", "Read recorded diff events.", ""},
 	"doctor":       {"[HOST ...]", "Check execution hosts.", "json"},
 	"events":       {"JOB", "Read recorded events.", ""},
-	"exec":         {"HOST [options] -- ARGV...\n  cx exec HOST --script FILE [--shell SHELL] [options]", "Submit a command job.", "project tag cwd timeout quiet-timeout queue-timeout wait session script shell reuse env profile"},
-	"fork":         {"JOB --job CHILD [--through TURN] [--profile NAME]", "Fork an agent thread on its current host.", ""},
+	"exec":         {"HOST [options] -- ARGV...\n  cx exec HOST --script FILE [--shell SHELL] [options]", "Submit a command job.", "project tag cwd timeout quiet-timeout queue-timeout wait script shell reuse env profile " + submissionSessionFlags},
+	"fork":         {"JOB --job CHILD [--through TURN] [--profile NAME]", "Fork an agent thread on its current host.", "job through profile " + submissionSessionFlags},
 	"gate":         {"DIR [GATE-ARGS ...]", "Run the source directory's scripts/gate.sh.", ""},
 	"history":      {"JOB [read|turns|items]", "Read agent thread history.", ""},
 	"host":         {"HOST", "Read or update node configuration.", "set"},
@@ -54,11 +56,11 @@ var ctlCommands = map[string]ctlCommand{
 	"project-init": {"NAME --repo DIR [DIR ...] [--default-host HOST]", "Initialize a project.", ""},
 	"project-ls":   {"", "List configured projects.", ""},
 	"project-show": {"NAME", "Print project configuration.", ""},
-	"rebase":       {"JOB TEXT", "Submit a follow-up to resolve patch conflicts.", ""},
+	"rebase":       {"JOB TEXT", "Submit a follow-up to resolve patch conflicts.", submissionSessionFlags},
 	"reply":        {"JOB [--request ID] (--result JSON|@FILE | --error JSON|@FILE)", "Reply to a pending engine request.", ""},
 	"requests":     {"JOB", "List pending engine requests.", ""},
 	"result":       {"JOB", "Collect a sealed turn's report, JSON metadata, or full log.", "turn full json log wait timeout refresh max-bytes"},
-	"resume":       {"JOB [--profile NAME]", "Restart a recoverable agent job.", ""},
+	"resume":       {"JOB [--profile NAME]", "Restart a recoverable agent job.", "profile"},
 	"review":       {"JOB --target JSON|@FILE", "Start an engine review.", ""},
 	"rpc":          {"JOB METHOD", "Invoke an engine RPC method.", ""},
 	"run":          {"HOST DIR TAG PROMPTFILE [options]\n  cx run HOST DIR TAG --cmd [options] -- ARGV...\n  cx run HOST DIR --batch FILE [options]", "Submit an agent or command job.", submitFlags + " batch cmd reuse timeout quiet-timeout"},
@@ -74,7 +76,7 @@ var ctlCommands = map[string]ctlCommand{
 	"undo":         {"JOB --before TURN", "Revert an agent thread to before a turn.", ""},
 	"usage":        {"JOB", "Read the engine account's usage.", ""},
 	"version":      {"", "Print the cx version.", ""},
-	"wait":         {"JOB [--timeout DURATION]\n  cx wait --any [options]", "Wait for a turn, job, admission block, or matching message.", "any timeout host project session cursor chat all"},
+	"wait":         {"JOB [--timeout DURATION]\n  cx wait --any [options]", "Wait for a turn, job, admission block, or matching message.", "any timeout host project session cursor from-start chat all"},
 }
 
 func cliFlags(name string) *flag.FlagSet {
@@ -124,11 +126,8 @@ func printCtlHelp(w io.Writer, op string) {
 
 	var o ctlOptions
 	f := ctlFlags(op, &o)
-	switch {
-	case isThinControl(op):
+	if isThinControl(op) {
 		f = controlFlags(op)
-	case op == "fork" || op == "resume":
-		f = restartFlags(op, new(string), new(string), new(string))
 	}
 	f.SetOutput(w)
 	f.PrintDefaults()
@@ -146,6 +145,26 @@ func printCtlHelp(w io.Writer, op string) {
 	}
 	if strings.Contains(cmd.usage, "JOB") {
 		_, _ = fmt.Fprintln(w, "\nJOB accepts [HOST:]PROJECT/TAG or TAG in the current project.")
+	}
+	switch op {
+	case "adopt", "wait", "run", "agent", "exec", "fork", "rebase", "ls", "overview":
+		_, _ = fmt.Fprintf(w, "\nSession precedence is %s, %s.\n", sessionEnv, strings.Join(toolSessionEnv[:], ", "))
+		_, _ = fmt.Fprintln(w, "  Claude Code, Codex and OpenCode are detected when they export these variables. Set CX_SESSION in other environments.")
+	}
+	switch op {
+	case "run", "agent", "exec", "fork", "rebase":
+		_, _ = fmt.Fprintln(w, "  New jobs require a session. Set CX_SESSION, pass --session NAME, or opt out with --no-session.")
+	case "adopt":
+		_, _ = fmt.Fprintln(w, "  Omit --session to adopt into the detected session.")
+		_, _ = fmt.Fprintln(w, "  The updated session applies to ls, overview, and wait --any after a successful adoption.")
+	}
+	if op == "wait" {
+		_, _ = fmt.Fprintln(w, "\nwait --any observes the current session unless --session or --all is set.")
+		_, _ = fmt.Fprintln(w, "  When no session is detected, set CX_SESSION or pass --session or --all.")
+		_, _ = fmt.Fprintln(w, "  A new cursor starts at each host's current job state. --from-start replays retained job history for a new cursor.")
+		_, _ = fmt.Fprintln(w, "  Host failures are reported and retried independently until the observation deadline.")
+		_, _ = fmt.Fprintln(w, "  Job events give turn (0 without a completed turn), next (a result command when available),")
+		_, _ = fmt.Fprintln(w, "  and rate_limited (true when a usage or rate limit ended the selected turn).")
 	}
 	if cmd.flags != "" || isThinControl(op) || op == "fork" {
 		_, _ = fmt.Fprintln(w, "Unspecified flags are off or unset unless a default is given.")
@@ -167,6 +186,7 @@ func printCtlHelp(w io.Writer, op string) {
 			_, _ = fmt.Fprintf(w, "  %d admission blocked (JSON with status=queued and queue_reason)\n", exitQueued)
 			_, _ = fmt.Fprintln(w, "  Check stdout JSON status=queued to identify an admission block. A command can also exit 13.")
 			_, _ = fmt.Fprintln(w, "  wait --any delivers at least once. Reuse a cursor and deduplicate retries by event_id.")
+			_, _ = fmt.Fprintln(w, "  Concurrent waits on the same session cursor warn and may repeat events.")
 		}
 		_, _ = fmt.Fprintln(w, "  124 observation timeout\n  130 observation canceled")
 		_, _ = fmt.Fprintln(w, "  Command jobs can return the command's exit code.")
@@ -220,22 +240,33 @@ var ctlFlagDescriptions = map[string]string{
 	"input-json": "use structured input from `JSON|@FILE`", "interactive": "recognize input questions",
 	"interval": "seconds between watch polls (defaults to 1)",
 	"json":     "emit JSON", "mention": "wait for a mention of `NAME`",
+	"job":   "required child job tag `CHILD`",
 	"model": "agent `MODEL` (engine default)", "network": "enable sandbox network access (enabled by default with workspace-write)",
 	"no-network": "disable sandbox network access", "no-tools": "omit the job-scoped messaging tools",
-	"parent":  "parent `JOB` or session (defaults to CX_PARENT, then current session)",
-	"project": "select `PROJECT`", "raw": "show raw job output", "refresh": "refresh the cached result",
+	"no-session": "explicitly create the job without a session",
+	"parent":     "parent `JOB` or session (defaults to CX_PARENT, then current session)",
+	"project":    "select `PROJECT`", "raw": "show raw job output", "refresh": "refresh the cached result",
 	"repo": "select repository `PATH`", "reuse": "reuse matching successful command output",
 	"profile": "execution host credential profile `NAME`", "role": "agent `ROLE` (defaults to worker)", "sandbox": "sandbox `MODE`: read-only (review, research), workspace-write (default; edits inside the checkout), danger-full-access (needs the execution account's full access; recorded as privileged)",
 	"script": "upload and run `FILE`", "session": "select `SESSION` (defaults to the detected session where applicable)",
 	"set": "update a node setting with `NAME=VALUE` (repeatable)", "snapshot": "reuse snapshot `ID`",
 	"sync": "wait for job registration", "tag": "job `TAG` (generated when omitted)",
-	"turn": "select sealed turn `N` (defaults to latest)", "type": "message `TYPE` (defaults to discussion)",
+	"through": "last turn `TURN` to include (defaults to all turns)",
+	"turn":    "select sealed turn `N` (defaults to latest)", "type": "message `TYPE` (defaults to discussion)",
 	"wait": "wait for completion", "watch": "refresh the listing continuously", "web-search": "enable live web search",
 	"with-history": "include Git history as `HEAD|A..HEAD` (omitted by default, HEAD when given without a value)",
 }
 
 func ctlFlagHelp(op, key string) string {
 	switch key {
+	case "from-start":
+		if op == "wait" {
+			return "replay retained turn completions and pending events for a new --any cursor"
+		}
+	case "project":
+		if op == "wait" {
+			return "select `PROJECT` (repeatable with --any)"
+		}
 	case "log":
 		return "stream the complete command log or the selected agent turn's progress log"
 	case "role":

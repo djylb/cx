@@ -16,6 +16,7 @@ func TestPreswitchTurnFailures(t *testing.T) {
 		t.Run(mode, func(t *testing.T) {
 			f := newControllerFixture(t)
 			h := newRuns(t, mode)
+			t.Setenv("CX_SESSION", "")
 			t.Setenv("CLAUDE_CODE_HOST_SESSION_ID", "local_x")
 			id := "p/" + mode
 			dir := filepath.Join(h.root, filepath.FromSlash(id))
@@ -37,7 +38,7 @@ func TestPreswitchTurnFailures(t *testing.T) {
 				code = 0
 			}
 			cliOutput(t, code, nil, f.cx, "wait", "local:"+id, "--timeout", "2m")
-			cliOutput(t, code, nil, f.cx, "wait", "--any", "--project", "p", "--timeout", "2m")
+			cliOutput(t, code, nil, f.cx, "wait", "--any", "--from-start", "--project", "p", "--timeout", "2m")
 			var s status
 			if err := loadJobStatusInto(dir, &s); err != nil || s.CompletedStatus != outcome || s.TurnStatus != outcome || s.Finished != 1 {
 				t.Fatalf("turn status = %+v, %v", s, err)
@@ -106,7 +107,7 @@ func TestPreswitchCacheAndDiskAdmission(t *testing.T) {
 	t.Cleanup(func() { cliOutput(t, 0, nil, f.cx, "close", "local:p/disk") })
 	dir := filepath.Join(root, "p", "disk")
 	one := []string{"wait", "local:p/disk"}
-	anyJob := []string{"wait", "--any", "--project", "p", "--cursor", "disk"}
+	anyJob := []string{"wait", "--any", "--all", "--from-start", "--project", "p", "--cursor", "disk"}
 	assertQueued := func(reason string, args ...string) {
 		t.Helper()
 		got := cliOutput(t, exitQueued, nil, f.cx, args...)
@@ -262,7 +263,7 @@ func TestQueueNoticePreservesPendingWaitEvents(t *testing.T) {
 	baseline := map[string]waitCursor{"j": {RunID: c.RunID, StateCursor: start.String()}}
 	expect := func(code int, finished int64, mailSeq uint64) {
 		t.Helper()
-		report, err := pollWaitAny(ctx, root, "", "", baseline)
+		report, err := pollWaitAny(ctx, root, nil, "", baseline)
 		if err != nil || report == nil || report.Code != code || (report.State == "queued") != (code == exitQueued) ||
 			report.Finished != finished || report.OutboxSeq != mailSeq {
 			t.Fatalf("wait report = %+v, %v", report, err)

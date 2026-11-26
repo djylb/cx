@@ -122,6 +122,11 @@ func TestWaitAnyFollowup(t *testing.T) {
 	h.await(idle, func(s status) bool { return s.State == "waiting" && idleHistory(s) })
 
 	cursor := filepath.Join(t.TempDir(), "cursor.json")
+	// An existing cursor still uses the active-turn floor for jobs it has
+	// not observed yet.
+	if err := writeJSON(cursor, map[string]waitCursor{}); err != nil {
+		t.Fatal(err)
+	}
 	wait := func(code int, limit string) string {
 		t.Helper()
 		return fixtureCLI(t, code, "wait", "--any", "--project", "p", "--since-file", cursor, "--timeout", limit)
@@ -134,6 +139,8 @@ func TestWaitAnyFollowup(t *testing.T) {
 			t.Fatalf("missing completion identity: %s (%v)", out, err)
 		}
 		got.Event, got.EventID = "", ""
+		want.Turn = want.Finished
+		want.setNext("local")
 		if got != want {
 			t.Fatalf("expected %+v, got %s", want, out)
 		}

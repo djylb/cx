@@ -82,9 +82,10 @@ func newControllerFixture(t *testing.T) controllerFixture {
 	if runtime.GOOS == "windows" {
 		t.Skip("Unix OpenSSH shell fixture")
 	}
-	for _, key := range []string{"CX_SESSION", "CLAUDE_CODE_HOST_SESSION_ID", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"} {
+	for _, key := range []string{"CX_SESSION", "CLAUDE_CODE_HOST_SESSION_ID", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_CHILD_SESSION", "CODEX_THREAD_ID", "CODEX_SESSION_ID", "OPENCODE_SESSION_ID"} {
 		t.Setenv(key, "")
 	}
+	t.Setenv("CX_SESSION", "fixture")
 	dir := t.TempDir()
 	exe, e := os.Executable()
 	if e != nil {
@@ -185,7 +186,7 @@ func TestB1CommandContract(t *testing.T) {
 		}
 	}
 	t.Setenv("PATH", f.home+string(os.PathListSeparator)+os.Getenv("PATH"))
-	for _, args := range [][]string{{"wait", "--any", "--project", "p", "--timeout", "2m"}, {"overview", "--project", "p", "--json"}} {
+	for _, args := range [][]string{{"wait", "--any", "--all", "--from-start", "--project", "p", "--timeout", "2m"}, {"overview", "--project", "p", "--json"}} {
 		got := cliOutput(t, 0, nil, f.cx, args...)
 		var a fields
 		if err := json.Unmarshal(got, &a); err != nil {
@@ -205,7 +206,7 @@ func TestB1CommandContract(t *testing.T) {
 	cliOutput(t, 2, nil, f.cx, "exec", "local", "--tag", "empty")
 	cliOutput(t, 17, nil, f.cx, "exec", "local", "--wait", "--tag", "bad", "--", "/bin/sh", "-c", "exit 17")
 	cliOutput(t, 17, nil, f.cx, "wait", "local:p/bad")
-	cliOutput(t, 124, nil, f.cx, "wait", "--any", "--project", "missing", "--timeout", "30ms")
+	cliOutput(t, 124, nil, f.cx, "wait", "--any", "--all", "--project", "missing", "--timeout", "30ms")
 	if f.python != "" {
 		cliOutput(t, 2, nil, "python3", f.python, "exec", "local", "--tag", "empty")
 		cliOutput(t, 124, nil, "python3", f.python, "wait", "--any", "--project", "missing", "--timeout", "30ms")

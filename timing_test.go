@@ -254,11 +254,15 @@ type fixtureWaitAnswer struct {
 // channel. A result on that scan is exposed as an unexpected early return.
 func startFixtureWaitAny(t *testing.T, ctx context.Context, root, project, session string, baseline map[string]waitCursor) (chan time.Time, <-chan fixtureWaitAnswer) {
 	t.Helper()
+	var projects []string
+	if project != "" {
+		projects = []string{project}
+	}
 	ticks := make(chan time.Time)
 	done := make(chan fixtureWaitAnswer, 1)
 	go func() {
 		// Use an unbuffered tick until the first scan reaches its select.
-		report, err := selectWaitAny(ctx, root, project, session, baseline, ticks, func(any) error { return nil })
+		report, err := selectWaitAny(ctx, root, projects, session, baseline, ticks, func(*waitReport) error { return nil })
 		done <- fixtureWaitAnswer{report, err}
 	}()
 	select {

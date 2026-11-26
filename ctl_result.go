@@ -795,7 +795,7 @@ func ctlResult(ctx context.Context, host, id, op string, o ctlOptions) (err erro
 			return e
 		}
 		if op == "rebase" {
-			return rebaseTurn(ctx, dest, host, id, o.dir, m)
+			return rebaseTurn(ctx, dest, host, id, o.dir, o.session, m)
 		}
 		patchDir := dest
 		if since > 1 {

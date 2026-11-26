@@ -71,7 +71,7 @@ func TestAgentToolSession(t *testing.T) {
 	check("ask", `{"question":"next?"}`, "ask-2")
 	baseline := filepath.Join(t.TempDir(), "cursor")
 	var wait bytes.Buffer
-	if err := waitAny(h.ctx, h.root, "p", "", baseline, &wait); err != nil || !strings.Contains(wait.String(), `"outbox_seq":2`) {
+	if err := waitAny(h.ctx, h.root, []string{"p"}, "", baseline, true, &wait); err != nil || !strings.Contains(wait.String(), `"outbox_seq":2`) {
 		t.Fatalf("wait: %s %v", wait.String(), err)
 	}
 	if err := h.ctl("say", id, "hello"); err != nil {

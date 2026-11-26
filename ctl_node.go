@@ -14,6 +14,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/djylb/timeshim"
 )
 
 func hostSettings(ctx context.Context, root string, sets []string, init bool) error {
@@ -201,6 +203,14 @@ func nodeControl(ctx context.Context, a []string) error {
 		return e
 	}
 	switch a[0] {
+	case "adopt-job":
+		if len(a) == 3 {
+			dir, err := jobDir(root, a[1])
+			if err != nil {
+				return err
+			}
+			return adoptJob(ctx, root, dir, a[2])
+		}
 	case "follow":
 		if len(a) == 4 {
 			dir, e := jobDir(root, a[1])
@@ -305,20 +315,32 @@ func nodeControl(ctx context.Context, a []string) error {
 			return submitNodeCommand(ctx, a, cwd)
 		}
 	case "wait-poll":
-		if len(a) == 5 {
-			limit, e := time.ParseDuration(a[4])
-			if e != nil || limit <= 0 {
+		if len(a) == 2 {
+			var req waitPollRequest
+			if err := json.Unmarshal([]byte(a[1]), &req); err != nil {
+				return err
+			}
+			if req.Limit <= 0 {
 				return errors.New("invalid poll limit")
 			}
-			cursor, e := decodeWaitBaseline([]byte(a[3]))
-			if e != nil {
-				return e
+			if err := validateWaitProjects(req.Projects); err != nil {
+				return err
 			}
-			callCtx, cancel := context.WithTimeout(ctx, limit)
+			callCtx, cancel := timeshim.WithTimeout(ctx, timeshim.Or(contextClock(ctx)), req.Limit)
 			defer cancel()
-			row, e := pollWaitAny(callCtx, root, a[1], a[2], cursor)
-			if e != nil {
-				return e
+			var row *waitReport
+			var err error
+			cursor := req.Cursor
+			if cursor == nil {
+				cursor, err = initialWaitBaseline(callCtx, root, req.Projects, req.Session, req.FromStart)
+			} else if err = validateWaitBaseline(cursor); err == nil {
+				row, err = pollWaitAny(callCtx, root, req.Projects, req.Session, cursor)
+			}
+			if err != nil {
+				if errors.Is(callCtx.Err(), context.DeadlineExceeded) {
+					return errObserveTimeout
+				}
+				return err
 			}
 			return json.NewEncoder(os.Stdout).Encode(fields{"row": row, "cursor": cursor})
 		}

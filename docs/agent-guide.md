@@ -6,6 +6,8 @@ Start with the [installation guide](agent-install.md). Use `cx --help` and `cx C
 
 Write a prompt with the goal, allowed changes, and validation. For work you plan to apply as a patch, ask the agent to leave changes uncommitted. Ask for a short report starting with `STATUS: DONE`, `STATUS: PARTIAL`, or `STATUS: BLOCKED`, with unresolved choices under `Pending decisions`.
 
+Before dispatching, set `CX_SESSION` or use a supported session environment. cx recognizes Claude Code, Codex, and OpenCode from their session variables. You can override the detected value with `--session NAME` or explicitly create an ungrouped job with `--no-session`. Submissions exit 2 when no session is available and neither flag is set. Inside a job, cx sets `CX_SESSION` to that job's own `HOST:PROJECT/JOB` so its child jobs belong to its session.
+
 - `cx run HOST DIR TAG PROMPTFILE` snapshots the source and prints `project/tag`. Add `--sync` to wait for registration. `cx agent --host HOST --dir DIR TEXT` submits, waits, and prints the report. It also takes `@FILE` or `-` for stdin and prints the job ID to stderr.
 - Choose `--engine`, `--sandbox`, `--queue-timeout`, and `--turn-timeout` for the task. Use `--profile NAME` to select a [configured execution account](agent-install.md#configure-execution-credentials). Keep secrets in that account's login or environment file.
 - Snapshots can include uncommitted work. Use `--clean-base` to require a clean Git source, `--with-history` to include commit history, or `--snapshot ID` to reuse the ID from `cx snapshot DIR`. Non-Git directories work too. For several repositories, register them with `cx project init NAME --repo DIR [DIR …]`.
@@ -25,24 +27,22 @@ Scripts default to `sh` on Unix and `powershell` on Windows. Choose an installed
 
 ## Observe and follow up
 
-1. Run `cx wait JOB --timeout 20s` in the background if your session supports it. When it returns, use `cx show JOB` for the turn report, `cx status JOB` for current state, or `cx tail JOB --cursor manager --timeout 20s` to follow progress. For submission failures, start with `show`.
-2. On exit 124, wait again for the same job. On exit 13 with stdout JSON containing `status: "queued"`, read `queue_reason` and continue observing. On exit 6, check the report or the engine's pending requests.
-3. Use `cx say JOB TEXT` or `cx say JOB @FILE` to follow up. Input starts a new turn when the job is idle. It can steer an active Codex turn and queues for Claude Code's next turn. `cx agent --continue JOB TEXT` sends the input and waits for a report. Use `cx interrupt JOB` to stop an active turn, or `cx resume JOB` to restart a recoverable agent job.
-4. For interactive turns, submit with `--interactive`. Reply to a question in the report with `cx say JOB TEXT`. For pending engine requests, use `cx requests JOB`, then `say --request`, `reply`, `approve`, or `deny` as appropriate. For the job's own messages, read `cx outbox JOB --since N` and answer or forward them.
-
-Use `cx tail JOB --messages --cursor manager` for complete agent messages or `--raw` for diagnostic output. Cursor names persist progress within the selected stream. Use `--from-start` to replay.
-
-### Watch several jobs
+Keep exactly one watcher per session. After dispatching, run this in the background (a background task, not a shell loop):
 
 ```sh
-cx ls --project demo
-cx overview --project demo
-cx wait --any --project demo --host local --cursor manager --timeout 20s
+cx wait --any --timeout 55m
 ```
 
-The wait returns one JSON event. Reuse the cursor for the same stream and deduplicate retries by `event_id`. Use separate cursors for independently filtered streams. With a configured channel center, add `--chat CHANNEL` to watch messages too.
+It watches every job this session dispatched, on every host, and returns one JSON line as soon as any job finishes a turn, asks a question, is rate-limited, fails, is blocked from admission, or sends a message. A turn event carries the completed `turn`, the `next` result command, and `rate_limited` to tell a quota stop from a normal finish. Then:
 
-`ls`, `overview`, and `wait --any` use the current [session](reference.md#environment-variables) when detected. Use `--session NAME` or `--all` to change the selection.
+1. Handle the event: `cx show JOB` for the report, `cx result JOB` to collect it, `cx say JOB TEXT` to continue. A `say` starts a new turn, and its completion arrives as a new event.
+2. Start the same command again. Its cursor remembers what was delivered, so nothing repeats or goes missing. On exit 124 nothing happened: start it again.
+
+A new cursor starts from the current state; add `--from-start` to replay retained events. Narrow the watch with `--project P` or `--host H` (both repeatable). A disconnected host is retried on its own while the others keep being watched. Do not poll `cx status` in a loop, wait on each job separately, or use `cx result --wait` to watch jobs.
+
+**Sessions.** Jobs belong to the session that dispatched them, detected from `CX_SESSION`, then Claude Code, Codex and OpenCode session variables. Where none is set, dispatching and `wait --any` stop with exit 2: set `CX_SESSION`, pass `--session NAME`, or dispatch with `--no-session` on purpose. `cx adopt JOB [--session NAME]` moves an existing job into a session. Agents dispatching their own jobs get `CX_SESSION=HOST:PROJECT/JOB`.
+
+Other controls: `cx interrupt JOB` stops an active turn; `cx resume JOB` restarts a recoverable agent job. For interactive turns, answer a question with `cx say JOB TEXT`; for engine requests, use `cx requests JOB`, then `say --request`, `reply`, `approve` or `deny`. Read a job's own messages with `cx outbox JOB`. Use `cx tail JOB --messages --cursor manager` for full agent messages.
 
 ## Share memory and progress
 
@@ -53,7 +53,7 @@ The wait returns one JSON event. Reuse the cursor for the same stream and dedupl
 
 ## Work while the manager is away
 
-Jobs run on their hosts without the controller: a dispatched job needs no connection back to finish, and its state stays on the node. An agent that needs an answer ends its turn with `STATUS: QUESTION`; the job keeps its thread and continues when the manager replies with `cx say`. After reconnecting, `cx wait --any` (or `cx ls`) reports what finished or is waiting.
+Jobs run on their hosts without the controller and keep their state on the node. An agent that needs an answer ends its turn with `STATUS: QUESTION`. The job keeps its thread and continues when the manager replies with `cx say`. After reconnecting, reuse your `cx wait --any` cursor or run `cx ls` to see current job states.
 
 ## Collect, review, and clean up
 

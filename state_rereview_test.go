@@ -253,7 +253,7 @@ func testWaitAnyWithdrawalAndCompletion(t *testing.T, saved bool) {
 	}
 	done := make(chan answer, 1)
 	go func() {
-		row, pollErr := pollWaitAnyTicks(ctx, root, "", "", baseline, ticks)
+		row, pollErr := selectWaitAny(ctx, root, nil, "", baseline, ticks, nil)
 		done <- answer{row, pollErr}
 	}()
 	tick := func() {
@@ -301,7 +301,7 @@ func testWaitAnyWithdrawalAndCompletion(t *testing.T, saved bool) {
 		baseline["j"].Finished != before || baseline["j"].StateCursor != start.String() {
 		t.Fatalf("wrong withdrawal: %+v %v, baseline %+v", got.report, got.err, baseline)
 	}
-	row, err := pollWaitAnyTicks(ctx, root, "", "", baseline, ticks)
+	row, err := selectWaitAny(ctx, root, nil, "", baseline, ticks, nil)
 	if err != nil || row == nil || row.Outcome != "failed" || row.Finished != 2 || baseline["j"].Finished != 2 {
 		t.Fatalf("unrelated completion was lost: %+v (%v), baseline %+v", row, err, baseline)
 	}

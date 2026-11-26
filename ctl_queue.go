@@ -287,7 +287,7 @@ func observeSubmission(ctx context.Context, host, id, op string, limit time.Dura
 			diagnosticf("%v\n", s.Reason)
 			return true, ctlExit(8)
 		}
-		if op != "tail" && op != "wait" {
+		if op != "tail" && op != "wait" && op != "adopt" {
 			return true, errors.New("job is being submitted")
 		}
 		if time.Now().After(end) {

@@ -161,7 +161,7 @@ func workspaceUser(ctx context.Context, root, work, id string) (string, error) {
 		return "", err
 	}
 	var user string
-	err = walkJobDirs(ctx, root, "", func(dir, _, _ string) (bool, bool, error) {
+	err = walkJobDirs(ctx, root, nil, func(dir, _, _ string) (bool, bool, error) {
 		s, _, statusErr := loadJobStatus(dir)
 		if errors.Is(statusErr, os.ErrNotExist) {
 			return false, false, nil
