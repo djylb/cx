@@ -102,7 +102,8 @@ func TestB3CenterBuildAndTaskResume(t *testing.T) {
 		}
 	}
 	t.Setenv("CX_MODULE", module)
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	// This deadline covers a real cold `go build`; hosted runners with -race need far more than a warm laptop.
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	id, m, e := freezeCompilerSource(ctx)
 	if e != nil {
