@@ -1,12 +1,10 @@
 package main
 
 import (
-	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"testing"
-	"time"
 
 	"golang.org/x/sys/windows"
 )
@@ -33,7 +31,7 @@ func TestMuxWorkerStartsWithDeleteDeniedDescriptor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	ctx, cancel := fixtureContext(t)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, exe, "node", "runner-worker", path)
 	if out, err := cmd.CombinedOutput(); err != nil {

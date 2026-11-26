@@ -59,7 +59,7 @@ func TestTailMessages(t *testing.T) {
 	appendEvent("item/completed", message(long), fields{"turn_number": 2, "time": stamp})
 	second := "--- turn 2, " + stamp + "\n" + long
 	all := "--- turn 1, unknown\n" + first + "\n" + second
-	base := []string{"tail", job, "--messages", "--cursor", "review", "--timeout", "2s"}
+	base := []string{"tail", job, "--messages", "--cursor", "review", "--timeout", "2m"}
 	check := func(want string, extra ...string) {
 		t.Helper()
 		out := cliOutput(t, 0, nil, f.cx, append(base, extra...)...)

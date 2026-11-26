@@ -66,7 +66,7 @@ func TestPackageCachesAcrossJobs(t *testing.T) {
 
 	override := filepath.Join(t.TempDir(), "pip-override")
 	h.start("package-cache", []string{"--env", "PIP_CACHE_DIR=" + override}, "package-cache-env")
-	h.cli(0, "wait", "--job", "p/package-cache", "--timeout", "3s")
+	h.cli(0, "wait", "--job", "p/package-cache", "--timeout", "2m")
 	var env map[string]string
 	if err := readJSON(filepath.Join(h.root, "p", "package-cache", "output.log"), &env); err != nil {
 		t.Fatal(err)

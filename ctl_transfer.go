@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"syscall"
 	"time"
+
+	"github.com/djylb/timeshim"
 )
 
 // commandInput only charges the idle budget while a read is outstanding.
@@ -71,7 +73,8 @@ func retryTransfer(ctx context.Context, attempt func() error) error {
 	if e != nil {
 		return e
 	}
-	end := time.Now().Add(window)
+	clock := timeshim.Or(contextClock(ctx))
+	end := clock.Now().Add(window)
 	delay := 5 * time.Second
 	for {
 		e = attempt()
@@ -80,11 +83,11 @@ func retryTransfer(ctx context.Context, attempt func() error) error {
 		}
 		var ex *exec.ExitError
 		connection := errors.Is(e, ctlExit(9)) || errors.Is(e, context.DeadlineExceeded) || errors.Is(e, io.ErrUnexpectedEOF) || errors.Is(e, io.ErrClosedPipe) || errors.Is(e, syscall.EPIPE) || errors.As(e, &ex) && (ex.ExitCode() == 255 || ex.ExitCode() == 9)
-		if !connection || time.Now().Add(delay).After(end) {
+		if !connection || clock.Now().Add(delay).After(end) {
 			return e
 		}
 		diagnosticf("cx: transfer interrupted; retry in %s: %v\n", delay, e)
-		if err := pause(ctx, delay); err != nil {
+		if err := timeshim.Sleep(ctx, clock, delay); err != nil {
 			return err
 		}
 		delay = min(2*delay, time.Minute)

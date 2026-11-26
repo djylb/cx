@@ -12,6 +12,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/djylb/timeshim"
 )
 
 func toolList() []fields {
@@ -113,7 +115,7 @@ func callTool(ctx context.Context, dir string, identity jobIdentity, requestKey 
 	if !m.Blocking {
 		return m, nil
 	}
-	ctx, cancel := context.WithDeadline(ctx, *m.Deadline)
+	ctx, cancel := timeshim.WithDeadline(ctx, timeshim.Or(contextClock(ctx)), *m.Deadline)
 	defer cancel()
 	return waitAgentAnswer(ctx, dir, identity, m.Request)
 }

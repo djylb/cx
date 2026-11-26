@@ -18,6 +18,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/djylb/timeshim"
 )
 
 const sshConnect = 90 * time.Second
@@ -225,7 +227,7 @@ func runWithActivity(ctx context.Context, cmd *exec.Cmd, cancel context.CancelFu
 	}
 	done := make(chan processWait, 1)
 	go func() { done <- processWait{cmd.Wait()} }()
-	timer := time.NewTimer(connect)
+	timer := timeshim.NewTimer(timeshim.Or(contextClock(ctx)), connect)
 	defer timer.Stop()
 	for {
 		select {

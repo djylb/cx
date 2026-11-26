@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -11,7 +10,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 )
 
 func waitFixture(t *testing.T, root, id string, s status) *runner {
@@ -42,7 +40,7 @@ func TestWaitAnyWithdrawalBetweenCallsAndTurnsBeforeTerminal(t *testing.T) {
 	root := t.TempDir()
 	r := waitFixture(t, root, "j", status{Job: "j", RunID: "mixed", Engine: "codex", State: "waiting",
 		Finished: 1, Turn: "one", LastCompleted: "one", CompletedStatus: "completed"})
-	ctx, cancel := context.WithTimeout(t.Context(), 4*time.Second)
+	ctx, cancel := fixtureContext(t)
 	defer cancel()
 	baseline := make(map[string]waitCursor)
 	seen := make(map[string]bool)
@@ -92,17 +90,13 @@ func TestWaitAnyWithdrawalBetweenCallsAndTurnsBeforeTerminal(t *testing.T) {
 	}
 	expect("completion", "failed", 1, 3)
 	expect("terminal", "", 3, 3)
-	short, stop := context.WithTimeout(ctx, 40*time.Millisecond)
-	defer stop()
-	if row, err := pollWaitAny(short, root, "", "", baseline); !errors.Is(err, errObserveTimeout) {
-		t.Fatalf("already acknowledged event replayed: %+v (%v)", row, err)
-	}
+	assertNoWaitAnyEvent(t, ctx, root, "", "", baseline)
 }
 
 func TestWaitAnyReportsTerminalFailureWithDamagedOutbox(t *testing.T) {
 	root := t.TempDir()
 	r := waitFixture(t, root, "j", status{Job: "j", RunID: "damage", Engine: "codex", State: "waiting"})
-	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	ctx, cancel := fixtureContext(t)
 	defer cancel()
 	id, _, _, err := captureJobIdentity(r.dir)
 	if err != nil {
@@ -143,7 +137,7 @@ func TestWaitAnyRetriesFailedOutputAndCursorWithStableID(t *testing.T) {
 			if err := r.setQueueReason("test admission condition"); err != nil {
 				t.Fatal(err)
 			}
-			ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+			ctx, cancel := fixtureContext(t)
 			defer cancel()
 			var file string
 			if mode != "without cursor" {
@@ -189,7 +183,7 @@ func TestWaitAnySinceFileLockCoversOutput(t *testing.T) {
 		t.Fatal(err)
 	}
 	file := filepath.Join(t.TempDir(), "cursor.json")
-	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	ctx, cancel := fixtureContext(t)
 	defer cancel()
 	enter, release := make(chan struct{}), make(chan struct{}, 1)
 	done := make(chan error, 1)
@@ -260,7 +254,7 @@ func TestWaitThirteenMachineContract(t *testing.T) {
 	root := os.Getenv("CXRUN_STATE")
 	t.Run("command exit", func(t *testing.T) {
 		cliOutput(t, 0, nil, f.cx, "exec", "local", "--tag", "code-thirteen", "--", "sh", "-c", "exit 13")
-		body := cliOutput(t, 13, nil, f.cx, "wait", "local:p/code-thirteen", "--timeout", "3s")
+		body := cliOutput(t, 13, nil, f.cx, "wait", "local:p/code-thirteen", "--timeout", "2m")
 		if json.Valid(body) || !bytes.Contains(body, []byte("exit_code=13")) {
 			t.Fatalf("command exit should retain normal terminal output: %s", body)
 		}
@@ -277,9 +271,9 @@ func TestWaitThirteenMachineContract(t *testing.T) {
 			t.Fatal(err)
 		}
 		closeBestEffort(reader)
-		ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+		ctx, cancel := fixtureContext(t)
 		defer cancel()
-		cmd := exec.CommandContext(ctx, f.cx, "wait", "local:q/queue-thirteen", "--timeout", "2s")
+		cmd := exec.CommandContext(ctx, f.cx, "wait", "local:q/queue-thirteen", "--timeout", "2m")
 		cmd.Stdout = writer
 		err = cmd.Run()
 		closeBestEffort(writer)
@@ -287,8 +281,8 @@ func TestWaitThirteenMachineContract(t *testing.T) {
 		if !errors.As(err, &exit) || exit.ExitCode() == exitQueued || ctx.Err() != nil {
 			t.Fatalf("closed controller stdout should fail before acknowledgement: %v", err)
 		}
-		one := cliOutput(t, 13, nil, f.cx, "wait", "local:q/queue-thirteen", "--timeout", "2s")
-		anyJob := cliOutput(t, 13, nil, f.cx, "wait", "--any", "--project", "q", "--timeout", "2s")
+		one := cliOutput(t, 13, nil, f.cx, "wait", "local:q/queue-thirteen", "--timeout", "2m")
+		anyJob := cliOutput(t, 13, nil, f.cx, "wait", "--any", "--project", "q", "--timeout", "2m")
 		for _, body := range [][]byte{one, anyJob} {
 			var row waitObservation
 			if err := json.Unmarshal(body, &row); err != nil || row.State != "queued" || row.QueueReason != r.s.QueueReason ||
@@ -314,7 +308,7 @@ func TestWaitStalledExitAndNodeMarker(t *testing.T) {
 	if err = r.saveTerminal(); err != nil {
 		t.Fatal(err)
 	}
-	if body := cliOutput(t, 3, nil, f.cx, "wait", "local:p/stall-marker", "--timeout", "2s"); !bytes.Contains(body, []byte("status=stalled")) {
+	if body := cliOutput(t, 3, nil, f.cx, "wait", "local:p/stall-marker", "--timeout", "2m"); !bytes.Contains(body, []byte("status=stalled")) {
 		t.Fatalf("unexpected stalled diagnostic: %s", body)
 	}
 }

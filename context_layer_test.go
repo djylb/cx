@@ -194,3 +194,14 @@ func TestPsmuxLaunchTarget(t *testing.T) {
 		t.Fatal(args)
 	}
 }
+
+func TestEnvFileExpansion(t *testing.T) {
+	t.Setenv("CX_TEST_BASE", "/base")
+	env, err := parseEnvFile("TOOLS=/opt/t\nPATH=${TOOLS}/bin:${CX_TEST_BASE}\nLIT=a$b\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if env["PATH"] != "/opt/t/bin:/base" || env["LIT"] != "a$b" {
+		t.Fatalf("%v", env)
+	}
+}

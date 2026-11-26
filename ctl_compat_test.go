@@ -94,7 +94,7 @@ func TestControllerCompatibilityViews(t *testing.T) {
 		t.Fatalf("session groups: %s", overview)
 	}
 	for _, job := range []string{"local:p/review", "local:p/work"} {
-		args := []string{"tail", job, "--raw", "--cursor", "replay", "--timeout", "2s"}
+		args := []string{"tail", job, "--raw", "--cursor", "replay", "--timeout", "2m"}
 		if got := cliOutput(t, 0, nil, f.cx, args...); !bytes.Equal(got, log) {
 			t.Fatalf("%s initial tail: %q", job, got)
 		}

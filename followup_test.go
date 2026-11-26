@@ -1,7 +1,6 @@
 package main
 
 import (
-	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -13,28 +12,13 @@ func TestQueuedFollowupOutlivesIdleExit(t *testing.T) {
 	const idle = 300 * time.Millisecond
 	h := newRuns(t, "question")
 	setTestHost(t, h.root, map[string]int{"agent": 1}, "")
+	clock := h.withClock("a")
 	a := h.start("a", "--interactive", "--idle-exit", idle.String())
-	dir := filepath.Join(h.root, "a")
-	await := func(match func(status) bool) {
-		t.Helper()
-		for {
-			var s status
-			if err := projected(h.ctx, dir, &s); err == nil {
-				if match(s) {
-					return
-				}
-			} else if !errors.Is(err, errNotRegistered) {
-				t.Fatal(err)
-			}
-			if err := pause(h.ctx, 10*time.Millisecond); err != nil {
-				t.Fatalf("last status %+v: %v", s, err)
-			}
-		}
-	}
+
 	// The first turn explicitly waits for input, so the idle clock cannot
 	// end the runner while the test takes the only slot.
-	await(func(s status) bool { return s.State == "waiting_input" && s.Finished == 1 })
-	slot, err := lockPath(filepath.Join(h.root, ".admit", "slot-0.lock"), 0)
+	h.await("a", func(s status) bool { return s.State == "waiting_input" && s.Finished == 1 })
+	slot, err := lockUntil(h.ctx, filepath.Join(h.root, ".admit", "slot-0.lock"))
 	if err != nil || slot == nil {
 		t.Fatalf("reserve the released slot: %v", err)
 	}
@@ -42,24 +26,18 @@ func TestQueuedFollowupOutlivesIdleExit(t *testing.T) {
 	if err := h.ctl("say", "a", "second round"); err != nil {
 		t.Fatal(err)
 	}
-	await(func(s status) bool { return s.State == "queued" })
-	if err := pause(h.ctx, 3*idle); err != nil {
-		t.Fatal(err)
-	}
-	var s status
-	if err := projected(h.ctx, dir, &s); err != nil || s.State != "queued" {
-		t.Fatalf("queued follow-up idle-exited: %+v %v", s, err)
-	}
+	h.await("a", func(s status) bool { return s.State == "queued" })
+	// A host policy refresh after the clock jump must still be handled.
+	setTestHost(t, h.root, map[string]int{"agent": 1}, "exit 1")
+	clock.Advance(time.Second + 3*idle)
+	h.await("a", func(s status) bool { return s.State == "queued" && s.QueueReason == "host load check did not pass" })
+	setTestHost(t, h.root, map[string]int{"agent": 1}, "")
+	clock.Advance(time.Second)
 	if err := slot.Close(); err != nil {
 		t.Fatal(err)
 	}
-	await(func(s status) bool { return s.LastCompleted == "second" && s.Finished == 2 })
-	select {
-	case err := <-a:
-		if err != nil {
-			t.Fatal(err)
-		}
-	case <-h.ctx.Done():
-		t.Fatal(h.ctx.Err())
+	clockAfter := func(s status) bool { return s.LastCompleted == "second" && s.Finished == 2 }
+	if err := h.idleExit("a", a, clockAfter); err != nil {
+		t.Fatal(err)
 	}
 }

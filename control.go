@@ -17,6 +17,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/djylb/timeshim"
 )
 
 func loadJobStatus(dir string) (s status, cursor stateCursor, err error) {
@@ -301,6 +303,7 @@ type waitObservation struct {
 }
 
 func waitJob(ctx context.Context, dir string, acknowledge bool) (waitObservation, error) {
+	clock := timeshim.Or(contextClock(ctx))
 	observer, err := openJobObservation(dir, stateCursor{}, "")
 	if err != nil {
 		return waitObservation{}, err
@@ -318,7 +321,7 @@ func waitJob(ctx context.Context, dir string, acknowledge bool) (waitObservation
 			}
 			return waitObservation{}, err
 		}
-		if err = pause(ctx, 200*time.Millisecond); err != nil {
+		if err = timeshim.Sleep(ctx, clock, 200*time.Millisecond); err != nil {
 			if errors.Is(err, context.DeadlineExceeded) {
 				return waitObservation{}, waitTimeout(s, dir)
 			}
@@ -391,7 +394,7 @@ func waitJob(ctx context.Context, dir string, acknowledge bool) (waitObservation
 			fmt.Printf("job=%s status=%s completed_turn=%s outcome=%s\n", s.Job, s.State, s.LastCompleted, s.CompletedStatus)
 			return observation, outcomeError(s.State, s.CompletedStatus)
 		}
-		if err = pause(ctx, 200*time.Millisecond); err == nil {
+		if err = timeshim.Sleep(ctx, clock, 200*time.Millisecond); err == nil {
 			err = observer.poll(ctx)
 			s = observer.s
 		}
@@ -447,7 +450,7 @@ func monitorContext(ctx context.Context, limit time.Duration) (context.Context, 
 			}
 		}
 	}
-	ctx, cancel := context.WithTimeout(ctx, limit)
+	ctx, cancel := timeshim.WithTimeout(ctx, timeshim.Or(contextClock(ctx)), limit)
 	return ctx, cancel, nil
 }
 

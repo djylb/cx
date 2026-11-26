@@ -74,7 +74,7 @@ func startCommand(cmd *exec.Cmd, id string) (commandTree, error) {
 	}
 	if err != nil {
 		cmd.Process.Kill()
-		_ = waitProcess(cmd, 5*time.Second)
+		_ = waitProcess(cmd, 5*time.Second, nil)
 		if h != 0 {
 			syscall.CloseHandle(h)
 		}

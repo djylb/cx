@@ -7,7 +7,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"time"
+
+	"github.com/djylb/timeshim"
 )
 
 var terminalCodes = map[string]int{"done": 0, "failed": 1, "stalled": 3, "timeout": 4, "queue_timeout": 4, "orphaned": 5}
@@ -224,7 +225,7 @@ func projectJobStatusWithBarrier(ctx context.Context, dir string, s *status, bar
 	r.s.EnginePID = 0
 	r.s.CommandPID = 0
 	r.s.Approvals = nil
-	r.s.LastEvent = time.Now().UTC()
+	r.s.LastEvent = timeshim.Or(r.clock).Now().UTC()
 	if err = r.openState(); err != nil {
 		return false, err
 	}

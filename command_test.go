@@ -31,17 +31,17 @@ func commandFixture(args []string) int {
 		}
 		return 37
 	case "silent":
-		time.Sleep(30 * time.Second)
+		time.Sleep(fixtureLimit)
 	case "after-parent":
-		for i := 0; i < 150; i++ {
-			if _, err := os.Stat("parent-gone"); err == nil {
-				if _, err := fmt.Print("survived"); err != nil {
-					return 2
-				}
-				return 0
-			}
-			time.Sleep(50 * time.Millisecond)
+		ctx, cancel := context.WithTimeout(context.Background(), fixtureLimit)
+		defer cancel()
+		if err := awaitFixtureFile(ctx, "parent-gone"); err != nil {
+			return 2
 		}
+		if _, err := fmt.Print("survived"); err != nil {
+			return 2
+		}
+		return 0
 	case "detached-parent":
 		child := exec.Command(os.Args[0], "fixture-command", "spawn-sleep")
 		if err := child.Run(); err != nil {
@@ -50,14 +50,14 @@ func commandFixture(args []string) int {
 		if len(args) > 1 {
 			return 0
 		}
-		time.Sleep(25 * time.Second)
+		time.Sleep(fixtureLimit)
 	case "sleep":
-		time.Sleep(22 * time.Second)
+		time.Sleep(fixtureLimit)
 		return 0
 	case "spawn-sleep":
 		child := exec.Command(os.Args[0], "fixture-command", "sleep")
 		if runtime.GOOS == "linux" {
-			child = exec.Command("/bin/sleep", "22")
+			child = exec.Command("/bin/sleep", "120")
 		}
 		detachWorker(child)
 		if err := child.Start(); err != nil {
@@ -97,10 +97,13 @@ func commandFixture(args []string) int {
 			return 2
 		}
 		defer func() { _ = held.Close() }()
+		if err := writeJSON("grandchild.json", os.Getpid()); err != nil {
+			return 2
+		}
 		if _, err := fmt.Println("grandchild ready"); err != nil {
 			return 2
 		}
-		time.Sleep(30 * time.Second)
+		time.Sleep(fixtureLimit)
 	}
 	return 2
 }
@@ -122,7 +125,7 @@ func commands(t *testing.T) *commandHarness {
 	setTestHost(t, root, map[string]int{"agent": 1, "test": 1}, "")
 	t.Setenv("GORACE", "atexit_sleep_ms=0")
 	joinFixtureWorkers(t, root)
-	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	ctx, cancel := fixtureContext(t)
 	t.Cleanup(cancel)
 	return &commandHarness{root: root, work: t.TempDir(), exe: exe, ctx: ctx, t: t}
 }
@@ -130,11 +133,9 @@ func commands(t *testing.T) *commandHarness {
 // running blocks until job owns its slot (start returns before admission, so queue-order tests need this).
 func (h *commandHarness) running(job string) {
 	h.t.Helper()
-	for deadline := time.Now().Add(10 * time.Second); h.status(job).State != "running"; {
-		if time.Now().After(deadline) {
-			h.t.Fatalf("%s never started", job)
-		}
-		time.Sleep(20 * time.Millisecond)
+	_, err := awaitFixtureStatus(h.ctx, filepath.Join(h.root, "p", job), func(s status) bool { return s.State == "running" })
+	if err != nil {
+		h.t.Fatalf("%s never started: %v", job, err)
 	}
 }
 
@@ -200,7 +201,7 @@ func TestCommandArgvExitAndLog(t *testing.T) {
 }
 func TestCommandAfterSubmitterExits(t *testing.T) {
 	h := commands(t)
-	h.start("detach", []string{"--timeout", "12s", "--dedup-key", "receipt"}, "after-parent")
+	h.start("detach", []string{"--timeout", "2m", "--dedup-key", "receipt"}, "after-parent")
 	// cli has waited for the actual submitter to exit and for its stdout/stderr EOF.
 	if runtime.GOOS != "windows" {
 		barrier, err := lockPath(os.Getenv(fixtureWorkerLock), 0)
@@ -221,6 +222,9 @@ func TestCommandAfterSubmitterExits(t *testing.T) {
 	if out := h.cli(10, "log", "--job", "p/detach"); out != "survived" {
 		t.Fatal(out)
 	}
+	if err := awaitFixtureOwnerReleased(h.ctx, filepath.Join(h.root, "p", "detach")); err != nil {
+		t.Fatal(err)
+	}
 	h.cli(0, "clean", "--job", "p/detach")
 	out := h.cli(7, "start", "--job", "p/dup", "--cmd", "--dedup-key", "receipt", "--", h.exe)
 	var s status
@@ -230,7 +234,9 @@ func TestCommandAfterSubmitterExits(t *testing.T) {
 }
 func TestCommandQuietWatchdog(t *testing.T) {
 	h := commands(t)
+	advance := h.clockJob("quiet")
 	h.start("quiet", []string{"--quiet-timeout", "250ms"}, "silent")
+	advance(commandPollInterval, 250*time.Millisecond)
 	if out := h.cli(3, "wait", "--job", "p/quiet"); !strings.Contains(out, "status=stalled") {
 		t.Fatal(out)
 	}
@@ -240,7 +246,37 @@ func TestCloseReapsGrandchildAfterTimeout(t *testing.T) {
 		t.Skip("fixture ignores POSIX TERM")
 	}
 	h := commands(t)
+	advance := h.clockJob("tree")
 	h.start("tree", []string{"--timeout", "2s"}, "tree")
+	if err := awaitFixtureFile(h.ctx, filepath.Join(h.work, "grandchild.json")); err != nil {
+		t.Fatal(err)
+	}
+	var pid int
+	if err := readJSON(filepath.Join(h.work, "grandchild.json"), &pid); err != nil || pid <= 0 {
+		t.Fatalf("grandchild PID: %d, %v", pid, err)
+	}
+	p, err := os.FindProcess(pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lockPathname := filepath.Join(h.work, "grandchild.lock")
+	t.Cleanup(func() {
+		defer func() { _ = p.Release() }()
+		lock, lockErr := lockPath(lockPathname, 0)
+		if lockErr == nil && lock == nil {
+			_ = p.Kill()
+		}
+		if lock != nil {
+			closeBestEffort(lock)
+		}
+	})
+	if waitErr := awaitFixtureCondition(h.ctx, func() (bool, error) {
+		data, readErr := os.ReadFile(filepath.Join(h.root, "p", "tree", "output.log"))
+		return strings.Contains(string(data), "grandchild ready\n"), readErr
+	}); waitErr != nil {
+		t.Fatal(waitErr)
+	}
+	advance(2*time.Second, 2*time.Second)
 	if out := h.cli(4, "wait", "--job", "p/tree"); !strings.Contains(out, "status=timeout") {
 		t.Fatal(out)
 	}
@@ -248,7 +284,7 @@ func TestCloseReapsGrandchildAfterTimeout(t *testing.T) {
 		t.Fatal(got)
 	}
 	h.cli(0, "close", "--job", "p/tree")
-	f, err := lockPath(filepath.Join(h.work, "grandchild.lock"), 0)
+	f, err := lockPath(lockPathname, 0)
 	if err != nil || f == nil {
 		t.Fatal("grandchild still holds lock", err)
 	}
@@ -265,13 +301,6 @@ func TestCommandClassQueueAndClose(t *testing.T) {
 	if s := h.status("queued"); s.State != "queued" || s.CommandPID != 0 {
 		t.Fatal(s)
 	}
-	h.start("deadline", []string{"--queue-timeout", "300ms"}, "silent")
-	if out := h.cli(4, "wait", "--job", "p/deadline"); !strings.Contains(out, "status=queue_timeout") {
-		t.Fatal(out)
-	}
-	if s := h.status("deadline"); s.State != "queue_timeout" || s.ExitCode != nil {
-		t.Fatal(s)
-	}
 	h.cli(0, "close", "--job", "p/queued")
 	h.cli(1, "wait", "--job", "p/queued")
 	h.cli(0, "close", "--job", "p/holder")
@@ -281,6 +310,27 @@ func TestCommandClassQueueAndClose(t *testing.T) {
 		if err != nil || in.acks[1].Result != "delivered" {
 			t.Fatalf("%s did not acknowledge the completed close: %+v (%v)", name, in, err)
 		}
+	}
+}
+func TestCommandQueueDeadline(t *testing.T) {
+	h := commands(t)
+	pool := filepath.Join(h.root, ".admit", "classes", testSlotClass)
+	if err := os.MkdirAll(pool, 0700); err != nil {
+		t.Fatal(err)
+	}
+	slot, err := lockPath(filepath.Join(pool, "slot-0.lock"), os.O_CREATE)
+	if err != nil || slot == nil {
+		t.Fatalf("hold admission slot: %v", err)
+	}
+	defer closeBestEffort(slot)
+	advance := h.clockJob("deadline")
+	h.start("deadline", []string{"--queue-timeout", "300ms"}, "silent")
+	advance(300*time.Millisecond, 300*time.Millisecond)
+	if out := h.cli(4, "wait", "--job", "p/deadline"); !strings.Contains(out, "status=queue_timeout") {
+		t.Fatal(out)
+	}
+	if s := h.status("deadline"); s.State != "queue_timeout" || s.ExitCode != nil {
+		t.Fatal(s)
 	}
 }
 func TestExplicitCommandShell(t *testing.T) {
@@ -311,9 +361,11 @@ func TestCommandRuntimeStartsAfterAdmission(t *testing.T) {
 	h := commands(t)
 	h.start("holder", nil, "after-parent")
 	h.running("holder") // start returns before admission: holder must own the only slot first
+	advance := h.clockJob("late")
 	h.start("late", []string{"--timeout", "500ms"}, "argv", "late", " start")
-	if out := h.cli(124, "wait", "--job", "p/late", "--timeout", "750ms"); !strings.Contains(out, "status=queued wait_timeout=true") {
-		t.Fatal(out)
+	advance(0, time.Second)
+	if s := h.status("late"); s.State != "queued" || s.CommandPID != 0 {
+		t.Fatal(s)
 	}
 	if err := os.WriteFile(filepath.Join(h.work, "parent-gone"), nil, 0600); err != nil {
 		t.Fatal(err)

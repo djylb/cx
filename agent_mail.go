@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"path/filepath"
 	"time"
+
+	"github.com/djylb/timeshim"
 )
 
 const agentAsk = "agent_ask"
@@ -148,7 +150,7 @@ func (r *runner) pollAgentMail() error {
 				return err
 			}
 			in.pendingAsks[m.Request] = ask
-			if m.Generation == r.s.Generation && m.Deadline != nil && time.Now().Before(*m.Deadline) {
+			if m.Generation == r.s.Generation && m.Deadline != nil && timeshim.Or(r.clock).Now().Before(*m.Deadline) {
 				id, _ := json.Marshal(m.Request)
 				r.s.Approvals = append(r.s.Approvals, approval{Generation: m.Generation, ID: id, Method: agentAsk, Summary: m.Question, Requested: m.Time, Deadline: *m.Deadline})
 				r.deriveState()

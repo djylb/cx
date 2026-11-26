@@ -18,7 +18,7 @@ func TestAppServerInOwnedJobObject(t *testing.T) {
 		s.tree.kill()
 		close(s.stop)
 		closeBestEffort(s.in)
-		_ = waitProcess(s.cmd, 5e9)
+		_ = waitProcess(s.cmd, fixtureLimit, nil)
 		s.tree.cleanup()
 	}()
 	var member int32

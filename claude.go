@@ -15,6 +15,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/djylb/timeshim"
 )
 
 type claudeEvent struct {
@@ -129,7 +131,8 @@ type claudeFrame struct {
 // arbitrary time waiting for the runner to consume already buffered events.
 type claudeOutput struct {
 	file    *os.File
-	timer   *time.Timer
+	timer   timeshim.Timer
+	clock   timeshim.Clock
 	grace   time.Duration
 	mu      sync.Mutex
 	reading bool
@@ -138,8 +141,8 @@ type claudeOutput struct {
 }
 
 func (p *claudeOutput) arm() {
-	var timer *time.Timer
-	timer = time.AfterFunc(p.grace, func() {
+	var timer timeshim.Timer
+	timer = timeshim.Or(p.clock).AfterFunc(p.grace, func() {
 		p.mu.Lock()
 		current := p.timer == timer && p.reading
 		if current {
@@ -547,7 +550,7 @@ func (r *runner) consumeClaude(f claudeFrame) error {
 		return r.claudeEvent("turn/completed", fields{"turn": t})
 	}
 	e := f.event
-	r.s.LastEvent = time.Now().UTC()
+	r.s.LastEvent = timeshim.Or(r.clock).Now().UTC()
 	r.s.StallCount = 0
 	r.dirty = true
 	if e.Session != "" && e.Session != r.s.Thread {
@@ -612,7 +615,7 @@ func (r *runner) serveClaude() (err error) {
 	} else {
 		r.releaseSlot()
 		r.deriveState()
-		r.idleSince = time.Now()
+		r.idleSince = timeshim.Or(r.clock).Now()
 		if err := r.save(); err != nil {
 			return err
 		}

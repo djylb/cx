@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -16,6 +15,126 @@ import (
 	"time"
 )
 
+func TestCargoCacheKeyFromSource(t *testing.T) {
+	root := t.TempDir()
+	root, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkout := func(job string, paths ...string) (string, []SnapshotRepo) {
+		t.Helper()
+		work := filepath.Join(root, ".work", job)
+		tree := filepath.Join(work, "work", "tree")
+		m := Manifest{Main: paths[0], Version: 1}
+		for _, path := range paths {
+			repo := filepath.Join(tree, path)
+			if err := os.MkdirAll(filepath.Join(repo, "crate"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(repo, "Cargo.toml"), []byte("[workspace]\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			m.Repositories = append(m.Repositories, SnapshotRepo{
+				Path: path, RepoID: snapSum([]byte(path)), StoreID: snapSum([]byte(path + "/store")), OID: strings.Repeat("a", 40),
+			})
+		}
+		if err := os.Mkdir(filepath.Join(work, "input"), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := writeJSON(filepath.Join(work, "input", "manifest.json"), m); err != nil {
+			t.Fatal(err)
+		}
+		return tree, m.Repositories
+	}
+	single, _ := checkout("flat", "standalone")
+	multi, repos := checkout("p/frozen", "one/shared", "two/shared")
+	other, _ := checkout("p/later", "one/shared", "two/shared")
+	plain := filepath.Join(root, "plain source")
+	local := filepath.Join(root, "in-place")
+	if err := os.Mkdir(plain, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(local, ".git"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(local, ".git", "HEAD"), []byte("ref: refs/heads/main\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(local, "crate"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		source string
+		want   string
+	}{
+		{plain, "plain source"},
+		{filepath.Join(local, "crate"), "in-place"},
+		{filepath.Join(single, "standalone", "crate"), "standalone"},
+		{filepath.Join(multi, "one", "shared", "crate"), repos[0].RepoID},
+		{filepath.Join(multi, "two", "shared"), repos[1].RepoID},
+		{filepath.Join(other, "two", "shared", "crate"), repos[1].RepoID},
+	} {
+		t.Run(tc.source, func(t *testing.T) {
+			repo, err := cargoRepository(root, tc.source)
+			if got := cargoCacheKey("p", "different-job", repo); err != nil || got != "p/"+tc.want {
+				t.Fatalf("repository cache key = %q, want p/%s, err = %v", got, tc.want, err)
+			}
+		})
+	}
+	if got := cargoCacheKey("", "flat", "standalone"); got != ".job-flat/standalone" {
+		t.Fatalf("flat job cache key = %q", got)
+	}
+}
+
+func TestCargoTargetExplicitEnvironment(t *testing.T) {
+	for _, name := range []string{"custom", "empty"} {
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			custom := filepath.Join(root, "custom-target")
+			makeCacheFixture(t, custom, 1000)
+			value := custom
+			if name == "empty" {
+				value = ""
+			}
+			r := runner{root: root, ctx: t.Context(),
+				s: status{Project: "p"},
+				c: config{
+					Dir: t.TempDir(), RunID: "explicit-target",
+					Env:      map[string]string{cargoTargetEnv: value},
+					localEnv: []string{cargoTargetEnv + "=profile-default"},
+				},
+			}
+			if err := r.prepareCaches(); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				r.releaseCaches()
+				info, err := os.Stat(custom)
+				if err != nil {
+					t.Error(err)
+				} else if !info.ModTime().Equal(time.Unix(1000, 0)) {
+					t.Errorf("explicit target timestamp changed to %v", info.ModTime())
+				}
+			})
+			cmd := exec.Command(os.Args[0])
+			r.c.mark(cmd, "job")
+			if !slices.Contains(cmd.Environ(), cargoTargetEnv+"="+value) {
+				t.Fatalf("payload environment lost %s=%q", cargoTargetEnv, value)
+			}
+			if r.targetLease != nil || len(r.c.cacheUse.leases) != 1 || slices.Contains(r.c.Roots, custom) {
+				t.Fatal("explicit target was managed as a cx cache")
+			}
+			if _, err := os.Stat(filepath.Join(cargoCachePath(root), "p")); !os.IsNotExist(err) {
+				t.Fatalf("a managed target was created: %v", err)
+			}
+			var pin cachePin
+			if err := readJSON(filepath.Join(cachePins(root), r.c.RunID), &pin); err != nil || pin.Target != "" {
+				t.Fatalf("package pin = %+v, err = %v", pin, err)
+			}
+		})
+	}
+}
+
 func TestCacheEvictsOnlyRegisteredTreesOnStateMount(t *testing.T) {
 	root := t.TempDir()
 	guard, err := lockCaches(t.Context(), root)
@@ -23,13 +142,22 @@ func TestCacheEvictsOnlyRegisteredTreesOnStateMount(t *testing.T) {
 		t.Fatal(err)
 	}
 	closeBestEffort(guard)
-	base := cargoCachePath(root)
+	base := filepath.Join(cargoCachePath(root), "p")
+	if err = prepareCacheEntry(root, filepath.Join("cargo-target", "p")); err != nil {
+		t.Fatal(err)
+	}
+	makeCacheFixture(t, base, 998)
+	oldLease, err := shareCache(filepath.Join(cargoCachePath(root), ".leases", "p"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeBestEffort(oldLease)
 	neverPrepared := filepath.Join(base, "unregistered")
 	manual := filepath.Join(base, "manual")
 	makeCacheFixture(t, neverPrepared, 999)
 	makeCacheFixture(t, manual, 1000)
 	for _, key := range []string{"manual", "replaced", "mounted", "mounted-late", "evict"} {
-		prepareCacheFixture(t, root, key)
+		prepareCacheFixture(t, root, "p", key)
 	}
 	replaced := filepath.Join(base, "replaced")
 	marker, err := os.ReadFile(filepath.Join(replaced, cacheIdentityFile))
@@ -72,12 +200,12 @@ func TestCacheEvictsOnlyRegisteredTreesOnStateMount(t *testing.T) {
 	if lateProbes != 2 {
 		t.Fatalf("visits to mount introduced after sizing: %d", lateProbes)
 	}
-	for _, path := range []string{neverPrepared, manual, replaced, mountpoint, lateMount} {
+	for _, path := range []string{base, neverPrepared, manual, replaced, mountpoint, lateMount} {
 		if b, err := os.ReadFile(filepath.Join(path, "data")); err != nil || string(b) != "x" {
 			t.Fatalf("protected sentinel in %s: %q, %v", path, b, err)
 		}
 	}
-	for _, path := range []string{evict, filepath.Join(base, ".leases", "unregistered")} {
+	for _, path := range []string{evict, cargoTargetLease(root, "p/unregistered")} {
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
 			t.Fatalf("unexpected %s: %v", path, err)
 		}
@@ -128,13 +256,13 @@ func TestCacheMaintenanceCoalescesAcrossQueueTickets(t *testing.T) {
 	}
 
 	for _, job := range []string{"queue-a", "queue-b", "queue-c"} {
-		h.start(job, []string{"--queue-timeout", "12s"}, "after-parent")
+		h.start(job, []string{"--queue-timeout", "2m"}, "after-parent")
 	}
 	// Every ticket can report disk pressure and process close while the one
 	// expensive scan still holds the host maintenance lock.
 	for _, job := range []string{"queue-a", "queue-b", "queue-c"} {
-		h.cli(exitQueued, "wait", "--job", "p/"+job, "--timeout", "2s")
-		closeCtx, cancel := context.WithTimeout(h.ctx, 2*time.Second)
+		h.cli(exitQueued, "wait", "--job", "p/"+job, "--timeout", "2m")
+		closeCtx, cancel := context.WithCancel(h.ctx)
 		closeHarness := *h
 		closeHarness.ctx = closeCtx
 		closeHarness.cli(0, "close", "--job", "p/"+job)
@@ -178,15 +306,12 @@ func launchCacheFixture(dropTracking bool) (launchErr error) {
 			launchErr = errors.Join(launchErr, releaseErr)
 		}
 	}()
-	for deadline := time.Now().Add(4 * time.Second); time.Now().Before(deadline); {
-		if _, err := os.Stat("cache-child.json"); err == nil {
-			if _, err := os.Stat("cache-parent-finish"); err == nil {
-				return nil
-			}
-		}
-		time.Sleep(10 * time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), fixtureLimit)
+	defer cancel()
+	if err := awaitFixtureFile(ctx, "cache-child.json"); err != nil {
+		return err
 	}
-	return fmt.Errorf("background cache fixture did not start")
+	return awaitFixtureFile(ctx, "cache-parent-finish")
 }
 
 func useCacheFixture() error {
@@ -200,18 +325,19 @@ func useCacheFixture() error {
 	if err := writeJSON("cache-child.json", process{PID: pid, Start: processStart(pid)}); err != nil {
 		return err
 	}
-	for deadline := time.Now().Add(8 * time.Second); time.Now().Before(deadline); {
-		if _, err := os.Stat("cache-finish"); err == nil {
-			return nil
+	ctx, cancel := context.WithTimeout(context.Background(), fixtureLimit)
+	defer cancel()
+	return awaitFixtureCondition(ctx, func() (bool, error) {
+		if ready, err := fileExists("cache-finish"); ready || err != nil {
+			return ready, err
 		}
 		for _, path := range paths {
 			if _, err := os.Stat(path); err != nil {
-				return err
+				return false, err
 			}
 		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	return nil
+		return false, nil
+	})
 }
 
 func TestBackgroundCacheUseOutlivesForegroundRunner(t *testing.T) {
@@ -224,7 +350,11 @@ func TestBackgroundCacheUseOutlivesForegroundRunner(t *testing.T) {
 func assertBackgroundCacheUse(t *testing.T, dropTracking bool) {
 	t.Helper()
 	h := commands(t)
-	t.Cleanup(func() { _ = os.WriteFile(filepath.Join(h.work, "cache-finish"), nil, 0600) })
+	t.Cleanup(func() {
+		for _, name := range []string{"cache-parent-finish", "cache-finish"} {
+			_ = os.WriteFile(filepath.Join(h.work, name), nil, 0600)
+		}
+	})
 	policy, err := readHostConfig(h.root)
 	if err != nil {
 		t.Fatal(err)
@@ -246,14 +376,13 @@ func assertBackgroundCacheUse(t *testing.T, dropTracking bool) {
 	if err := os.WriteFile(filepath.Join(h.work, "cache-parent-finish"), nil, 0600); err != nil {
 		t.Fatal(err)
 	}
-	h.cli(0, "wait", "--job", "p/bg-cache", "--timeout", "4s")
+	h.cli(0, "wait", "--job", "p/bg-cache", "--timeout", "2m")
 	awaitExit := func(p process) {
 		t.Helper()
-		for deadline := time.Now().Add(4 * time.Second); sameProcess(p.Start, processStart(p.PID)); {
-			if time.Now().After(deadline) {
-				t.Fatalf("process %d did not exit", p.PID)
-			}
-			time.Sleep(10 * time.Millisecond)
+		if err := awaitFixtureCondition(h.ctx, func() (bool, error) {
+			return !sameProcess(p.Start, processStart(p.PID)), nil
+		}); err != nil {
+			t.Fatalf("process %d did not exit: %v", p.PID, err)
 		}
 	}
 	awaitExit(process{PID: run.PID, Start: run.RunnerStart})
@@ -278,7 +407,7 @@ func assertBackgroundCacheUse(t *testing.T, dropTracking bool) {
 	// A subsequent runner using the same run ID must retain the preceding
 	// runner's process group after opening and closing its own leases.
 	if dropTracking {
-		resumed := runner{root: h.root, ctx: h.ctx, s: status{Project: "p"}, c: config{RunID: run.RunID}}
+		resumed := runner{root: h.root, ctx: h.ctx, s: status{Project: "p"}, c: config{RunID: run.RunID, Dir: h.work}}
 		if err := resumed.prepareCaches(); err != nil {
 			t.Fatal(err)
 		}
@@ -288,7 +417,8 @@ func assertBackgroundCacheUse(t *testing.T, dropTracking bool) {
 	if _, err := trimCaches(h.ctx, h.root, 1, probe); err != nil {
 		t.Fatal(err)
 	}
-	target, npm := filepath.Join(cargoCachePath(h.root), "p"), filepath.Join(packageCachePath(h.root), "npm")
+	target := filepath.Join(cargoCachePath(h.root), "p", filepath.Base(h.work))
+	npm := filepath.Join(packageCachePath(h.root), "npm")
 	for _, path := range []string{target, npm} {
 		if b, err := os.ReadFile(filepath.Join(path, "using-cache")); err != nil || string(b) != "background payload" {
 			t.Fatalf("active cache %s was evicted: %q, %v", path, b, err)

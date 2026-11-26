@@ -2,11 +2,14 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/djylb/timeshim"
 )
 
 func TestWaitFollowup(t *testing.T) {
@@ -17,7 +20,7 @@ func TestWaitFollowup(t *testing.T) {
 			gate := filepath.Join(h.work, "start-second")
 			t.Setenv("FIX_WAIT_START", gate)
 			const id = "p/job"
-			done := h.start(id, "--idle-exit", "10s", "--max-restarts", "0")
+			done := h.start(id, "--idle-exit", "2m", "--max-restarts", "0")
 			idle := func(s status) bool { return s.State == "waiting" && s.Finished == 1 }
 			h.await(id, idle)
 
@@ -50,8 +53,8 @@ func TestWaitFollowup(t *testing.T) {
 				done = resumed
 				h.await(id, idle)
 			} else {
-				checkTurn(nodeWait(0, "300ms"), "first")
-				checkTurn(controllerWait(0, "300ms"), "first")
+				checkTurn(nodeWait(0, "2m"), "first")
+				checkTurn(controllerWait(0, "2m"), "first")
 			}
 			if err := h.ctl("say", id, "second round"); err != nil {
 				t.Fatal(err)
@@ -59,10 +62,10 @@ func TestWaitFollowup(t *testing.T) {
 			// Check immediately after publication, then again with the app-server
 			// holding the request before turn/started.
 			nodeWait(124, "100ms")
-			h.await(id, func(s status) bool {
-				entries, err := pendingInboxMessages(filepath.Join(h.root, id))
-				return err == nil && len(entries) == 1 && s.TurnStatus != "inProgress"
-			})
+			entries, err := pendingInboxMessages(filepath.Join(h.root, id))
+			if err != nil || len(entries) != 1 {
+				t.Fatalf("pending follow-up: %v (%v)", entries, err)
+			}
 			controllerWait(124, "150ms")
 			if err := os.WriteFile(gate, nil, 0600); err != nil {
 				t.Fatal(err)
@@ -71,19 +74,28 @@ func TestWaitFollowup(t *testing.T) {
 			nodeWait(124, "100ms")
 			controllerWait(124, "150ms")
 
-			completed := make(chan error, 1)
+			clock := timeshim.NewFake(time.Now())
+			selected := make(chan error, 1)
 			go func() {
-				if err := pause(h.ctx, 250*time.Millisecond); err != nil {
-					completed <- err
-					return
+				obs, err := waitJob(clockContext(h.ctx, clock), filepath.Join(h.root, id), false)
+				if err == nil && (obs.Result == nil || obs.Result.TurnID != "second") {
+					err = fmt.Errorf("wait selected %+v", obs.Result)
 				}
-				completed <- h.ctl("rpc", id, "fixture/complete")
+				selected <- err
 			}()
-			checkTurn(controllerWait(0, "2s"), "second")
-			if err := <-completed; err != nil {
+			if err := clock.WaitPending(h.ctx, 1); err != nil {
 				t.Fatal(err)
 			}
-			checkTurn(nodeWait(0, "300ms"), "second")
+			if err := h.ctl("rpc", id, "fixture/complete"); err != nil {
+				t.Fatal(err)
+			}
+			h.await(id, func(s status) bool { return s.LastCompleted == "second" })
+			clock.AdvanceToNext()
+			if err := <-selected; err != nil {
+				t.Fatal(err)
+			}
+			checkTurn(controllerWait(0, "2m"), "second")
+			checkTurn(nodeWait(0, "2m"), "second")
 			if err := h.ctl("close", id); err != nil {
 				t.Fatal(err)
 			}
@@ -104,9 +116,9 @@ func TestWaitAnyFollowup(t *testing.T) {
 	gate := filepath.Join(h.work, "start-second")
 	t.Setenv("FIX_WAIT_START", gate)
 	active, idle := "p/a-active", "p/z-idle"
-	first := h.start(active, "--idle-exit", "10s")
+	first := h.start(active, "--idle-exit", "2m")
 	h.await(active, func(s status) bool { return s.State == "waiting" && idleHistory(s) })
-	other := h.start(idle, "--idle-exit", "10s")
+	other := h.start(idle, "--idle-exit", "2m")
 	h.await(idle, func(s status) bool { return s.State == "waiting" && idleHistory(s) })
 
 	cursor := filepath.Join(t.TempDir(), "cursor.json")
@@ -117,7 +129,7 @@ func TestWaitAnyFollowup(t *testing.T) {
 	check := func(want waitReport) {
 		t.Helper()
 		var got waitReport
-		out := wait(0, "3s")
+		out := wait(0, "2m")
 		if err := json.Unmarshal([]byte(out), &got); err != nil || got.Event != "completion" || got.EventID == "" {
 			t.Fatalf("missing completion identity: %s (%v)", out, err)
 		}
@@ -145,18 +157,27 @@ func TestWaitAnyFollowup(t *testing.T) {
 	if out := wait(124, "150ms"); out != "" {
 		t.Fatalf("wait --any returned stale completion: %q", out)
 	}
-	completed := make(chan error, 1)
-	go func() {
-		if err := pause(h.ctx, 250*time.Millisecond); err != nil {
-			completed <- err
-			return
-		}
-		completed <- h.ctl("rpc", active, "fixture/complete")
-	}()
-	check(waitReport{Project: "p", Job: "a-active", State: "waiting", Outcome: "completed", Finished: 2})
-	if err := <-completed; err != nil {
+	ticks, selected := startFixtureWaitAny(t, h.ctx, h.root, "p", "", saved)
+	if err := h.ctl("rpc", active, "fixture/complete"); err != nil {
 		t.Fatal(err)
 	}
+	h.await(active, func(s status) bool { return s.LastCompleted == "second" })
+	var observed fixtureWaitAnswer
+	select {
+	case ticks <- time.Time{}:
+		select {
+		case observed = <-selected:
+		case <-h.ctx.Done():
+			t.Fatal(h.ctx.Err())
+		}
+	case observed = <-selected:
+	case <-h.ctx.Done():
+		t.Fatal(h.ctx.Err())
+	}
+	if observed.err != nil || observed.report == nil || observed.report.Job != "a-active" || observed.report.Finished != 2 {
+		t.Fatalf("unexpected completion %+v (%v)", observed.report, observed.err)
+	}
+	check(waitReport{Project: "p", Job: "a-active", State: "waiting", Outcome: "completed", Finished: 2})
 	if err := readJSON(cursor, &saved); err != nil || saved[active].Finished != 2 || saved[idle].Finished != 1 {
 		t.Fatalf("cursor after completion: %+v, %v", saved, err)
 	}

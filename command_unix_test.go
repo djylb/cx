@@ -9,12 +9,11 @@ import (
 	"path/filepath"
 	"syscall"
 	"testing"
-	"time"
 )
 
 func TestDetachedCommandIgnoresHangup(t *testing.T) {
 	h := commands(t)
-	h.start("hup", []string{"--timeout", "10s"}, "after-parent")
+	h.start("hup", []string{"--timeout", "2m"}, "after-parent")
 	s := h.status("hup")
 	group, err := syscall.Getpgid(s.PID)
 	if err != nil || group != s.PID {
@@ -42,15 +41,12 @@ func TestDetachedSleepLifecycle(t *testing.T) {
 				h.cli(0, "wait", "--job", "p/"+name)
 			}
 			var child process
-			deadline := time.Now().Add(4 * time.Second)
-			for {
-				if err := readJSON(filepath.Join(h.work, "sleep.json"), &child); err == nil {
-					break
-				}
-				if time.Now().After(deadline) {
-					t.Fatal("sleep did not start")
-				}
-				time.Sleep(25 * time.Millisecond)
+			childFile := filepath.Join(h.work, "sleep.json")
+			if err := awaitFixtureFile(h.ctx, childFile); err != nil {
+				t.Fatal("sleep did not start", err)
+			}
+			if err := readJSON(childFile, &child); err != nil {
+				t.Fatal(err)
 			}
 			if child.Start == 0 {
 				t.Fatal("missing sleep creation time")
@@ -74,16 +70,18 @@ func TestDetachedSleepLifecycle(t *testing.T) {
 				}
 				return false
 			}
-			for !listed() && time.Now().Before(deadline) {
-				time.Sleep(25 * time.Millisecond)
-			}
-			if !listed() {
-				t.Fatal("detached sleep missing before close")
+			if err := awaitFixtureCondition(h.ctx, func() (bool, error) {
+				return listed(), nil
+			}); err != nil {
+				t.Fatal("detached sleep missing before close", err)
 			}
 			if active {
 				h.cli(0, "close", "--job", "p/"+name)
 				h.cli(1, "wait", "--job", "p/"+name)
 			} else {
+				if err := awaitFixtureOwnerReleased(h.ctx, filepath.Join(h.root, "p", name)); err != nil {
+					t.Fatal(err)
+				}
 				h.cli(0, op, "--job", "p/"+name)
 			}
 			if sameProcess(child.Start, processStart(child.PID)) {

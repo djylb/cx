@@ -13,6 +13,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/djylb/timeshim"
 )
 
 type item struct {
@@ -322,7 +324,7 @@ func (r *runner) flushTurnFailure() error {
 }
 
 func (r *runner) flushExpiredTurnFailure() error {
-	if f := r.turnFailure; f != nil && !time.Now().Before(f.deadline) {
+	if f := r.turnFailure; f != nil && !timeshim.Or(r.clock).Now().Before(f.deadline) {
 		return r.flushTurnFailure()
 	}
 	return nil
@@ -371,7 +373,7 @@ func (r *runner) begin(id string) error {
 	}
 	if r.s.Turn != id || !r.active() {
 		r.lastText = ""
-		r.turnSince = time.Now()
+		r.turnSince = timeshim.Or(r.clock).Now()
 	}
 	r.s.InputKind = ""
 	r.s.Turn = id
@@ -446,7 +448,7 @@ func (r *runner) finish(t turn) error {
 		r.s.InputKind = "next_turn"
 	}
 	r.deriveState()
-	r.idleSince = time.Now()
+	r.idleSince = timeshim.Or(r.clock).Now()
 	info := t.ID + " " + t.Status
 	if t.Error != nil {
 		info += " " + r.c.secret.text(t.Error.Message)
@@ -525,7 +527,7 @@ func (r *runner) notify(m message) error {
 			if !retry && id != "" && r.turnFailure == nil && id != r.s.LastCompleted {
 				// Allow the completion frame to provide final items before
 				// making the result visible. Some servers send only error.
-				r.turnFailure = &pendingTurnFailure{id: id, failure: e.Error, deadline: time.Now().Add(250 * time.Millisecond)}
+				r.turnFailure = &pendingTurnFailure{id: id, failure: e.Error, deadline: timeshim.Or(r.clock).Now().Add(250 * time.Millisecond)}
 			}
 		}
 	case "turn/plan/updated":
@@ -700,7 +702,7 @@ func (r *runner) connectThread() error {
 			if err := r.begin(latest.ID); err != nil {
 				return err
 			}
-			r.turnSince = time.Now()
+			r.turnSince = timeshim.Or(r.clock).Now()
 		} else {
 			if latest.Status == "inProgress" {
 				latest.Status = "interrupted"
@@ -713,7 +715,7 @@ func (r *runner) connectThread() error {
 				r.s.Turn = latest.ID
 				r.s.TurnStatus = latest.Status
 				r.deriveState()
-				r.idleSince = time.Now()
+				r.idleSince = timeshim.Or(r.clock).Now()
 				if err := r.save(); err != nil {
 					return err
 				}
@@ -732,7 +734,7 @@ func (r *runner) connectThread() error {
 		if r.c.ForkThread != "" || r.s.Finished > 0 && r.s.Turn == "" {
 			r.releaseSlot()
 			r.s.State = "waiting"
-			r.idleSince = time.Now()
+			r.idleSince = timeshim.Or(r.clock).Now()
 			return r.save()
 		}
 		if previous != "" && r.s.Turn != "" {

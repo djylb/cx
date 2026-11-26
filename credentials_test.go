@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
 	"io/fs"
@@ -147,7 +146,7 @@ func TestCredentialFilterProtocolFields(t *testing.T) {
 
 func credentialCLI(t *testing.T, f controllerFixture, code int, args ...string) (string, string) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	ctx, cancel := fixtureContext(t)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, f.cx, args...)
 	var stderr bytes.Buffer
@@ -217,7 +216,7 @@ func TestCredentialProfilesCommandCLI(t *testing.T) {
 		if tc.profile != "" {
 			args = []string{"--profile", tc.profile}
 		}
-		out, _ := credentialCLI(t, f, 0, append(append([]string{"exec", "local", "--tag", tc.tag, "--wait", "--timeout", "2s"}, args...), "--", "/bin/sh", "-ec", tc.check+`; printf '%s' "$AUTH_VALUE"`)...)
+		out, _ := credentialCLI(t, f, 0, append(append([]string{"exec", "local", "--tag", tc.tag, "--wait", "--timeout", "2m"}, args...), "--", "/bin/sh", "-ec", tc.check+`; printf '%s' "$AUTH_VALUE"`)...)
 		if out != tc.echo {
 			t.Fatalf("unexpected output for %s", tc.tag)
 		}
@@ -332,7 +331,7 @@ exec "$CX_FIXTURE_CODEX" "$@"
 			t.Fatal(diag)
 		}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := fixtureContext(t)
 	defer cancel()
 	h := &testRuns{t: t, ctx: ctx, root: root}
 	id := "p/agent"
@@ -377,7 +376,7 @@ printf '{"type":"result","session_id":"fixture-session","result":"%s"}\n' "$AUTH
 	if strings.Contains(out, value) || !strings.Contains(out, hiddenValue) {
 		t.Fatal("expected redacted Claude result")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := fixtureContext(t)
 	defer cancel()
 	h := &testRuns{t: t, ctx: ctx, root: root}
 	h.await("p/claude", func(s status) bool {

@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/djylb/timeshim"
 )
 
 func sshRecoveryFixture(t *testing.T, action string) string {
@@ -54,18 +56,26 @@ func TestSSHCallerDeadlineKeepsMaster(t *testing.T) {
 	dir := sshRecoveryFixture(t, `printf 'still connecting\n' >&2
 exec sleep 30
 `)
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := fixtureContext(t)
 	defer cancel()
 	old := fixtureMaster(t, ctx, "worker")
 	h := endpoint{SSH: "worker", CX: "cx"}
-	if _, e := h.call(ctx, 100*time.Millisecond, "facts"); !errors.Is(e, context.DeadlineExceeded) || !errors.Is(e, ctlExit(9)) {
+	clock := timeshim.NewFake(time.Now())
+	callCtx, stop := timeshim.WithTimeout(clockContext(ctx, clock), clock, time.Second)
+	defer stop()
+	done := make(chan error, 1)
+	go func() {
+		_, err := h.call(callCtx, time.Minute, "facts")
+		done <- err
+	}()
+	if err := awaitFixtureFile(ctx, filepath.Join(dir, "worker.paths")); err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(time.Second)
+	if e := <-done; !errors.Is(e, context.DeadlineExceeded) || !errors.Is(e, ctlExit(9)) {
 		t.Fatalf("caller deadline error = %v", e)
 	}
-	paths, e := os.ReadFile(filepath.Join(dir, "worker.paths"))
-	if e != nil || len(paths) == 0 {
-		t.Fatalf("SSH did not start: %q, %v", paths, e)
-	}
-	if _, e = os.Stat(filepath.Join(dir, "stop")); !os.IsNotExist(e) {
+	if _, e := os.Stat(filepath.Join(dir, "stop")); !os.IsNotExist(e) {
 		t.Fatalf("attempted to stop an SSH master: %v", e)
 	}
 	if now := fixtureMaster(t, context.Background(), "worker"); now.generation != old.generation {
@@ -93,7 +103,7 @@ printf 'new connection\n'
 			t.Setenv("CX_WEDGED", wedged)
 			// The relay hop re-executes this test binary; race builds start slowly, so the
 			// idle budget must exceed one relay startup while staying far below the wedge.
-			ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+			ctx, cancel := fixtureContext(t)
 			defer cancel()
 			exe, e := os.Executable()
 			if e != nil {
@@ -155,7 +165,7 @@ gzip -dc > "$CX_SSH_FIXTURE/received"
 echo done
 `)
 	t.Setenv("CX_PUBLISH_RETRY_WINDOW", "8")
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	ctx, cancel := fixtureContext(t)
 	defer cancel()
 	fixtureMaster(t, ctx, "worker")
 	packet := filepath.Join(dir, "packet")

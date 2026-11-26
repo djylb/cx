@@ -13,6 +13,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"time"
+
+	"github.com/djylb/timeshim"
 )
 
 type fields = map[string]any
@@ -38,6 +40,7 @@ type frame struct {
 	raw []byte
 }
 type server struct {
+	clock           timeshim.Clock
 	cmd             *exec.Cmd
 	finishLog       func() error
 	in              io.WriteCloser
@@ -229,7 +232,7 @@ func (s *server) send(v fields) error {
 		return err
 	}
 	w := writeRequest{data: append(b, '\n'), done: make(chan error, 1)}
-	timer := time.NewTimer(s.writeTimeout)
+	timer := timeshim.NewTimer(timeshim.Or(s.clock), s.writeTimeout)
 	defer timer.Stop()
 	select {
 	case s.writes <- w:
@@ -281,7 +284,7 @@ func (r *runner) read(f frame) (message, error) {
 				}
 			}
 		}
-		r.s.LastEvent = time.Now().UTC()
+		r.s.LastEvent = timeshim.Or(r.clock).Now().UTC()
 		r.dirty = true
 		if len(m.ID) > 0 {
 			return m, r.request(m, record["params"])
@@ -307,8 +310,9 @@ func (r *runner) call(method string, p any, result any) error {
 	if limit == 0 {
 		limit = 60 * time.Second
 	}
-	deadline := time.Now().Add(limit + r.c.Approval)
-	timer := time.NewTimer(limit)
+	clock := timeshim.Or(r.srv.clock)
+	deadline := clock.Now().Add(limit + r.c.Approval)
+	timer := timeshim.NewTimer(clock, limit)
 	defer timer.Stop()
 	tick := time.NewTicker(statePollInterval)
 	defer tick.Stop()
@@ -317,7 +321,7 @@ func (r *runner) call(method string, p any, result any) error {
 		case <-r.ctx.Done():
 			return r.ctx.Err()
 		case <-timer.C:
-			if remaining := time.Until(deadline); remaining > 0 && len(r.s.Approvals) > 0 {
+			if remaining := timeshim.Until(clock, deadline); remaining > 0 && len(r.s.Approvals) > 0 {
 				timer.Reset(remaining)
 				continue
 			}
@@ -372,6 +376,7 @@ type runner struct {
 	lastStateWrite                time.Time
 
 	ctx                       context.Context
+	clock                     timeshim.Clock
 	claude                    *claudeSession
 	budget                    *runtimeBudget
 	slot                      *os.File
@@ -649,7 +654,7 @@ func (r *runner) serveCodex() (err error) {
 				continue
 			}
 
-			r.lastAction = time.Now()
+			r.lastAction = timeshim.Or(r.clock).Now()
 		}
 		select {
 		case <-r.ctx.Done():

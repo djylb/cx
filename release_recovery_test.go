@@ -313,9 +313,10 @@ func TestRegistrationWaitsForOwnerProbe(t *testing.T) {
 		t.Fatalf("probe could not acquire owner: %v", err)
 	}
 	defer closeBestEffort(owner)
-	ctx, cancel := context.WithTimeout(t.Context(), 80*time.Millisecond)
-	defer cancel()
-	if err := registerJob(ctx, root, dir, config{}, status{Job: "j", State: "queued"}, (*stateWriter).sync); !errors.Is(err, context.DeadlineExceeded) {
+	err = expireLockWait(t, func(ctx context.Context) error {
+		return registerJob(ctx, root, dir, config{}, status{Job: "j", State: "queued"}, (*stateWriter).sync)
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("register treated a read-side probe as a live owner: %v", err)
 	}
 	if err := errors.Join(owner.Close(), gate.Close()); err != nil {
@@ -338,9 +339,9 @@ func TestCommandAdmissionCoordinatesWithManagedWorkspace(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer closeBestEffort(gate)
-	ctx, cancel := context.WithTimeout(t.Context(), 150*time.Millisecond)
-	defer cancel()
-	err = nodeControl(ctx, []string{"submit-command", "another/use", cwd, "--", "not-started"})
+	err = expireLockWait(t, func(ctx context.Context) error {
+		return nodeControl(ctx, []string{"submit-command", "another/use", cwd, "--", "not-started"})
+	})
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("command crossed the workspace cleanup lock: %v", err)
 	}

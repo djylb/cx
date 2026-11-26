@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/djylb/timeshim"
 )
 
 func (c *config) nudgeText(fallback string) string {
@@ -38,7 +40,7 @@ func (r *runner) watchdog() error {
 			ref = t
 		}
 	}
-	if time.Since(ref) < limit {
+	if timeshim.Or(r.clock).Now().Sub(ref) < limit {
 		return nil
 	}
 	r.s.StallCount++
@@ -76,7 +78,7 @@ func (r *runner) watchdog() error {
 		_ = r.note("stall", "step 4: giving up")
 		return errStalled
 	}
-	r.lastAction = time.Now()
+	r.lastAction = timeshim.Or(r.clock).Now()
 	r.s.LastAction = act
 	if err != nil {
 		if errors.Is(err, errServerClosed) || r.ctx.Err() != nil {

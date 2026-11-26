@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -60,7 +59,7 @@ case "$request" in
 esac
 printf '%s\n' "$request" | `+shellQuote(f.cx)+` node wire
 `)
-			ctx, cancel := context.WithTimeout(t.Context(), 8*time.Second)
+			ctx, cancel := fixtureContext(t)
 			defer cancel()
 			args := []string{"result", "--wait", "--full", "remote:" + id}
 			if tc.turn != "" {
@@ -170,7 +169,7 @@ func TestResultWaitBoundsSealing(t *testing.T) {
 	if err = lock.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if out := cliOutput(t, 0, nil, f.cx, "result", "--wait", "--full", "p/sealing", "--timeout", "3s"); !bytes.Contains(out, []byte("\nfirst report\n")) {
+	if out := cliOutput(t, 0, nil, f.cx, "result", "--wait", "--full", "p/sealing", "--timeout", "2m"); !bytes.Contains(out, []byte("\nfirst report\n")) {
 		t.Fatalf("idle result did not seal the latest completion: %q", out)
 	}
 }
@@ -179,7 +178,7 @@ func TestResultSealsInPlaceTurnBeforeNodeContinuation(t *testing.T) {
 	f := newControllerFixture(t)
 	h := newRuns(t, "question")
 	const id = "p/in-place"
-	done := h.start(id, "--idle-exit", "12s")
+	done := h.start(id, "--idle-exit", "2m")
 	h.await(id, func(s status) bool { return s.State == "waiting" && s.Finished == 1 })
 	// Send directly to the node to exercise the runner without controller-side sealing.
 	cliOutput(t, 0, nil, f.cx, "node", "say", "--job", id, "second round")

@@ -25,7 +25,7 @@ Review the execution host's `host.json` with `cx host HOST`. Update an individua
 | `load_cmd` | Optional admission check for all categories. It runs under `sh` on Unix or `cmd.exe` on Windows. Exit 0 allows admission. |
 | `min_free_bytes` | Free space required on the state volume. Default is the larger of 20 GB and 5% of the volume. Set 0 to disable the free-space threshold. |
 | `cache_max_bytes` | Budget for reclaimable cx-managed build and package caches. Default 50 GB. |
-| `env_file` | Private UTF-8 environment file for jobs. Use `KEY=VALUE`; blank lines and full-line comments are allowed. Values are literal, and the last assignment for a key wins. |
+| `env_file` | Private UTF-8 environment file for jobs. Use `KEY=VALUE`; blank lines and full-line comments are allowed. `${NAME}` expands to an earlier value in the file or the runner's environment (for example `PATH=C:\tools\bin;${PATH}`); everything else is literal. The last assignment for a key wins, and a job's own `--env` overrides it. |
 | `default_profile`, `profiles` | Default account name for new jobs and the map of named accounts. `run`, `agent`, and `exec` accept `--profile NAME`; continuation and resume keep the recorded profile. Fork inherits it by default. |
 | `profiles.<name>.engine_homes` | Maps `codex` to its `CODEX_HOME` directory and `claude` to its `CLAUDE_CONFIG_DIR` directory. |
 | `profiles.<name>.env_file` | Uses the profile's file in place of the host file. An omitted value inherits the host file. Relative profile and environment-file paths are resolved from the node state root. |
@@ -48,6 +48,8 @@ The default state root is `~/.local/share/cx/state` on Unix and `%LOCALAPPDATA%\
 | `PROJECT/JOB/progress.log`, `events.jsonl`, `output.log` | Progress, structured events, and merged command output. `output.log` applies to command jobs. |
 | `.work/PROJECT/JOB/` | Private snapshot workspace, with its own `state/` and `blobs/` for checkout metadata. |
 | `snapshot/`, `cache/` | Snapshot store and shared build and package caches. |
+
+cx shares Cargo build output at `cache/cargo-target/PROJECT/REPO` for jobs in the same project and source repository, and uses a job's own target directory when it supplies `--env CARGO_TARGET_DIR=PATH`.
 
 Use cx to query and manage state. For direct access on an execution host, use `cx node status --job PROJECT/JOB`, `cx node list`, or `cx node wait --job PROJECT/JOB --timeout 20s`. Node `list` and `wait --any` accept project and session filters. Controller `cx result` returns collected report, log, and artifact paths. A collected agent report is named `last.md` in the result archive.
 

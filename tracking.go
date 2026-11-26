@@ -32,11 +32,12 @@ func (c *config) mark(cmd *exec.Cmd, dir string) {
 	if c.cacheUse != nil {
 		inheritCacheLeases(cmd, c.cacheUse.leases)
 	}
-	env := cmd.Environ()
+	// Host defaults (shims, env_file, account settings) come first so a value the
+	// job sets explicitly wins: for duplicate keys the last entry is used.
+	env := append(cmd.Environ(), c.localEnv...)
 	for k, v := range c.Env {
 		env = append(env, k+"="+v)
 	}
-	env = append(env, c.localEnv...)
 	cmd.Env = append(env, "CXRUN_JOB="+c.Project+"/"+filepath.Base(dir), "CXRUN_RUN="+c.RunID)
 }
 func sameProcess(start, current uint64) bool { return start != 0 && start == current }

@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"compress/gzip"
-	"context"
 	"encoding/json"
 	"errors"
 	"os"
@@ -15,6 +14,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/djylb/timeshim"
 )
 
 func TestB3ControllerContract(t *testing.T) {
@@ -79,7 +80,7 @@ func TestB3SnapshotResult(t *testing.T) {
 		t.Fatal(e)
 	}
 	cliOutput(t, 0, nil, f.cx, "run", "local", src, "roundtrip", "--cmd", "--", "sh", "-c", "echo changed > original && mkdir artifacts && echo asset > artifacts/test && echo report")
-	cliOutput(t, 0, nil, f.cx, "wait", "p/roundtrip", "--timeout", "3s")
+	cliOutput(t, 0, nil, f.cx, "wait", "p/roundtrip", "--timeout", "2m")
 	// wait collects the result, so a plain result reads the cache (no exit 12).
 	cliOutput(t, 0, nil, f.cx, "result", "p/roundtrip")
 	if got := cliOutput(t, 0, nil, f.cx, "result", "p/roundtrip", "--wait"); !bytes.Contains(got, []byte("artifacts/test (6 bytes)")) {
@@ -102,8 +103,8 @@ func TestB3CenterBuildAndTaskResume(t *testing.T) {
 		}
 	}
 	t.Setenv("CX_MODULE", module)
-	// This deadline covers a real cold `go build`; hosted runners with -race need far more than a warm laptop.
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	// The fixture watchdog also covers the cold compiler cache.
+	ctx, cancel := fixtureContext(t)
 	defer cancel()
 	id, m, e := freezeCompilerSource(ctx)
 	if e != nil {
@@ -187,7 +188,7 @@ func TestB3AllRepositoryPreflight(t *testing.T) {
 	}
 	t.Setenv("GOWORK", work)
 	cliOutput(t, 0, nil, f.cx, "run", "local", src, "merge", "--cmd", "--", "sh", "-c", "echo worker > a; echo worker > ../second/a")
-	cliOutput(t, 0, nil, f.cx, "wait", "p/merge", "--timeout", "4s")
+	cliOutput(t, 0, nil, f.cx, "wait", "p/merge", "--timeout", "2m")
 	if e := os.WriteFile(filepath.Join(other, "a"), []byte("local\n"), 0600); e != nil {
 		t.Fatal(e)
 	}
@@ -233,7 +234,7 @@ func TestB3InteractiveContinuation(t *testing.T) {
 	}
 	t.Setenv("CX_CONTEXT_DIR", ctxDir)
 	t.Setenv("FIXPROMPT", "Workflow\nProject context is available in $CX_CONTEXT.\n"+strings.TrimRight(jobToolsNote, "\n")+"\n\ntask")
-	out := cliOutput(t, 6, nil, f.cx, "agent", "--host", "local", "--dir", src, "--inplace", "--interactive", "--tag", "conversation", "--idle-exit", "5s", "task")
+	out := cliOutput(t, 6, nil, f.cx, "agent", "--host", "local", "--dir", src, "--inplace", "--interactive", "--tag", "conversation", "--idle-exit", "2m", "task")
 	defer cliOutput(t, 0, nil, f.cx, "close", "local:p/conversation")
 	if !bytes.Contains(out, []byte("STATUS: QUESTION")) || !bytes.Contains(out, []byte("JOB=p/conversation STATUS=QUESTION")) {
 		t.Fatal(string(out))
@@ -266,7 +267,7 @@ func TestB3ChatInteroperability(t *testing.T) {
 	if f.python != "" {
 		checkRead("python3", f.python, "chat", "read", "reports")
 	}
-	cliOutput(t, 0, nil, f.cx, "chat", "wait", "reports", "--mention", "member", "--timeout", "1s")
+	cliOutput(t, 0, nil, f.cx, "chat", "wait", "reports", "--mention", "member", "--timeout", "2m")
 	if data := cliOutput(t, 0, nil, f.cx, "chat", "read", "reports", "--cursor", "default"); len(data) > 0 {
 		t.Fatal(string(data))
 	}
@@ -311,9 +312,9 @@ func TestB3ChatInteroperability(t *testing.T) {
 			t.Fatalf("wait: Go %s, Python %s", goOut, pyOut)
 		}
 	}
-	waitBoth(0, "2s")
+	waitBoth(0, "2m")
 	cliOutput(t, 17, nil, f.cx, "exec", "local", "--tag", "failed", "--wait", "--", "sh", "-c", "exit 17")
-	waitBoth(1, "2s")
+	waitBoth(1, "2m")
 	waitBoth(124, "300ms")
 	cliOutput(t, 0, nil, f.cx, "chat", "post", "reports", "--type", "decision", "ship")
 	if runtime.GOOS == "darwin" {
@@ -365,7 +366,7 @@ exec /bin/sh -c "$1"
 		t.Fatal(e)
 	}
 	t.Setenv("PATH", f.home+string(os.PathListSeparator)+os.Getenv("PATH"))
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := fixtureContext(t)
 	defer cancel()
 	handled, e := deployFromCenter(ctx, endpoint{SSH: "center", CX: target, Platform: "linux/amd64"}, runtime.GOOS+"/"+runtime.GOARCH)
 	if e != nil || !handled {
@@ -423,6 +424,11 @@ func TestB3ReuseCleanAndGate(t *testing.T) {
 	if e := json.Unmarshal(cliOutput(t, 3, nil, f.cx, a...), &hit); e != nil || !hit.Reused || hit.Job != "p/first" {
 		t.Fatal(hit, e)
 	}
+	ctx, cancel := fixtureContext(t)
+	defer cancel()
+	if err := awaitFixtureOwnerReleased(ctx, filepath.Join(os.Getenv("CXRUN_STATE"), "p", "first")); err != nil {
+		t.Fatal(err)
+	}
 	cliOutput(t, 0, nil, f.cx, "clean", "p/first")
 	if _, e := os.Stat(dir); e != nil {
 		t.Fatal(e)
@@ -448,7 +454,7 @@ func TestB3DroppedSnapshotConnection(t *testing.T) {
 	if e := os.WriteFile(filepath.Join(root, "note"), []byte("data"), 0600); e != nil {
 		t.Fatal(e)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := fixtureContext(t)
 	defer cancel()
 	sid, _, e := Freeze(ctx, root, FreezeOptions{})
 	if e != nil {
@@ -505,7 +511,7 @@ func TestB3ResumeResultStream(t *testing.T) {
 	if err = os.WriteFile(ssh, []byte(drop), 0700); err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	ctx, cancel := fixtureContext(t)
 	defer cancel()
 	dest := filepath.Join(f.home, "received")
 	h := endpoint{SSH: "fixture", CX: f.cx, State: os.Getenv("CXRUN_STATE"), Platform: runtime.GOOS + "/" + runtime.GOARCH}
@@ -629,7 +635,7 @@ esac
 	if e := os.WriteFile(next, data, 0700); e != nil {
 		t.Fatal(e)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 7*time.Second)
+	ctx, cancel := fixtureContext(t)
 	defer cancel()
 	h := endpoint{SSH: "fixture", CX: target, State: filepath.Join(center, "state"), Platform: "linux/amd64"}
 	if handled, e := deployFromCenter(ctx, h, h.Platform); e != nil || handled {
@@ -689,17 +695,28 @@ func TestB3SessionScope(t *testing.T) {
 
 func TestB3RetryWindow(t *testing.T) {
 	t.Setenv("CX_PUBLISH_RETRY_WINDOW", "6.5")
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	ctx, cancel := fixtureContext(t)
 	defer cancel()
+	clock := timeshim.NewFake(time.Now())
+	ctx = clockContext(ctx, clock)
 	attempts := 0
-	started := time.Now()
-	err := retryTransfer(ctx, func() error { attempts++; return ctlExit(9) })
-	if !errors.Is(err, ctlExit(9)) || attempts != 2 || time.Since(started) < 5*time.Second {
+	done := make(chan error, 1)
+	go func() {
+		done <- retryTransfer(ctx, func() error {
+			attempts++
+			return ctlExit(9)
+		})
+	}()
+	if err := clock.WaitDeadline(ctx, clock.Now().Add(5*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	clock.AdvanceToNext()
+	if err := <-done; !errors.Is(err, ctlExit(9)) || attempts != 2 {
 		t.Fatal(attempts, err)
 	}
 	attempts = 0
 	invalid := errors.New("invalid manifest")
-	err = retryTransfer(ctx, func() error { attempts++; return invalid })
+	err := retryTransfer(ctx, func() error { attempts++; return invalid })
 	if !errors.Is(err, invalid) || attempts != 1 {
 		t.Fatal(attempts, err)
 	}

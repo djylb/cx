@@ -1,14 +1,11 @@
 package main
 
 import (
-	"context"
 	"errors"
-	"io"
 	"os"
 	"path/filepath"
 	"strconv"
 	"testing"
-	"time"
 )
 
 var fixtureRequests = []string{
@@ -18,7 +15,7 @@ var fixtureRequests = []string{
 
 func TestNestedControlRequests(t *testing.T) {
 	h := newRuns(t, "silent")
-	done := h.start("job", "--idle-exit", "5s")
+	done := h.start("job", "--idle-exit", "2m")
 	h.await("job", func(s status) bool { return s.Turn == "first" })
 	call := make(chan error, 1)
 	go func() { call <- h.ctl("rpc", "job", "fixture/requests", "--params", "{}") }()
@@ -55,16 +52,12 @@ func TestNestedControlRequests(t *testing.T) {
 
 func TestInteractiveAndThreadControls(t *testing.T) {
 	h := newRuns(t, "question")
-	done := h.start("job", "--interactive", "--idle-exit", "5s")
+	done := h.start("job", "--interactive", "--idle-exit", "2m")
 	h.await("job", func(s status) bool { return s.InputKind == "next_turn" })
 	if err := h.ctl("wait", "job"); !errors.Is(err, errQuestion) {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(h.ctx, 100*time.Millisecond)
-	defer cancel()
-	if err := waitAny(ctx, h.root, "", "", "", io.Discard); !errors.Is(err, errObserveTimeout) {
-		t.Fatal(err)
-	}
+	assertNoWaitAnyEvent(t, h.ctx, h.root, "", "", nil)
 	for _, scope := range []string{"turn", "thread"} {
 		if err := h.ctl("settings", "job", "--scope", scope, "--effort", "low"); err != nil {
 			t.Fatal(err)
@@ -140,7 +133,7 @@ func TestLocalHandshake(t *testing.T) {
 	}
 	dir := t.TempDir()
 	t.Setenv("CODEX_HOME", dir)
-	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	ctx, cancel := fixtureContext(t)
 	defer cancel()
 	r := runner{dir: dir, c: config{Dir: dir}, ctx: ctx}
 	startFixtureWriter(t, &r)

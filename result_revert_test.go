@@ -10,7 +10,7 @@ func TestDefaultResultRejectsCachedAndSealedTurnAfterEmptyRevert(t *testing.T) {
 	f := newControllerFixture(t)
 	h := newRuns(t, "revert-empty")
 	const job, addr = "p/reverted-result", "local:p/reverted-result"
-	done := h.start(job, "--idle-exit", "20s")
+	done := h.start(job, "--idle-exit", "2m")
 	h.await(job, func(s status) bool { return s.State == "waiting" && s.LastCompleted == "first" })
 	before := cliOutput(t, 0, nil, f.cx, "result", addr, "--wait", "--full")
 	if err := h.ctl("undo", job, "--before", "first", "--op-id", "empty-result-history"); err != nil {

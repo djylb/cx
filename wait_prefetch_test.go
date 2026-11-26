@@ -6,11 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/djylb/timeshim"
 )
 
 // After `cx wait` reports a completed turn, `cx result` without --wait must read the
@@ -36,9 +37,9 @@ func TestWaitPrefetchesResult(t *testing.T) {
 		cliOutput(t, 0, nil, "git", append([]string{"-C", src}, args...)...)
 	}
 	const id = "local:p/prefetch"
-	cliOutput(t, 0, nil, f.cx, "run", "local", src, "prefetch", prompt, "--sync", "--idle-exit", "15s")
+	cliOutput(t, 0, nil, f.cx, "run", "local", src, "prefetch", prompt, "--sync", "--idle-exit", "2m")
 	defer cliOutput(t, 0, nil, f.cx, "close", id)
-	cliOutput(t, 0, nil, f.cx, "wait", id, "--timeout", "10s")
+	cliOutput(t, 0, nil, f.cx, "wait", id, "--timeout", "2m")
 	out, diag := cliStreams(t, 0, nil, f.cx, "result", id)
 	if strings.Contains(string(out), "collecting") || !strings.Contains(diag, "last.md") {
 		t.Fatalf("result after wait was not cached: %s %s", out, diag)
@@ -47,7 +48,7 @@ func TestWaitPrefetchesResult(t *testing.T) {
 
 func TestWaitPrefetchesSelectedTurn(t *testing.T) {
 	f := newControllerFixture(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := fixtureContext(t)
 	defer cancel()
 	before := status{RunID: "run", Finished: 1, LastCompleted: "first", Turn: "second", TurnStatus: "inProgress"}
 	now := status{RunID: "run", Job: "prefetch", State: "waiting", Finished: 3, LastCompleted: "third", CompletedStatus: "completed"}
@@ -73,7 +74,7 @@ case "$request" in
   *) exit 44 ;;
 esac
 `)
-	out := cliOutput(t, 0, nil, f.cx, "wait", "remote:p/prefetch", "--timeout", "8s")
+	out := cliOutput(t, 0, nil, f.cx, "wait", "remote:p/prefetch", "--timeout", "2m")
 	if !bytes.Contains(out, []byte("completed_turn=second")) || bytes.Contains(out, []byte("run_id")) {
 		t.Fatalf("wait returned %s", out)
 	}
@@ -89,7 +90,7 @@ func TestWaitPrefetchUnavailableAndSlow(t *testing.T) {
 		name, action string
 	}{
 		{"unavailable", "exit 44"},
-		{"slow", "exec sleep 12"},
+		{"silent", "exec sleep 120"},
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
 			f := newControllerFixture(t)
@@ -103,10 +104,34 @@ case "$request" in
   *) exit 44 ;;
 esac
 `)
-			started := time.Now()
-			cliOutput(t, 0, nil, f.cx, "wait", "remote:p/prefetch", "--timeout", "15s")
-			if elapsed := time.Since(started); elapsed > 8*time.Second {
-				t.Fatalf("prefetch held wait for %s", elapsed)
+			ctx, cancel := fixtureContext(t)
+			defer cancel()
+			clock := timeshim.NewFake(time.Now())
+			h := endpoint{SSH: "fixture", CX: "cx"}
+			done := make(chan error, 1)
+			go func() { done <- waitOne(clockContext(ctx, clock), h, "remote", "p/prefetch", time.Minute) }()
+			if scenario.name == "silent" {
+				if err := awaitFixtureCondition(ctx, func() (bool, error) {
+					data, err := os.ReadFile(filepath.Join(f.home, "requests"))
+					if os.IsNotExist(err) {
+						return false, nil
+					}
+					return bytes.Contains(data, []byte("result-download")), err
+				}); err != nil {
+					t.Fatal(err)
+				}
+				if err := clock.WaitDeadline(ctx, clock.Now().Add(prefetchLimit)); err != nil {
+					t.Fatal(err)
+				}
+				clock.Advance(prefetchLimit)
+			}
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
 			}
 			assertPrefetchRequests(t, f.home)
 		})
@@ -158,7 +183,7 @@ func writePrefetchArchive(t *testing.T, ctx context.Context, result observedResu
 
 func TestResultMarkerRejectsLatePublication(t *testing.T) {
 	t.Setenv("CX_HOME", t.TempDir())
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := fixtureContext(t)
 	defer cancel()
 	const host, id = "local", "p/prefetch"
 	marker, before, err := resultMarkerSnapshot(host, id)
@@ -207,7 +232,7 @@ func TestResultMarkerRejectsLatePublication(t *testing.T) {
 
 func TestWaitPrefetchKeepsNewerGeneration(t *testing.T) {
 	f := newControllerFixture(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	ctx, cancel := fixtureContext(t)
 	defer cancel()
 	const host, id = "remote", "p/prefetch"
 	target := observedResult{RunID: "old", Number: 2, TurnID: "second"}
@@ -228,27 +253,12 @@ case "$request" in
   *) exit 44 ;;
 esac
 `)
-	cmd := exec.CommandContext(ctx, f.cx, "wait", host+":"+id, "--timeout", "7s")
-	var output bytes.Buffer
-	cmd.Stdout, cmd.Stderr, cmd.WaitDelay = &output, &output, time.Second
-	if err := cmd.Start(); err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		if cmd.ProcessState == nil {
-			cancel()
-			_ = cmd.Wait()
-		}
-	}()
-	for {
-		if _, err := os.Stat(entered); err == nil {
-			break
-		} else if !os.IsNotExist(err) {
-			t.Fatal(err)
-		}
-		if err := pause(ctx, 10*time.Millisecond); err != nil {
-			t.Fatal("old prefetch did not start", err)
-		}
+	clock := timeshim.NewFake(time.Now())
+	h := endpoint{SSH: "fixture", CX: "cx"}
+	done := make(chan error, 1)
+	go func() { done <- waitOne(clockContext(ctx, clock), h, host, id, time.Minute) }()
+	if err := awaitFixtureFile(ctx, entered); err != nil {
+		t.Fatal("old prefetch did not start", err)
 	}
 	marker, seen, err := resultMarkerSnapshot(host, id)
 	if err != nil {
@@ -260,8 +270,13 @@ esac
 	if err = os.WriteFile(release, nil, 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err = cmd.Wait(); err != nil {
-		t.Fatalf("wait: %v, output %s", err, &output)
+	select {
+	case err = <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
 	}
 	dest, err := resultDest(host, id, target.RunID, "2")
 	if err != nil {
@@ -276,7 +291,7 @@ esac
 }
 
 func TestCanceledResultUnpackKeepsDownload(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := fixtureContext(t)
 	defer cancel()
 	target := observedResult{RunID: "run", Number: 2, TurnID: "second"}
 	archive := writePrefetchArchive(t, ctx, target)

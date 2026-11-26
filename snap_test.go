@@ -12,7 +12,7 @@ import (
 
 func snapTestCtx(t *testing.T) context.Context {
 	t.Helper()
-	ctx, c := context.WithTimeout(context.Background(), 23*time.Second)
+	ctx, c := fixtureContext(t)
 	t.Cleanup(c)
 	t.Setenv("CX_SNAPSHOT_STORE", filepath.Join(t.TempDir(), "store"))
 	t.Setenv("GOWORK", "off")

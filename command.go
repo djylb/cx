@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"syscall"
 	"time"
+
+	"github.com/djylb/timeshim"
 )
 
 // The worker has no handles to the submitter's terminal or SSH pipes.
@@ -36,7 +38,10 @@ func launchCommand(root, project, job, runID, directory string) (<-chan error, e
 	return done, nil
 }
 
-const outputTailBytes = 64 * 1024
+const (
+	outputTailBytes     = 64 * 1024
+	commandPollInterval = 50 * time.Millisecond
+)
 
 func (r *runner) publishOutputTail() error {
 	f, err := openJobFile(filepath.Join(r.dir, "output.log"), jobFileRead)
@@ -142,10 +147,11 @@ func (r *runner) serveCommand() (err error) {
 	if err = r.save(); err != nil {
 		return err
 	}
-	ticker := time.NewTicker(50 * time.Millisecond)
+	clock := timeshim.Or(r.clock)
+	lastOutput := clock.Now()
+	ticker := timeshim.NewTicker(clock, commandPollInterval)
 	defer ticker.Stop()
 	var size int64
-	lastOutput := time.Now()
 	for {
 		var reason string
 		var closing bool
@@ -180,7 +186,7 @@ func (r *runner) serveCommand() (err error) {
 			}
 			if fi.Size() != size {
 				size = fi.Size()
-				lastOutput = time.Now()
+				lastOutput = clock.Now()
 			}
 			if _, ok, e := r.takeMarker("close"); e != nil {
 				return e
@@ -190,7 +196,7 @@ func (r *runner) serveCommand() (err error) {
 				if err = r.reclaim(); err != nil {
 					return err
 				}
-			} else if r.c.Quiet > 0 && time.Since(lastOutput) >= r.c.Quiet {
+			} else if r.c.Quiet > 0 && timeshim.Since(clock, lastOutput) >= r.c.Quiet {
 				reason = "stalled"
 			} else {
 				continue
@@ -229,13 +235,13 @@ func (r *runner) serveCommand() (err error) {
 
 var errReapDeadline = errors.New("process reap deadline")
 
-func waitProcess(cmd *exec.Cmd, limit time.Duration) error {
+func waitProcess(cmd *exec.Cmd, limit time.Duration, clock timeshim.Clock) error {
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
 	select {
 	case err := <-done:
 		return err
-	case <-time.After(limit):
+	case <-timeshim.After(timeshim.Or(clock), limit):
 		return errReapDeadline
 	}
 }

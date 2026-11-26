@@ -6,7 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
-	"time"
+
+	"github.com/djylb/timeshim"
 )
 
 type envelope struct {
@@ -184,7 +185,7 @@ func (r *runner) executeRPC(id string, e envelope, reply **agentReply) (json.Raw
 			return nil, errors.New("reply requires exactly one result or error")
 		}
 		for _, a := range r.s.Approvals {
-			if bytes.Equal(a.ID, e.Request) && time.Now().Before(a.Deadline) {
+			if bytes.Equal(a.ID, e.Request) && timeshim.Or(r.clock).Now().Before(a.Deadline) {
 				if a.Method == agentAsk {
 					var request string
 					if err := json.Unmarshal(a.ID, &request); err != nil {
@@ -299,7 +300,7 @@ func (r *runner) clearCurrentTurn() {
 	r.s.InputKind = ""
 	r.s.turnSummary = turnSummary{}
 	r.deriveState()
-	r.idleSince = time.Now()
+	r.idleSince = timeshim.Or(r.clock).Now()
 }
 
 func (r *runner) hasUncertainRevert() bool {

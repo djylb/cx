@@ -17,7 +17,7 @@ func TestClaudeDeferredInput(t *testing.T) {
 	fixture := `#!/bin/sh
 read -r msg
 case "$msg" in
-  *task*) sleep 0.8 ;;
+  *task*) while [ ! -f release-first ]; do sleep .02; done ;;
   *follow*) case "$*" in *"--resume fixture-session"*) ;; *) exit 2 ;; esac ;;
   *) exit 3 ;;
 esac
@@ -26,12 +26,16 @@ echo '{"type":"result","session_id":"fixture-session","result":"answer"}'
 	if err := os.WriteFile(path, []byte(fixture), 0700); err != nil {
 		t.Fatal(err)
 	}
+	h.withClock("conversation")
 	done := h.start("conversation", "--engine", "claude", "--web-search", "--idle-exit", "1s")
 	h.await("conversation", func(s status) bool { return s.TurnStatus == "inProgress" })
 	if err := h.ctl("say", "conversation", "follow"); err != nil {
 		t.Fatal(err)
 	}
-	if err := <-done; err != nil {
+	if err := os.WriteFile(filepath.Join(h.work, "release-first"), nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.idleExit("conversation", done, func(s status) bool { return s.Finished == 2 }); err != nil {
 		t.Fatal(err)
 	}
 	s := h.await("conversation", func(s status) bool { return s.State == "done" })

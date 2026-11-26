@@ -16,6 +16,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/djylb/timeshim"
 )
 
 func TestStatesAndOrphanProjection(t *testing.T) {
@@ -71,10 +73,16 @@ func TestRPCWriteDeadlineAndLateReply(t *testing.T) {
 	reader, writer := io.Pipe()
 	defer func() { _ = reader.Close() }()
 	defer func() { _ = writer.Close() }()
-	s := &server{in: writer, stop: make(chan struct{}), writes: make(chan writeRequest, 1), expired: map[string]bool{"7": true}, writeTimeout: 20 * time.Millisecond}
+	ctx, cancel := fixtureContext(t)
+	defer cancel()
+	clock := timeshim.NewFake(time.Now())
+	s := &server{clock: clock, in: writer, stop: make(chan struct{}), writes: make(chan writeRequest, 1), expired: map[string]bool{"7": true}, writeTimeout: time.Second}
 	go s.writer()
 	defer close(s.stop)
-	if err := s.send(fields{"id": 1}); !errors.Is(err, errServerClosed) {
+	done := make(chan error, 1)
+	go func() { done <- s.send(fields{"id": 1}) }()
+	advanceFixture(t, ctx, clock)
+	if err := <-done; !errors.Is(err, errServerClosed) {
 		t.Fatal(err)
 	}
 	if err := s.send(fields{"id": 2}); !errors.Is(err, errServerClosed) {
@@ -122,7 +130,7 @@ func TestAtomicSyncOrderAndFailure(t *testing.T) {
 }
 func TestProgressCursorAndEventSequence(t *testing.T) {
 	h := newRuns(t, "complete")
-	if err := <-h.start("job"); err != nil {
+	if err := h.finishFirstTurn("job"); err != nil {
 		t.Fatal(err)
 	}
 	cmd := commands(t)
@@ -160,14 +168,27 @@ func TestProgressCursorAndEventSequence(t *testing.T) {
 }
 func TestRegistryAndReapDeadlines(t *testing.T) {
 	root := t.TempDir()
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	ctx, cancel := fixtureContext(t)
 	defer cancel()
 	g, err := registryLock(ctx, root)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = g.Close() }()
-	if _, err = registryLock(ctx, root); !errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+	clock := timeshim.NewFake(time.Now())
+	done := make(chan error, 1)
+	go func() {
+		held, lockErr := registryLock(clockContext(ctx, clock), root)
+		if held != nil {
+			closeBestEffort(held)
+		}
+		done <- lockErr
+	}()
+	if waitErr := clock.WaitPending(ctx, 2); waitErr != nil {
+		t.Fatal(waitErr)
+	}
+	clock.Advance(5 * time.Second)
+	if err = <-done; !errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
 		t.Fatal(err, ctx.Err())
 	}
 	exe, err := os.Executable()
@@ -180,13 +201,16 @@ func TestRegistryAndReapDeadlines(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = cmd.Process.Kill() }()
-	if err = waitProcess(cmd, 20*time.Millisecond); !errors.Is(err, errReapDeadline) {
+	go func() { done <- waitProcess(cmd, time.Second, clock) }()
+	advanceFixture(t, ctx, clock)
+	if err = <-done; !errors.Is(err, errReapDeadline) {
 		t.Fatal(err)
 	}
 }
 func TestFollowupQueueHandlesInterruptAndIdle(t *testing.T) {
 	h := newRuns(t, "manual")
 	setTestHost(t, h.root, map[string]int{"agent": 1}, "")
+	h.withClock("a")
 	a := h.start("a", "--idle-exit", "2s")
 	h.await("a", func(s status) bool { return s.Turn == "first" })
 	b := h.start("b")
@@ -202,7 +226,11 @@ func TestFollowupQueueHandlesInterruptAndIdle(t *testing.T) {
 	if err := h.ctl("interrupt", "a"); err != nil {
 		t.Fatal(err)
 	}
-	if err := <-a; err != nil {
+	h.awaitRecord("a", func(row stateRecord) bool {
+		var ack inboxAck
+		return row.Kind == "inbox_ack" && json.Unmarshal(row.Value, &ack) == nil && ack.Result == "withdrawn"
+	})
+	if err := h.idleExit("a", a, func(s status) bool { return s.State == "waiting" }); err != nil {
 		t.Fatal(err)
 	}
 	data, err := os.ReadFile(filepath.Join(h.root, "a", "progress.log"))
@@ -236,7 +264,15 @@ func TestRestartBudgetAndCommandStall(t *testing.T) {
 		})
 	}
 	h := newRuns(t, "command-silent")
+	clock := h.withClock("cmd")
 	done := h.start("cmd", "--cmd-stall", "500ms", "--stall", "50ms")
+	// The fixture emits item/started before the turn/start reply. Wait for
+	// that reply and a subsequent RPC before advancing the command stall clock.
+	h.await("cmd", func(s status) bool { return s.Turn == "first" })
+	if err := h.ctl("rpc", "cmd", "fixture/noop"); err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(500 * time.Millisecond)
 	h.await("cmd", func(s status) bool { return s.StallCount == 1 })
 	if err := h.ctl("close", "cmd"); err != nil {
 		t.Fatal(err)
@@ -273,7 +309,7 @@ func TestRejectedStartReleasesSlot(t *testing.T) {
 	defer close(s.stop)
 	go func() { _, _ = io.Copy(io.Discard, input) }()
 	s.frames <- frame{raw: []byte(`{"id":1,"error":{"code":-1,"message":"rejected"}}`)}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	ctx, cancel := fixtureContext(t)
 	defer cancel()
 	r := runner{dir: root, srv: s, slot: slot, ctx: ctx}
 	startFixtureWriter(t, &r)
@@ -286,7 +322,8 @@ func TestLateReplyDuringNextCall(t *testing.T) {
 	reader, writer := io.Pipe()
 	defer func() { _ = reader.Close() }()
 	defer func() { _ = writer.Close() }()
-	s := &server{in: writer, stop: make(chan struct{}), frames: make(chan frame, 2), writes: make(chan writeRequest, 1), expired: map[string]bool{}, writeTimeout: time.Second, responseTimeout: 25 * time.Millisecond}
+	clock := timeshim.NewFake(time.Now())
+	s := &server{clock: clock, in: writer, stop: make(chan struct{}), frames: make(chan frame, 2), writes: make(chan writeRequest, 1), expired: map[string]bool{}, writeTimeout: time.Minute, responseTimeout: time.Second}
 	go s.writer()
 	defer close(s.stop)
 	go func() { _, _ = io.Copy(io.Discard, reader) }()
@@ -296,11 +333,17 @@ func TestLateReplyDuringNextCall(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = log.Close() }()
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	ctx, cancel := fixtureContext(t)
 	defer cancel()
 	r := runner{dir: dir, ctx: ctx, srv: s, log: log}
 	startFixtureWriter(t, &r)
-	if err = r.call("first", nil, nil); err == nil {
+	done := make(chan error, 1)
+	go func() { done <- r.call("first", nil, nil) }()
+	if waitErr := clock.WaitDeadline(ctx, clock.Now().Add(s.responseTimeout)); waitErr != nil {
+		t.Fatal(waitErr)
+	}
+	clock.AdvanceToNext()
+	if err = <-done; !errors.Is(err, errRPCUncertain) {
 		t.Fatal("RPC did not expire")
 	}
 	s.frames <- frame{raw: []byte(`{"id":1,"result":{"old":true}}`)}

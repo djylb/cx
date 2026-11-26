@@ -146,7 +146,7 @@ func TestSnapWireDisconnectReleasesSnapshotLock(t *testing.T) {
 		{"inherited sender handle remains", 250 * time.Millisecond, true, 9},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			ctx, cancel := context.WithTimeout(t.Context(), 6*time.Second)
+			ctx, cancel := fixtureContext(t)
 			defer cancel()
 			store := t.TempDir()
 			t.Setenv("CX_SNAPSHOT_STORE", store)

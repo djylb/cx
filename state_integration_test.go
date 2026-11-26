@@ -102,15 +102,19 @@ func TestDedupPublishesNewClaimAfterFailure(t *testing.T) {
 	h := commands(t)
 	dedup := []string{"--dedup-key", "retry"}
 	h.start("failed", dedup, "argv", "failed", "")
-	h.cli(1, "wait", "--job", "p/failed", "--timeout", "3s")
+	h.cli(1, "wait", "--job", "p/failed", "--timeout", "2m")
 	_, first, err := dedupReceipt(h.root, "retry")
 	if err != nil || first.Job != "failed" || first.RunID == "" {
 		t.Fatal(first, err)
 	}
 	h.start("successful", dedup, "package-cache-env")
-	h.cli(0, "wait", "--job", "p/successful", "--timeout", "3s")
-	h.cli(0, "clean", "--job", "p/failed")
-	h.cli(0, "clean", "--job", "p/successful")
+	h.cli(0, "wait", "--job", "p/successful", "--timeout", "2m")
+	for _, job := range []string{"failed", "successful"} {
+		if waitErr := awaitFixtureOwnerReleased(h.ctx, filepath.Join(h.root, "p", job)); waitErr != nil {
+			t.Fatal(waitErr)
+		}
+		h.cli(0, "clean", "--job", "p/"+job)
+	}
 	dir, second, err := dedupReceipt(h.root, "retry")
 	if err != nil || second.Job != "successful" || second.RunID == first.RunID {
 		t.Fatal(second, err)

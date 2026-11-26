@@ -73,6 +73,8 @@ func (p hostProfile) accountEnv(root string) []string {
 	return env
 }
 
+var envRef = regexp.MustCompile(`\$\{[A-Za-z_][A-Za-z0-9_]*\}`)
+
 func parseEnvFile(data string) (map[string]string, error) {
 	env := map[string]string{}
 	for i, line := range strings.Split(data, "\n") {
@@ -86,7 +88,16 @@ func parseEnvFile(data string) (map[string]string, error) {
 		if !ok || !envName.MatchString(key) || strings.ContainsRune(value, 0) || !utf8.ValidString(value) {
 			return nil, fmt.Errorf("invalid env_file assignment on line %d", i+1)
 		}
-		env[key] = value
+		// Only ${NAME} expands (to a value set earlier in the file, else to the
+		// runner's environment), so a file can extend PATH; a bare $ stays literal
+		// because env files also carry credentials.
+		env[key] = envRef.ReplaceAllStringFunc(value, func(ref string) string {
+			name := ref[2 : len(ref)-1]
+			if v, ok := env[name]; ok {
+				return v
+			}
+			return os.Getenv(name)
+		})
 	}
 	return env, nil
 }

@@ -63,6 +63,83 @@ func packageCachePath(root string) string {
 	return filepath.Join(root, "cache", "packages")
 }
 
+const cargoTargetEnv = "CARGO_TARGET_DIR"
+
+func isCargoTargetEnv(name string) bool {
+	return name == cargoTargetEnv || runtime.GOOS == "windows" && strings.EqualFold(name, cargoTargetEnv)
+}
+
+func cargoRepository(root, source string) (string, error) {
+	if workspace, err := filepath.EvalSymlinks(filepath.Join(root, ".work")); err == nil {
+		rel, err := filepath.Rel(workspace, source)
+		if err == nil && filepath.IsLocal(rel) {
+			parts := strings.SplitN(filepath.ToSlash(rel), "/", 5)
+			// Use the checkout's owning job, which can differ from the runner's
+			// job on a fork or when an existing checkout is used in place.
+			for n := 1; n <= 2 && len(parts) > n+2; n++ {
+				if parts[n] != "work" || parts[n+1] != "tree" {
+					continue
+				}
+				job := filepath.Join(workspace, filepath.Join(parts[:n]...))
+				var m Manifest
+				err := readJSON(filepath.Join(job, "input", "manifest.json"), &m)
+				if os.IsNotExist(err) {
+					continue
+				}
+				if err != nil {
+					return "", err
+				}
+				if err := m.validate(); err != nil {
+					return "", err
+				}
+				tree := filepath.Join(job, "work", "tree")
+				for _, repo := range m.Repositories {
+					if snapWithin(filepath.Join(tree, repo.Path), source) {
+						if len(m.Repositories) == 1 {
+							return filepath.Base(repo.Path), nil
+						}
+						return repo.RepoID, nil
+					}
+				}
+			}
+		}
+	}
+	// An in-place job can start below the root of an ordinary or linked
+	// Git checkout. Plain directory jobs use the source directory's name.
+	for dir := source; filepath.IsAbs(dir); dir = filepath.Dir(dir) {
+		git := filepath.Join(dir, ".git")
+		if info, err := os.Stat(git); err == nil {
+			if info.Mode().IsRegular() {
+				return filepath.Base(dir), nil
+			}
+			if head, err := os.Stat(filepath.Join(git, "HEAD")); err == nil && head.Mode().IsRegular() {
+				return filepath.Base(dir), nil
+			}
+		}
+		if dir == filepath.Dir(dir) {
+			break
+		}
+	}
+	return filepath.Base(source), nil
+}
+
+func cargoCacheKey(project, job, repo string) string {
+	if project == "" {
+		project = ".job-" + job
+	}
+	if runtime.GOOS == "windows" {
+		project, repo = strings.ToLower(project), strings.ToLower(repo)
+	}
+	if !snapPath(repo) || filepath.Base(repo) != repo || strings.HasPrefix(repo, ".repo-") {
+		repo = ".repo-" + snapSum([]byte(repo))
+	}
+	return project + "/" + repo
+}
+
+func cargoTargetLease(root, key string) string {
+	return filepath.Join(cargoCachePath(root), ".leases", ".target-"+snapSum([]byte(key)))
+}
+
 var packageCaches = []struct {
 	dir  string
 	keys []string
@@ -105,26 +182,38 @@ func cacheLockPath(root string) (string, error) {
 }
 
 func (r *runner) prepareCaches() error {
+	var key, target string
+	cargoTargetSupplied := false
+	for name := range r.c.Env {
+		if isCargoTargetEnv(name) {
+			cargoTargetSupplied = true
+			break
+		}
+	}
+	if !cargoTargetSupplied {
+		repo, err := cargoRepository(r.root, r.c.Dir)
+		if err != nil {
+			return err
+		}
+		key = cargoCacheKey(r.s.Project, r.s.Job, repo)
+		target = filepath.Join(cargoCachePath(r.root), key)
+	}
 	guard, err := lockCaches(r.ctx, r.root)
 	if err != nil {
 		return err
 	}
 	defer closeBestEffort(guard)
 
-	project := r.s.Project
-	if project == "" {
-		project = ".job-" + r.s.Job
-	}
-	if runtime.GOOS == "windows" {
-		project = strings.ToLower(project)
-	}
-	targets := cargoCachePath(r.root)
-	target := filepath.Join(targets, project)
-	if err = prepareCacheEntry(r.root, filepath.Join("cargo-target", project)); err != nil {
-		return err
-	}
-	if err = touchCache(target); err != nil {
-		return err
+	if key != "" {
+		if err = ensureCacheDir(filepath.Dir(target)); err != nil {
+			return err
+		}
+		if err = prepareCacheEntry(r.root, filepath.Join("cargo-target", key)); err != nil {
+			return err
+		}
+		if err = touchCache(target); err != nil {
+			return err
+		}
 	}
 	packages := packageCachePath(r.root)
 	for _, cache := range packageCaches {
@@ -159,6 +248,25 @@ func (r *runner) prepareCaches() error {
 	}
 
 	use := &cacheUse{}
+	defer func() {
+		if r.c.cacheUse != use {
+			for _, lease := range use.leases {
+				closeBestEffort(lease)
+			}
+		}
+	}()
+	if key != "" {
+		r.targetLease, err = shareCache(cargoTargetLease(r.root, key))
+		if err != nil {
+			return err
+		}
+		use.leases = append(use.leases, r.targetLease)
+	}
+	r.packageLease, err = shareCache(filepath.Join(packages, ".lease"))
+	if err != nil {
+		return err
+	}
+	use.leases = append(use.leases, r.packageLease)
 	if r.c.RunID != "" {
 		use.path, err = jobPath(cachePins(r.root), r.c.RunID)
 		if err != nil {
@@ -169,29 +277,29 @@ func (r *runner) prepareCaches() error {
 		if readErr := readJSON(use.path, &use.pin); readErr != nil && !os.IsNotExist(readErr) {
 			return readErr
 		}
-		use.pin.Target, use.pin.PID, use.pin.Started = project, r.s.PID, r.s.RunnerStart
+	}
+	use.pin.Target, use.pin.PID, use.pin.Started = key, r.s.PID, r.s.RunnerStart
+	if use.path != "" {
 		// Register before launching a child. Unlike a runner handle, this
 		// record survives a runner crash and an ordinary foreground exit.
 		if err = writeJSON(use.path, use.pin); err != nil {
 			return err
 		}
 	}
-	r.targetLease, err = shareCache(filepath.Join(targets, ".leases", project))
-	if err != nil {
-		return err
-	}
-	r.packageLease, err = shareCache(filepath.Join(packages, ".lease"))
-	if err != nil {
-		closeBestEffort(r.targetLease)
-		return err
-	}
-	if r.c.Env == nil {
-		r.c.Env = map[string]string{}
-	}
-	use.leases = []*os.File{r.targetLease, r.packageLease}
 	r.c.cacheUse = use
-	r.c.Env["CARGO_TARGET_DIR"] = target
-	r.c.Roots = append(r.c.Roots, target)
+	if cargoTargetSupplied {
+		// Profile environment entries are applied after config.Env.
+		r.c.localEnv = slices.DeleteFunc(r.c.localEnv, func(entry string) bool {
+			name, _, _ := strings.Cut(entry, "=")
+			return isCargoTargetEnv(name)
+		})
+	} else {
+		if r.c.Env == nil {
+			r.c.Env = map[string]string{}
+		}
+		r.c.Env[cargoTargetEnv] = target
+		r.c.Roots = append(r.c.Roots, target)
+	}
 	return nil
 }
 
@@ -209,9 +317,13 @@ func touchCache(path string) error {
 }
 
 func (r *runner) releaseCaches() {
-	_ = touchCache(r.c.Env["CARGO_TARGET_DIR"])
-	if use := r.c.cacheUse; use != nil && use.path != "" && !cacheRunAlive(r.c.RunID, use.pin.Groups) {
-		removeBestEffort(use.path)
+	if use := r.c.cacheUse; use != nil {
+		if use.pin.Target != "" {
+			_ = touchCache(filepath.Join(cargoCachePath(r.root), use.pin.Target))
+		}
+		if use.path != "" && !cacheRunAlive(r.c.RunID, use.pin.Groups) {
+			removeBestEffort(use.path)
+		}
 	}
 	closeBestEffort(r.targetLease)
 	closeBestEffort(r.packageLease)
@@ -284,7 +396,7 @@ func (c *config) startCachedCommand(cmd *exec.Cmd) (commandTree, error) {
 			use.pin.Groups = append(use.pin.Groups, group)
 			if err := writeJSON(use.path, use.pin); err != nil {
 				killTree(cmd)
-				err = errors.Join(err, waitProcess(cmd, 5*time.Second))
+				err = errors.Join(err, waitProcess(cmd, 5*time.Second, nil))
 				tree.cleanup()
 				return commandTree{}, fmt.Errorf("record cache process group: %w", err)
 			}
@@ -301,6 +413,7 @@ func activeCachePins(root string) (map[string]bool, bool, error) {
 		return nil, false, err
 	}
 	targets := make(map[string]bool)
+	packagesPinned := false
 	for _, entry := range entries {
 		if !entry.Type().IsRegular() || strings.HasPrefix(entry.Name(), ".") {
 			continue
@@ -314,14 +427,17 @@ func activeCachePins(root string) (map[string]bool, bool, error) {
 			return nil, false, err
 		}
 		if (pin.PID > 0 && sameProcess(pin.Started, processStart(pin.PID))) || cacheRunAlive(entry.Name(), pin.Groups) {
-			targets[pin.Target] = true
+			packagesPinned = true
+			if pin.Target != "" {
+				targets[pin.Target] = true
+			}
 		} else {
 			// The maintenance lock keeps a resumed runner from re-registering
 			// until this check and removal are complete.
 			removeBestEffort(path)
 		}
 	}
-	return targets, len(targets) > 0, nil
+	return targets, packagesPinned, nil
 }
 
 func maintainReleasedCaches(ctx context.Context, root string) {
@@ -470,21 +586,36 @@ func cacheCandidates(cache *os.Root, root string) ([]cacheCandidate, error) {
 		}
 		return err
 	}
-	targets := cargoCachePath(root)
 	entries, err := fs.ReadDir(cache.FS(), "cargo-target")
 	if err != nil {
 		return nil, err
 	}
-	for _, ent := range entries {
-		name := ent.Name()
-		if !ent.IsDir() {
+	for _, project := range entries {
+		if !project.IsDir() {
 			continue
 		}
-		if _, pathErr := jobPath("", strings.TrimPrefix(name, ".job-")); pathErr != nil {
+		if _, pathErr := jobPath("", strings.TrimPrefix(project.Name(), ".job-")); pathErr != nil {
 			continue
 		}
-		if err = add(filepath.Join("cargo-target", name), filepath.Join(targets, ".leases", name)); err != nil {
-			return nil, err
+		info, infoErr := project.Info()
+		if infoErr != nil {
+			return nil, infoErr
+		}
+		if !cacheDirectory(info) {
+			continue
+		}
+		repos, readErr := fs.ReadDir(cache.FS(), "cargo-target/"+project.Name())
+		if readErr != nil {
+			return nil, readErr
+		}
+		for _, repo := range repos {
+			if !repo.IsDir() {
+				continue
+			}
+			key := project.Name() + "/" + repo.Name()
+			if err = add(filepath.Join("cargo-target", key), cargoTargetLease(root, key)); err != nil {
+				return nil, err
+			}
 		}
 	}
 	lease := filepath.Join(packageCachePath(root), ".lease")

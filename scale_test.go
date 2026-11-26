@@ -2,13 +2,11 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 )
 
 func TestWaitAnyConsumers(t *testing.T) {
@@ -41,16 +39,9 @@ func TestWaitAnyConsumers(t *testing.T) {
 	defer func() { _ = owner.Close() }()
 	registerJob(status{Project: "p", Job: "other", Session: "other", State: "done"}, "other")
 	registerJob(status{Project: "q", Job: "work", Session: "s", State: "stalled"}, "stalled")
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := fixtureContext(t)
 	defer cancel()
-	var out bytes.Buffer
-	done := make(chan error, 1)
-	go func() { done <- waitAny(ctx, root, "p", "s", a, &out) }()
-	select {
-	case err := <-done:
-		t.Fatalf("returned before a matching completion: %s %v", &out, err)
-	case <-time.After(80 * time.Millisecond):
-	}
+	assertNoWaitAnyEvent(t, ctx, root, "p", "s", map[string]waitCursor{})
 	first.Finished, first.CompletedStatus = 1, "failed"
 	if err := writeFixtureStatus(dir, first); err != nil {
 		t.Fatal(err)
@@ -66,7 +57,8 @@ func TestWaitAnyConsumers(t *testing.T) {
 			t.Fatalf("wanted %+v, got %s", expected, line)
 		}
 	}
-	if err := <-done; err != nil {
+	var out bytes.Buffer
+	if err := waitAny(ctx, root, "p", "s", a, &out); err != nil {
 		t.Fatal(err)
 	}
 	failedTurn := waitReport{Project: "p", Job: "work", State: "waiting", Outcome: "failed", Finished: 1, Code: 1}
@@ -75,7 +67,7 @@ func TestWaitAnyConsumers(t *testing.T) {
 	call := func(file, project, session string) string {
 		t.Helper()
 		var out bytes.Buffer
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		ctx, cancel := fixtureContext(t)
 		defer cancel()
 		if err := waitAny(ctx, root, project, session, file, &out); err != nil {
 			t.Fatal(err)
@@ -108,7 +100,7 @@ func TestWaitAnyConsumers(t *testing.T) {
 
 func TestScaleStatusFromAppServer(t *testing.T) {
 	h := newRuns(t, "scale")
-	done := h.start("scale", "--idle-exit", "10s")
+	done := h.start("scale", "--idle-exit", "2m")
 	s := h.await("scale", func(s status) bool { return s.State == "waiting" && s.Finished == 1 })
 	var usage struct{ Total struct{ TotalTokens int } }
 	if err := json.Unmarshal(s.Usage, &usage); err != nil || usage.Total.TotalTokens != 42 {

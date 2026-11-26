@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -46,11 +45,11 @@ func TestApplySealedTurns(t *testing.T) {
 	git("add", ".")
 	git("commit", "-qm", "base")
 	const id = "local:p/rounds"
-	cliOutput(t, 0, nil, f.cx, "run", "local", src, "rounds", prompt, "--sync", "--idle-exit", "15s")
+	cliOutput(t, 0, nil, f.cx, "run", "local", src, "rounds", prompt, "--sync", "--idle-exit", "2m")
 	defer cliOutput(t, 0, nil, f.cx, "close", id)
-	cliOutput(t, 0, nil, f.cx, "wait", id, "--timeout", "5s")
+	cliOutput(t, 0, nil, f.cx, "wait", id, "--timeout", "2m")
 	sealed := filepath.Join(root, ".work", "p", "rounds", "result", "turn-1")
-	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	ctx, cancel := fixtureContext(t)
 	defer cancel()
 	for {
 		ok, err := fileExists(filepath.Join(sealed, "result.json"))
@@ -75,7 +74,7 @@ func TestApplySealedTurns(t *testing.T) {
 	before := read(".git/index")
 	// Use the low-level node entry that bypasses the controller's say preflight.
 	cliOutput(t, 0, nil, f.cx, "node", "say", "--job", "p/rounds", "second round")
-	cliOutput(t, 0, nil, f.cx, "wait", id, "--timeout", "5s")
+	cliOutput(t, 0, nil, f.cx, "wait", id, "--timeout", "2m")
 	second := cliOutput(t, 0, nil, f.cx, "patch", id, "--turn", "2", "--incremental", "--full")
 	for _, want := range []string{"-round 1\n+round 2\n", "-round 1\n+base\n", "+++ b/new"} {
 		if !bytes.Contains(second, []byte(want)) {

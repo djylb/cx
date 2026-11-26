@@ -18,6 +18,8 @@ import (
 	"syscall"
 	"time"
 	"unicode/utf8"
+
+	"github.com/djylb/timeshim"
 )
 
 const (
@@ -648,7 +650,7 @@ func runNode(ctx context.Context, args []string, directSubmit bool) error {
 	}
 	if limit > 0 {
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, limit)
+		ctx, cancel = timeshim.WithTimeout(ctx, timeshim.Or(contextClock(ctx)), limit)
 		defer cancel()
 		if fs.NArg() != 0 {
 			return errors.New("wait: unexpected arguments")
@@ -1036,7 +1038,7 @@ func runNode(ctx context.Context, args []string, directSubmit bool) error {
 		}
 	}
 
-	r := runner{root: root, dir: dir, c: c, s: s, ctx: ctx}
+	r := runner{root: root, dir: dir, c: c, s: s, ctx: ctx, clock: runnerPolicyClock(ctx)}
 	if op == "clean" || terminalClose {
 		if !s.final {
 			return errors.New("job is not terminal")
@@ -1150,11 +1152,13 @@ func runNode(ctx context.Context, args []string, directSubmit bool) error {
 	defer r.releaseCaches()
 	return r.c.driver().run(&r)
 }
-func main() {
+func main() { mainContext(context.Background()) }
+
+func mainContext(parent context.Context) {
 	if len(os.Args) > 1 && os.Args[1] == "_command" {
 		ignoreHangup()
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop := signal.NotifyContext(parent, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if err := dispatch(ctx, os.Args[1:]); err != nil {
 		var code ctlExit

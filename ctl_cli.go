@@ -18,6 +18,8 @@ import (
 	"time"
 
 	"github.com/BurntSushi/toml"
+
+	"github.com/djylb/timeshim"
 )
 
 type ctlOptions struct {
@@ -528,7 +530,8 @@ func controller(ctx context.Context, a []string) error {
 	return errors.New("invalid command")
 }
 func waitOne(ctx context.Context, h endpoint, host, id string, limit time.Duration) error {
-	deadline := time.Now().Add(limit)
+	clock := timeshim.Or(contextClock(ctx))
+	deadline := clock.Now().Add(limit)
 	marker, seen, cacheErr := resultMarkerSnapshot(host, id)
 	r, e := h.call(ctx, limit+2*time.Second, "observe-one", id, limit.String())
 	if e != nil {
@@ -556,7 +559,7 @@ func waitOne(ctx context.Context, h endpoint, host, id string, limit time.Durati
 		}
 		if cacheErr == nil && s.Result != nil {
 			defer func() {
-				prefetchCtx, cancel := context.WithDeadline(ctx, deadline)
+				prefetchCtx, cancel := timeshim.WithDeadline(ctx, clock, deadline)
 				defer cancel()
 				prefetchResult(prefetchCtx, h, host, id, marker, seen, *s.Result)
 			}()

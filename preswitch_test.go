@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -16,30 +15,29 @@ func TestPreswitchTurnFailures(t *testing.T) {
 	for _, mode := range []string{"failure-pair", "failure-only", "failure-eof", "failure-status", "failure-field", "failure-retry"} {
 		t.Run(mode, func(t *testing.T) {
 			f := newControllerFixture(t)
-			root, work, prompt := runnerFixture(t)
+			h := newRuns(t, mode)
 			t.Setenv("CLAUDE_CODE_HOST_SESSION_ID", "local_x")
-			t.Setenv("FIXMODE", mode)
 			id := "p/" + mode
-			dir := filepath.Join(root, filepath.FromSlash(id))
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			done := make(chan struct{})
-			go func() {
-				defer close(done)
-				_ = run(ctx, []string{"start", "--job", id, "--dir", work, "--prompt-file", prompt, "--sandbox", "workspace-write", "--network", "--idle-exit", "3s", "--session", "local_x"})
-			}()
-			defer func() {
-				cancel()
-				<-done // CLI assertions check the turn. The runner is canceled during cleanup.
-			}()
+			dir := filepath.Join(h.root, filepath.FromSlash(id))
+			clock := h.withClock(id)
+			h.start(id, "--session", "local_x")
+			if mode == "failure-only" {
+				h.await(id, func(s status) bool { return s.Turn == "first" })
+				// The fixture sends the error before its turn/start reply.
+				if err := h.ctl("rpc", id, "fixture/noop"); err != nil {
+					t.Fatal(err)
+				}
+				clock.Advance(time.Second)
+			}
+			h.await(id, func(s status) bool { return s.Finished == 1 })
 			outcome := "failed"
 			code := 1
 			if mode == "failure-retry" {
 				outcome = "completed"
 				code = 0
 			}
-			cliOutput(t, code, nil, f.cx, "wait", "local:"+id, "--timeout", "3s")
-			cliOutput(t, code, nil, f.cx, "wait", "--any", "--project", "p", "--timeout", "3s")
+			cliOutput(t, code, nil, f.cx, "wait", "local:"+id, "--timeout", "2m")
+			cliOutput(t, code, nil, f.cx, "wait", "--any", "--project", "p", "--timeout", "2m")
 			var s status
 			if err := loadJobStatusInto(dir, &s); err != nil || s.CompletedStatus != outcome || s.TurnStatus != outcome || s.Finished != 1 {
 				t.Fatalf("turn status = %+v, %v", s, err)
@@ -99,11 +97,12 @@ func TestPreswitchCacheAndDiskAdmission(t *testing.T) {
 		}
 	})
 	cache := filepath.Join(packageCachePath(root), "cargo", "registry", "cache")
-	prepareCacheFixture(t, root, "p")
+	const repo = "command-src"
+	source := prepareCacheFixture(t, root, "p", repo)
 	makeCacheFixture(t, cache, 1000)
 	goCache := filepath.Join(f.home, "go-cache")
 	t.Setenv("GOCACHE", goCache)
-	cliOutput(t, 0, nil, f.cx, "exec", "local", "--tag", "disk", "--queue-timeout", "30s", "--", "sh", "-c", "printf \"%s\\n%s\\n\" \"$CARGO_TARGET_DIR\" \"$GOCACHE\"")
+	cliOutput(t, 0, nil, f.cx, "exec", "local", "--cwd", source, "--tag", "disk", "--queue-timeout", "2m", "--", "sh", "-c", "printf \"%s\\n%s\\n\" \"$CARGO_TARGET_DIR\" \"$GOCACHE\"")
 	t.Cleanup(func() { cliOutput(t, 0, nil, f.cx, "close", "local:p/disk") })
 	dir := filepath.Join(root, "p", "disk")
 	one := []string{"wait", "local:p/disk"}
@@ -116,17 +115,12 @@ func TestPreswitchCacheAndDiskAdmission(t *testing.T) {
 			t.Fatalf("queue notice = %s, %v", got, decodeErr)
 		}
 	}
-	assertQueued("min_free_bytes", append(one, "--timeout", "4s")...)
-	assertQueued("min_free_bytes", append(anyJob, "--timeout", "4s")...)
-	for deadline := time.Now().Add(3 * time.Second); ; {
-		_, statErr := os.Stat(cache)
-		if os.IsNotExist(statErr) {
-			break
-		}
-		if statErr != nil || time.Now().After(deadline) {
-			t.Fatalf("cache should be reclaimed under disk pressure with the slot occupied: %v", statErr)
-		}
-		time.Sleep(20 * time.Millisecond)
+	assertQueued("min_free_bytes", append(one, "--timeout", "2m")...)
+	assertQueued("min_free_bytes", append(anyJob, "--timeout", "2m")...)
+	ctx, cancel := fixtureContext(t)
+	defer cancel()
+	if waitErr := awaitRemovedFixtureFile(ctx, cache); waitErr != nil {
+		t.Fatalf("cache should be reclaimed under disk pressure with the slot occupied: %v", waitErr)
 	}
 	for _, args := range [][]string{one, anyJob} {
 		cliOutput(t, 124, nil, f.cx, append(args, "--timeout", "250ms")...)
@@ -137,22 +131,22 @@ func TestPreswitchCacheAndDiskAdmission(t *testing.T) {
 		}
 	}
 	cliOutput(t, 0, nil, f.cx, "host", "local", "--set", "min_free_bytes=0")
-	assertQueued("slots", append(one, "--timeout", "5s")...)
+	assertQueued("slots", append(one, "--timeout", "2m")...)
 	// Neither cursor observes the clear before the same disk reason returns.
 	cliOutput(t, 0, nil, f.cx, "host", "local", "--set", "min_free_bytes=18446744073709551615")
-	assertQueued("min_free_bytes", append(one, "--timeout", "4s")...)
-	assertQueued("min_free_bytes", append(anyJob, "--timeout", "4s")...)
+	assertQueued("min_free_bytes", append(one, "--timeout", "2m")...)
+	assertQueued("min_free_bytes", append(anyJob, "--timeout", "2m")...)
 	src := filepath.Join(f.home, "agent-src")
 	if mkdirErr := os.Mkdir(src, 0700); mkdirErr != nil {
 		t.Fatal(mkdirErr)
 	}
-	t.Setenv("CXRUN_MONITOR_TIMEOUT", "4s")
-	assertQueued("min_free_bytes", "agent", "--host", "local", "--dir", src, "--tag", "disk-agent", "--queue-timeout", "20s", "fixture")
+	t.Setenv("CXRUN_MONITOR_TIMEOUT", "2m")
+	assertQueued("min_free_bytes", "agent", "--host", "local", "--dir", src, "--tag", "disk-agent", "--queue-timeout", "2m", "fixture")
 	cliOutput(t, 0, nil, f.cx, "close", "local:p/disk-agent")
 	cliOutput(t, 0, nil, f.cx, "host", "local", "--set", "min_free_bytes=0")
 	closeBestEffort(slot)
 	slot = nil
-	cliOutput(t, 0, nil, f.cx, "wait", "local:p/disk", "--timeout", "3s")
+	cliOutput(t, 0, nil, f.cx, "wait", "local:p/disk", "--timeout", "2m")
 	out, err := os.ReadFile(filepath.Join(dir, "output.log"))
 	if err != nil {
 		t.Fatal(err)
@@ -161,42 +155,36 @@ func TestPreswitchCacheAndDiskAdmission(t *testing.T) {
 	if err = loadJobStatusInto(dir, &done); err != nil || done.QueueReason != "" {
 		t.Fatalf("completed queue reason = %q, %v", done.QueueReason, err)
 	}
-	want := filepath.Join(cargoCachePath(root), "p") + "\n" + goCache + "\n"
+	target := filepath.Join(cargoCachePath(root), "p", repo)
+	want := target + "\n" + goCache + "\n"
 	if string(out) != want {
 		t.Fatalf("build env = %q, want %q", out, want)
 	}
 
 	cliOutput(t, 0, nil, f.cx, "host", "local", "--set", "cache_max_bytes=1")
-	cliOutput(t, 0, nil, f.cx, "exec", "local", "--tag", "grow-cache", "--queue-timeout", "5s", "--", "sh", "-c", `printf xx > "$CARGO_TARGET_DIR/new"`)
-	cliOutput(t, 0, nil, f.cx, "wait", "local:p/grow-cache", "--timeout", "3s")
-	deadline := time.Now().Add(3 * time.Second)
-	for {
-		_, err := os.Stat(filepath.Join(cargoCachePath(root), "p"))
-		if os.IsNotExist(err) {
-			break
-		}
-		if err != nil || time.Now().After(deadline) {
-			t.Fatalf("worker did not trim its cache after exit: %v", err)
-		}
-		time.Sleep(20 * time.Millisecond)
+	cliOutput(t, 0, nil, f.cx, "exec", "local", "--cwd", source, "--tag", "grow-cache", "--queue-timeout", "2m", "--", "sh", "-c", `printf xx > "$CARGO_TARGET_DIR/new"`)
+	cliOutput(t, 0, nil, f.cx, "wait", "local:p/grow-cache", "--timeout", "2m")
+	if err := awaitRemovedFixtureFile(ctx, target); err != nil {
+		t.Fatalf("worker did not trim its cache after exit: %v", err)
 	}
 }
 
 func TestPreswitchCacheEvictsLeastRecentlyUsed(t *testing.T) {
 	root := t.TempDir()
-	ctx, stop := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, stop := fixtureContext(t)
 	defer stop()
-	active := runner{root: root, ctx: ctx, s: status{Project: "active"}}
+	source := prepareCacheFixture(t, root, "p", "active")
+	active := runner{root: root, ctx: ctx, s: status{Project: "p"}, c: config{Dir: source}}
 	if err := active.prepareCaches(); err != nil {
 		t.Fatal(err)
 	}
-	peer := runner{root: root, ctx: ctx, s: active.s}
+	peer := runner{root: root, ctx: ctx, s: active.s, c: config{Dir: source}}
 	if err := peer.prepareCaches(); err != nil {
 		t.Fatal(err)
 	}
-	base := cargoCachePath(root)
-	prepareCacheFixture(t, root, "old")
-	prepareCacheFixture(t, root, "new")
+	base := filepath.Join(cargoCachePath(root), "p")
+	prepareCacheFixture(t, root, "p", "old")
+	prepareCacheFixture(t, root, "p", "new")
 	makeCacheFixture(t, filepath.Join(base, "active"), 1000)
 	makeCacheFixture(t, filepath.Join(base, "old"), 1002)
 	makeCacheFixture(t, filepath.Join(base, "new"), 1003)
@@ -208,9 +196,8 @@ func TestPreswitchCacheEvictsLeastRecentlyUsed(t *testing.T) {
 		t.Fatal(err)
 	}
 	peer.releaseCaches()
-	zero := uint64(0)
-	host := &hostConfig{CacheMaxBytes: 3, MinFreeBytes: &zero}
-	if err := maintainCaches(ctx, root, host, true); err != nil {
+	probe := func() diskStatus { return diskStatus{} }
+	if _, err := trimCaches(ctx, root, 3, probe); err != nil {
 		t.Fatalf("cache maintenance: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(base, "old")); !os.IsNotExist(err) {
@@ -222,8 +209,7 @@ func TestPreswitchCacheEvictsLeastRecentlyUsed(t *testing.T) {
 		}
 	}
 	active.releaseCaches()
-	host.CacheMaxBytes = 2
-	if err := maintainCaches(ctx, root, host, true); err != nil {
+	if _, err := trimCaches(ctx, root, 2, probe); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(registry); !os.IsNotExist(err) {
@@ -254,7 +240,7 @@ func TestQueueNoticePreservesPendingWaitEvents(t *testing.T) {
 		t.Fatal(err)
 	}
 	startFixtureWriter(t, &r)
-	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	ctx, cancel := fixtureContext(t)
 	defer cancel()
 
 	for _, turn := range []struct{ id, outcome string }{{"first", "failed"}, {"second", "completed"}} {
@@ -294,8 +280,8 @@ func TestQueueNoticePreservesPendingWaitEvents(t *testing.T) {
 
 func TestCachePressureRechecksDiskAndLeavesWorkspace(t *testing.T) {
 	root := t.TempDir()
-	prepareCacheFixture(t, root, "recent")
-	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	prepareCacheFixture(t, root, "p", "recent")
+	ctx, cancel := fixtureContext(t)
 	defer cancel()
 	guard, err := lockCaches(ctx, root)
 	if err != nil {
@@ -303,7 +289,7 @@ func TestCachePressureRechecksDiskAndLeavesWorkspace(t *testing.T) {
 	}
 	defer closeBestEffort(guard)
 	old := filepath.Join(packageCachePath(root), "npm")
-	recent := filepath.Join(cargoCachePath(root), "recent")
+	recent := filepath.Join(cargoCachePath(root), "p", "recent")
 	work := filepath.Join(root, ".work", "p", "job")
 	makeCacheFixture(t, old, 1000)
 	makeCacheFixture(t, recent, 1001)
@@ -333,13 +319,18 @@ func TestCachePressureRechecksDiskAndLeavesWorkspace(t *testing.T) {
 	}
 }
 
-func prepareCacheFixture(t *testing.T, root, project string) {
+func prepareCacheFixture(t *testing.T, root, project, repo string) string {
 	t.Helper()
-	r := runner{root: root, ctx: t.Context(), s: status{Project: project}}
+	source := filepath.Join(t.TempDir(), repo)
+	if err := os.Mkdir(source, 0700); err != nil {
+		t.Fatal(err)
+	}
+	r := runner{root: root, ctx: t.Context(), s: status{Project: project}, c: config{Dir: source}}
 	if err := r.prepareCaches(); err != nil {
 		t.Fatal(err)
 	}
 	r.releaseCaches()
+	return source
 }
 
 func makeCacheFixture(t *testing.T, path string, seconds int64) {
@@ -369,7 +360,7 @@ func TestPreswitchCloseKeepsResult(t *testing.T) {
 		t.Fatal(err)
 	}
 	cliOutput(t, 0, nil, f.cx, "run", "local", src, "close", "--cmd", "--", "sh", "-c", "echo changed > file; echo report")
-	cliOutput(t, 0, nil, f.cx, "wait", "local:p/close", "--timeout", "3s")
+	cliOutput(t, 0, nil, f.cx, "wait", "local:p/close", "--timeout", "2m")
 	root := os.Getenv("CXRUN_STATE")
 	work := filepath.Join(root, ".work", "p", "close")
 	prep, found, err := readPreparedSnapshot(t.Context(), work)
@@ -398,7 +389,7 @@ func TestPreswitchDeployWithoutModule(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", f.home+string(os.PathListSeparator)+os.Getenv("PATH"))
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := fixtureContext(t)
 	defer cancel()
 	h := endpoint{SSH: "fixture", CX: f.cx, Platform: runtime.GOOS + "/" + runtime.GOARCH}
 	hs := endpoints{"fixture": h}
@@ -441,5 +432,5 @@ func TestPreswitchDeployWithoutModule(t *testing.T) {
 	if err != nil || r.code != 0 || !json.Valid(r.data) {
 		t.Fatalf("submit = %+v, %v", r, err)
 	}
-	cliOutput(t, 0, nil, f.cx, "wait", "local:p/no-module", "--timeout", "3s")
+	cliOutput(t, 0, nil, f.cx, "wait", "local:p/no-module", "--timeout", "2m")
 }

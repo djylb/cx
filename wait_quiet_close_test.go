@@ -2,11 +2,9 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 )
 
 // Closing a job whose finished turn was already reported must not wake `wait --any`.
@@ -34,20 +32,17 @@ func TestWaitAnyIgnoresQuietClose(t *testing.T) {
 		}
 	}
 	since := filepath.Join(t.TempDir(), "cursor.json")
-	run := func(timeout time.Duration) string {
-		t.Helper()
-		var out bytes.Buffer
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		defer cancel()
-		_ = waitAny(ctx, root, "p", "", since, &out)
-		return out.String()
-	}
-	if run(2*time.Second) == "" {
-		t.Fatal("first completion was not reported")
+	ctx, cancel := fixtureContext(t)
+	defer cancel()
+	var out bytes.Buffer
+	if err := waitAny(ctx, root, "p", "", since, &out); err != nil || out.Len() == 0 {
+		t.Fatal("first completion was not reported", err)
 	}
 	first.State = "done"
 	reg(first)
-	if got := run(300 * time.Millisecond); got != "" {
-		t.Fatalf("quiet close woke the waiter: %s", got)
+	var baseline map[string]waitCursor
+	if err := readJSON(since, &baseline); err != nil {
+		t.Fatal(err)
 	}
+	assertNoWaitAnyEvent(t, ctx, root, "p", "", baseline)
 }

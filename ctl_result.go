@@ -16,6 +16,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/djylb/timeshim"
 )
 
 type turnPatch struct {
@@ -1041,8 +1043,10 @@ func agentReport(ctx context.Context, host string, h endpoint, id string, full b
 
 // result-download seals a ready turn under the result lock before streaming it.
 // An unavailable selected turn (44) gives this observer no reason to poll again.
+const prefetchLimit = 2 * time.Second
+
 func prefetchResult(ctx context.Context, h endpoint, host, id, marker string, seen resultReference, target observedResult) {
-	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	ctx, cancel := timeshim.WithTimeout(ctx, timeshim.Or(contextClock(ctx)), prefetchLimit)
 	defer cancel()
 	if ctx.Err() != nil {
 		return

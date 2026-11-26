@@ -56,7 +56,7 @@ func TestCommandInputPreservesInheritedDescriptor(t *testing.T) {
 	if _, e := w.WriteString("xy"); e != nil {
 		t.Fatal(e)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := fixtureContext(t)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestCommandInputPreservesInheritedDescriptor$")
 	cmd.Env = append(os.Environ(), "CX_TEST_STDIN_CHILD=1")
@@ -72,7 +72,7 @@ func TestCommandInputPreservesInheritedDescriptor(t *testing.T) {
 
 func TestCommandInputNamedFIFOEOF(t *testing.T) {
 	if os.Getenv("CX_TEST_FIFO_CHILD") == "1" {
-		in := commandInput{ctx: context.Background(), idle: 3 * time.Second}
+		in := commandInput{ctx: context.Background(), idle: fixtureLimit}
 		var p [1]byte
 		if _, e := io.ReadFull(in, p[:]); e != nil || p[0] != 'x' {
 			t.Fatalf("FIFO data: %q, %v", p[:], e)
@@ -107,7 +107,7 @@ func TestCommandInputNamedFIFOEOF(t *testing.T) {
 	if _, e = w.WriteString("x"); e != nil {
 		t.Fatal(e)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	ctx, cancel := fixtureContext(t)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestCommandInputNamedFIFOEOF$")
 	cmd.Env = append(os.Environ(), "CX_TEST_FIFO_CHILD=1")
@@ -164,7 +164,7 @@ func TestSnapshotLockDoesNotSpendReadIdleBudget(t *testing.T) {
 				time.Sleep(5 * idle)
 				closeBestEffort(lock)
 			}()
-			ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+			ctx, cancel := fixtureContext(t)
 			defer cancel()
 			if e := dispatch(ctx, append([]string{"node", "snap-receive"}, args...)); e != nil {
 				t.Fatal(e)
@@ -222,7 +222,7 @@ func TestSnapshotReceiverIdleIsRetryable(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("CX_SNAPSHOT_STORE", t.TempDir())
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			ctx, cancel := fixtureContext(t)
 			defer cancel()
 			r, w, e := os.Pipe()
 			if e != nil {

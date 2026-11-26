@@ -12,12 +12,18 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/djylb/timeshim"
 )
 
 // The subprocess fixture exercises real pipes, files and locks. It needs no model account.
 func TestMain(m *testing.M) {
+	if os.Getenv("GORACE") == "" {
+		_ = os.Setenv("GORACE", "atexit_sleep_ms=0")
+	}
 	// Keep the controller configuration (context layers, projects) of the machine
 	// running the tests out of every test; tests that need it set their own.
 	if os.Getenv("CX_TEST_CONFIG") == "" {
@@ -39,7 +45,10 @@ func TestMain(m *testing.M) {
 		switch os.Args[1] {
 		case "fixture-command":
 			os.Exit(commandFixture(os.Args[2:]))
-		case "_command", "node":
+		case "_command":
+			commandFixtureMain()
+			return
+		case "node":
 			main()
 			return
 		case "fixture-cli":
@@ -100,7 +109,9 @@ func joinFixtureWorkers(t *testing.T, dir string) {
 	t.Cleanup(func() {
 		// The runner can still maintain caches after publishing terminal
 		// state and releasing owner.lock. Join before TempDir removes state.
-		barrier, err := lockUntil(context.Background(), path)
+		ctx, cancel := context.WithTimeout(context.Background(), fixtureLimit)
+		defer cancel()
+		barrier, err := lockUntil(ctx, path)
 		if err != nil {
 			t.Errorf("waiting for detached fixture workers: %v", err)
 			return
@@ -209,6 +220,7 @@ func fixtureServer() error {
 				turns = []fields{}
 			}
 			result = fields{"data": turns}
+		case "fixture/noop":
 		case "fixture/disconnect":
 			return nil
 		case "fixture/complete":
@@ -287,7 +299,7 @@ func fixtureServer() error {
 					send(fields{"id": m.ID, "result": fields{"turn": t}})
 					return errors.New("ENOSPC: no space left on device")
 				}
-				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				ctx, cancel := context.WithTimeout(context.Background(), fixtureLimit)
 				err := waitFixtureStart(ctx)
 				cancel()
 				if err != nil {
@@ -444,7 +456,7 @@ func fixtureServer() error {
 				if err := writeFile("three"); err != nil {
 					return err
 				}
-				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+				ctx, cancel := context.WithTimeout(context.Background(), fixtureLimit)
 				cmd := exec.CommandContext(ctx, os.Args[0], "check-files")
 				err := cmd.Run()
 				cancel()
@@ -483,6 +495,7 @@ func waitFixtureStart(ctx context.Context) error {
 
 func runnerFixture(t *testing.T) (root, work, prompt string) {
 	t.Helper()
+	t.Setenv("GORACE", "atexit_sleep_ms=0")
 	tmp := t.TempDir()
 	work = filepath.Join(tmp, "work dir")
 	if err := os.Mkdir(work, 0700); err != nil {
@@ -521,11 +534,12 @@ func TestRunnerConversation(t *testing.T) {
 	root, work, prompt := runnerFixture(t)
 	var err error
 	dir := filepath.Join(root, "job")
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := fixtureContext(t)
 	defer cancel()
+	clock := timeshim.NewFake(time.Now())
 	done := make(chan error, 1)
 	go func() {
-		done <- run(ctx, []string{"start", "--job", "job", "--dir", work, "--prompt-file", prompt, "--sandbox", "workspace-write", "--network", "--approval-timeout", "1200ms", "--idle-exit", "30s"}) // ended by close below, not by idle timing
+		done <- run(runnerClockContext(ctx, clock), []string{"start", "--job", "job", "--dir", work, "--prompt-file", prompt, "--sandbox", "workspace-write", "--network", "--approval-timeout", "1200ms", "--idle-exit", "2m"}) // ended by close below, not by idle timing
 	}()
 	check := func(err error) {
 		t.Helper()
@@ -535,20 +549,9 @@ func TestRunnerConversation(t *testing.T) {
 	}
 	until := func(want func(status) bool) status {
 		t.Helper()
-		for {
-			var s status
-			if loadJobStatusInto(dir, &s) == nil && want(s) {
-				return s
-			}
-			select {
-			case runnerErr := <-done:
-				b, _ := os.ReadFile(filepath.Join(dir, "server.stderr.log"))
-				t.Fatalf("runner exited early: %v %s", runnerErr, b)
-			case <-ctx.Done():
-				t.Fatal(ctx.Err())
-			case <-time.After(15 * time.Millisecond):
-			}
-		}
+		s, waitErr := awaitFixtureStatus(ctx, dir, want)
+		check(waitErr)
+		return s
 	}
 	until(func(s status) bool { return s.Turn == "first" })
 	check(run(ctx, []string{"start", "--job", "job", "--prompt-file", "missing"}))
@@ -563,6 +566,8 @@ func TestRunnerConversation(t *testing.T) {
 	}
 	approvalFile("approve", `"approval-1"`)
 	approvalFile("deny", "42")
+	until(func(s status) bool { return len(s.Approvals) == 1 && string(s.Approvals[0].ID) == "43" })
+	clock.Advance(1200 * time.Millisecond)
 	until(func(s status) bool { return s.State == "waiting" && s.Finished == 1 && len(s.Usage) > 0 })
 	check(control(ctx, "wait", dir, nil))
 	for _, p := range []string{"one", "two", "three"} {
@@ -706,50 +711,64 @@ func TestWaitKeepsOriginalTurn(t *testing.T) {
 }
 
 type testRuns struct {
-	t                  *testing.T
-	ctx                context.Context
-	runs               map[string]chan error
-	root, work, prompt string
+	ctx     context.Context
+	t       *testing.T
+	runs    map[string]chan error
+	clocks  map[string]*timeshim.Fake
+	root    string
+	work    string
+	prompt  string
+	workers sync.WaitGroup
 }
 
 func newRuns(t *testing.T, mode string) *testRuns {
 	root, work, prompt := runnerFixture(t)
 	t.Setenv("FIXMODE", mode)
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	t.Cleanup(cancel)
-	return &testRuns{t: t, ctx: ctx, runs: map[string]chan error{}, root: root, work: work, prompt: prompt}
+	ctx, cancel := fixtureContext(t)
+	h := &testRuns{t: t, ctx: ctx, runs: map[string]chan error{}, clocks: map[string]*timeshim.Fake{}, root: root, work: work, prompt: prompt}
+	t.Cleanup(func() {
+		cancel()
+		done := make(chan struct{})
+		go func() {
+			h.workers.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(fixtureLimit):
+			t.Error("fixture runners did not stop after cancellation")
+		}
+	})
+	return h
 }
 func (h *testRuns) args(id string, extra ...string) []string {
-	return append([]string{"start", "--job", id, "--dir", h.work, "--prompt-file", h.prompt, "--sandbox", "workspace-write", "--network", "--idle-exit", "100ms"}, extra...)
+	return append([]string{"start", "--job", id, "--dir", h.work, "--prompt-file", h.prompt, "--sandbox", "workspace-write", "--network", "--idle-exit", "2m"}, extra...)
 }
 func (h *testRuns) start(id string, extra ...string) <-chan error {
 	done := make(chan error, 1)
 	h.runs[id] = done
-	go func() { done <- run(h.ctx, h.args(id, extra...)) }()
+	ctx := h.ctx
+	if c := h.clocks[id]; c != nil {
+		ctx = runnerClockContext(ctx, c)
+	}
+	h.workers.Go(func() { done <- run(ctx, h.args(id, extra...)) })
 	return done
 }
 func (h *testRuns) await(id string, match func(status) bool) status {
 	h.t.Helper()
-	for {
-		var s status
-		if err := loadJobStatusInto(filepath.Join(h.root, id), &s); err == nil && match(s) {
-			return s
-		}
-		if err := pause(h.ctx, 10*time.Millisecond); err != nil {
-			// A stuck in-process runner is diagnosed from its goroutine stacks.
-			stacks := make([]byte, 1<<20)
-			h.t.Logf("goroutines:\n%s", stacks[:runtime.Stack(stacks, true)])
-			for job, done := range h.runs {
-				select {
-				case e := <-done:
-					h.t.Logf("runner %s already returned: %v", job, e)
-					done <- e
-				default:
-				}
+	s, err := awaitFixtureStatus(h.ctx, filepath.Join(h.root, id), match)
+	if err != nil {
+		for job, done := range h.runs {
+			select {
+			case e := <-done:
+				h.t.Logf("runner %s already returned: %v", job, e)
+				done <- e
+			default:
 			}
-			h.t.Fatalf("%s: %+v: %v", id, s, err)
 		}
+		h.t.Fatalf("%s: %+v: %v", id, s, err)
 	}
+	return s
 }
 func (h *testRuns) ctl(op, id string, opts ...string) error {
 	return run(h.ctx, append([]string{op, "--job", id}, opts...))
@@ -784,7 +803,7 @@ func TestFirstTurnPreamble(t *testing.T) {
 				}
 				opts = []string{"--preamble-file", path}
 			}
-			if err := <-h.start("job", opts...); err != nil {
+			if err := h.finishFirstTurn("job", opts...); err != nil {
 				stderr, _ := os.ReadFile(filepath.Join(h.root, "job", "server.stderr.log"))
 				t.Fatalf("runner: %v\n%s", err, stderr)
 			}
@@ -819,7 +838,11 @@ func TestDangerFullAccess(t *testing.T) {
 	h := newRuns(t, "exit")
 	t.Setenv("FIXSANDBOX", "danger-full-access")
 	const id = "privileged"
-	if err := <-h.start(id, "--sandbox", "danger-full-access"); err != nil {
+	h.withClock(id)
+	done := h.start(id, "--sandbox", "danger-full-access")
+	if err := h.idleExit(id, done, func(s status) bool {
+		return s.State == "waiting" && s.LastCompleted == "continued"
+	}); err != nil {
 		stderr, _ := os.ReadFile(filepath.Join(h.root, id, "server.stderr.log"))
 		t.Fatalf("runner: %v\n%s", err, stderr)
 	}
@@ -865,7 +888,8 @@ func TestStallAndCrashRecovery(t *testing.T) {
 			mode := tc.mode
 			h := newRuns(t, mode)
 			id := "p/recover"
-			opts := []string{"--stall", "200ms"}
+			clock := h.withClock(id)
+			opts := []string{"--stall", "200ms", "--idle-exit", "100ms"}
 			if tc.nudge != "" {
 				path := filepath.Join(t.TempDir(), "stall nudge")
 				if err := os.WriteFile(path, []byte(tc.nudge), 0600); err != nil {
@@ -876,7 +900,14 @@ func TestStallAndCrashRecovery(t *testing.T) {
 			}
 			done := h.start(id, opts...)
 			h.await(id, func(s status) bool { return s.Turn == "first" })
-			waitErr := h.ctl("wait", id, "--timeout", "14s")
+			if mode == "silent" {
+				h.stallUntilRestart(id, clock)
+				clock.Advance(time.Second)
+			} else {
+				h.await(id, func(s status) bool { return s.State == "waiting" && s.LastCompleted == "continued" })
+				clock.Advance(time.Second)
+			}
+			waitErr := h.ctl("wait", id, "--timeout", "2m")
 			err := <-done
 			var want error
 			if mode == "silent" {
@@ -920,7 +951,16 @@ func TestFIFOQueuedCloseAndDedup(t *testing.T) {
 	queued := func(s status) bool { return s.State == "queued" && s.PID != 0 }
 	first := h.start("alpha/j", "--dedup-key", "abc")
 	h.await("alpha/j", queued)
-	if err = h.ctl("wait", "alpha/j", "--timeout", "50ms"); !errors.Is(err, context.DeadlineExceeded) {
+	clock := timeshim.NewFake(time.Now())
+	waited := make(chan error, 1)
+	go func() {
+		waited <- run(clockContext(h.ctx, clock), []string{"wait", "--job", "alpha/j", "--timeout", "1s"})
+	}()
+	if err = clock.WaitDeadline(h.ctx, clock.Now().Add(200*time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(time.Second)
+	if err = <-waited; !errors.Is(err, errObserveTimeout) {
 		t.Fatal(err)
 	}
 	if err = h.ctl("start", "alpha/j"); err != nil {
@@ -988,7 +1028,7 @@ func TestProjectsRunConcurrently(t *testing.T) {
 }
 func TestCleanKeepsSuccessfulReceipt(t *testing.T) {
 	h := newRuns(t, "complete")
-	if err := <-h.start("p/a", "--dedup-key", "key"); err != nil {
+	if err := h.finishFirstTurn("p/a", "--dedup-key", "key"); err != nil {
 		t.Fatal(err)
 	}
 	if err := h.ctl("clean", "p/a"); err != nil {
@@ -997,7 +1037,7 @@ func TestCleanKeepsSuccessfulReceipt(t *testing.T) {
 	if err := run(h.ctx, h.args("p/b", "--dedup-key", "key")); !errors.Is(err, errDuplicate) {
 		t.Fatal(err)
 	}
-	if err := <-h.start("p/b", "--dedup-key", "key", "--force"); err != nil {
+	if err := h.finishFirstTurn("p/b", "--dedup-key", "key", "--force"); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -1018,16 +1058,23 @@ func TestLockedRegisteredJob(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = held.Close() }()
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	ctx, cancel := fixtureContext(t)
 	defer cancel()
 	for _, op := range []string{"start", "resume", "status"} {
 		if err = run(ctx, []string{op, "--job", "legacy"}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	closeCtx, stopClose := context.WithTimeout(ctx, 100*time.Millisecond)
+	clock := timeshim.NewFake(time.Now())
+	closeCtx, stopClose := timeshim.WithTimeout(clockContext(ctx, clock), clock, time.Second)
 	defer stopClose()
-	if err = run(closeCtx, []string{"close", "--job", "legacy"}); !errors.Is(err, context.DeadlineExceeded) {
+	done := make(chan error, 1)
+	go func() { done <- run(closeCtx, []string{"close", "--job", "legacy"}) }()
+	if waitErr := clock.WaitDeadline(ctx, clock.Now().Add(50*time.Millisecond)); waitErr != nil {
+		t.Fatal(waitErr)
+	}
+	clock.Advance(time.Second)
+	if err = <-done; !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("close returned without a final record: %v", err)
 	}
 	if err = run(ctx, []string{"clean", "--job", "legacy"}); err == nil {
@@ -1067,7 +1114,7 @@ func TestListAndWaitCLI(t *testing.T) {
 	fixtureCLI(t, 0, "wait", "--job", "p/same")
 	fixtureCLI(t, 1, "wait", "--job", "legacy")
 	fixtureCLI(t, 3, "wait", "--job", "p/other")
-	fixtureCLI(t, 5, "wait", "--job", "q/same", "--timeout", "30ms")
+	fixtureCLI(t, 5, "wait", "--job", "q/same", "--timeout", "2m")
 }
 
 func fixtureCLI(t *testing.T, expected int, args ...string) string {
@@ -1076,7 +1123,7 @@ func fixtureCLI(t *testing.T, expected int, args ...string) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := fixtureContext(t)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, exe, append([]string{"fixture-cli"}, args...)...)
 	b, err := cmd.CombinedOutput()
@@ -1107,7 +1154,8 @@ func TestLoadGateAndAbandonedTicket(t *testing.T) {
 		}
 	}()
 	h.await("p/abandoned", func(s status) bool { return s.State == "queued" && s.PID == cmd.Process.Pid })
-	if err = h.ctl("wait", "p/abandoned", "--timeout", "1s"); !errors.Is(err, ctlExit(exitQueued)) {
+	h.await("p/abandoned", func(s status) bool { return s.QueueReason != "" })
+	if err = h.ctl("wait", "p/abandoned", "--timeout", "2m"); !errors.Is(err, ctlExit(exitQueued)) {
 		t.Fatal(err)
 	}
 	if err = cmd.Process.Kill(); err != nil {
@@ -1117,7 +1165,7 @@ func TestLoadGateAndAbandonedTicket(t *testing.T) {
 		t.Fatal("expected killed runner")
 	}
 	setTestHost(t, h.root, map[string]int{"agent": 1}, "exit 0")
-	if err = <-h.start("p/next"); err != nil {
+	if err = h.finishFirstTurn("p/next"); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -1172,10 +1220,13 @@ func TestTurnSlotHandoff(t *testing.T) {
 func TestRestartKeepsActiveSlot(t *testing.T) {
 	h := newRuns(t, "silent")
 	setTestHost(t, h.root, map[string]int{"agent": 1}, "")
+	clock := h.withClock("recover")
 	recovery := h.start("recover", "--stall", "600ms")
-	h.await("recover", func(s status) bool { return s.Turn == "continued" && s.StallCount == 2 })
+	h.await("recover", func(s status) bool { return s.Turn == "first" })
+	h.stallUntilRestart("recover", clock)
 	next := h.start("next")
-	h.await("next", func(s status) bool { return s.State == "queued" && s.PID != 0 })
+	h.await("next", func(s status) bool { return s.State == "queued" && s.QueueReason != "" })
+	clock.Advance(time.Second)
 	h.await("next", func(s status) bool { return s.Turn == "first" })
 	var s status
 	if err := loadJobStatusInto(filepath.Join(h.root, "recover"), &s); err != nil || s.State != "stalled" {
@@ -1198,10 +1249,12 @@ func TestFollowupQueueDeadlines(t *testing.T) {
 			h := newRuns(t, "manual")
 			setTestHost(t, h.root, map[string]int{"agent": 1}, "")
 			h.t.Setenv("GORACE", "atexit_sleep_ms=0")
+			const queueTimeout = 350 * time.Millisecond
 			queueLimit := "0"
 			if expireQueue {
-				queueLimit = "350ms"
+				queueLimit = queueTimeout.String()
 			}
+			clock := h.withClock("a")
 			a := h.start("a", "--idle-exit", "1m", "--timeout", "2s", "--queue-timeout", queueLimit)
 			h.await("a", func(s status) bool { return s.Turn == "first" })
 			b := h.start("b", "--idle-exit", "1m")
@@ -1214,12 +1267,17 @@ func TestFollowupQueueDeadlines(t *testing.T) {
 				t.Fatal(err)
 			}
 			h.await("a", func(s status) bool { return s.State == "queued" })
+			wantState := "timeout"
+			wantErr := error(context.DeadlineExceeded)
 			if expireQueue {
-				h.await("a", func(s status) bool { return s.State == "queue_timeout" })
-			} else {
-				if err := pause(h.ctx, 2200*time.Millisecond); err != nil {
+				if err := clock.WaitDeadline(h.ctx, clock.Now().Add(queueTimeout)); err != nil {
 					t.Fatal(err)
 				}
+				clock.Advance(queueTimeout)
+				wantState, wantErr = "queue_timeout", errQueueTimeout
+				h.await("a", func(s status) bool { return s.State == wantState })
+			} else {
+				clock.Advance(3 * time.Second)
 			}
 			if err := h.ctl("close", "b"); err != nil {
 				t.Fatal(err)
@@ -1229,12 +1287,13 @@ func TestFollowupQueueDeadlines(t *testing.T) {
 			}
 			if !expireQueue {
 				h.await("a", func(s status) bool { return s.Turn == "second" && s.State == "running" })
+				clock.Advance(2 * time.Second)
 				h.await("a", func(s status) bool { return s.State == "timeout" })
 			}
-			if err := <-a; !errors.Is(err, context.DeadlineExceeded) {
+			if err := <-a; !errors.Is(err, wantErr) || !expireQueue && errors.Is(err, errQueueTimeout) {
 				t.Fatal(err)
 			}
-			if err := h.ctl("wait", "a"); !errors.Is(err, stateFailure("timeout")) && !errors.Is(err, stateFailure("queue_timeout")) {
+			if err := h.ctl("wait", "a"); !errors.Is(err, stateFailure(wantState)) {
 				t.Fatal(err)
 			}
 		})

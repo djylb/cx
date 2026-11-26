@@ -20,6 +20,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/djylb/timeshim"
 )
 
 type controllerFixture struct{ home, cx, python string }
@@ -47,7 +49,7 @@ func TestCommandInputCancelsWindowsStdin(t *testing.T) {
 	}
 	for _, kind := range []string{"pipe", "console"} {
 		t.Run(kind, func(t *testing.T) {
-			ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+			ctx, cancel := fixtureContext(t)
 			defer cancel()
 			cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestCommandInputCancelsWindowsStdin$")
 			cmd.Env = append(os.Environ(), child+"="+kind)
@@ -110,7 +112,7 @@ func cliOutput(t *testing.T, code int, stdin []byte, exe string, args ...string)
 
 func cliStreams(t *testing.T, code int, stdin []byte, exe string, args ...string) ([]byte, string) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx, cancel := fixtureContext(t)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, exe, args...)
 	cmd.Stdin = bytes.NewReader(stdin)
@@ -149,7 +151,7 @@ func TestB1CommandContract(t *testing.T) {
 		obj  bool
 	}{
 		{[]string{"ls", "--json"}, true}, {[]string{"status", "local:p/sample"}, true}, {[]string{"show", "local:p/sample", "--turn", "1"}, true}, {[]string{"host", "local"}, true},
-		{[]string{"tail", "local:p/sample", "--raw"}, false}, {[]string{"tail", "local:p/sample", "--since", "0"}, false}, {[]string{"wait", "local:p/sample", "--timeout", "1s"}, false},
+		{[]string{"tail", "local:p/sample", "--raw"}, false}, {[]string{"tail", "local:p/sample", "--since", "0"}, false}, {[]string{"wait", "local:p/sample", "--timeout", "2m"}, false},
 	} {
 		t.Run(strings.Join(tc.args, " "), func(t *testing.T) {
 			got := cliOutput(t, 0, nil, f.cx, tc.args...)
@@ -183,7 +185,7 @@ func TestB1CommandContract(t *testing.T) {
 		}
 	}
 	t.Setenv("PATH", f.home+string(os.PathListSeparator)+os.Getenv("PATH"))
-	for _, args := range [][]string{{"wait", "--any", "--project", "p", "--timeout", "2s"}, {"overview", "--project", "p", "--json"}} {
+	for _, args := range [][]string{{"wait", "--any", "--project", "p", "--timeout", "2m"}, {"overview", "--project", "p", "--json"}} {
 		got := cliOutput(t, 0, nil, f.cx, args...)
 		var a fields
 		if err := json.Unmarshal(got, &a); err != nil {
@@ -331,7 +333,7 @@ func TestB1ReleaseFallback(t *testing.T) {
 	if runtime.GOOS+"/"+runtime.GOARCH == plat {
 		plat = "windows/amd64"
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := fixtureContext(t)
 	defer cancel()
 	if _, e := cacheArtifact(ctx, version, plat, releaseSource{}); e == nil {
 		t.Fatal("missing release config accepted")
@@ -376,7 +378,7 @@ echo closed
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", f.home+string(os.PathListSeparator)+os.Getenv("PATH"))
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := fixtureContext(t)
 	defer cancel()
 	h := endpoint{SSH: "fixture", CX: "cx"}
 	cmd, err := h.command(ctx, []string{"wait-poll"})
@@ -407,25 +409,69 @@ func TestB1ConnectionAndProgressClocks(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell clock fixture")
 	}
-	for _, tc := range []struct {
-		name, script string
-		expired      bool
-	}{
-		{"slow handshake", "echo proxy-banner >&2; sleep .6; echo connected; sleep .1; echo done", false},
-		{"active transfer", "for i in 1 2 3 4 5; do echo data; sleep .1; done", false},
-		// This process exits before the connection deadline. Only the idle clock
-		// can interrupt it.
-		{"silent node", "printf 'cx-wire: ready\n' >&2; exec sleep 1.1", true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			// The idle budget leaves room for process exit and reaping on slow CI runners;
-			// the handshake sleep still exceeds it, so only the connect clock can cover it.
-			ctx, stop := context.WithTimeout(context.Background(), 4*time.Second)
+	for _, scenario := range []string{"handshake", "progress", "silence"} {
+		t.Run(scenario, func(t *testing.T) {
+			ctx, cancel := fixtureContext(t)
+			defer cancel()
+			clock := timeshim.NewFake(time.Now())
+			ctx = clockContext(ctx, clock)
+			processCtx, stop := context.WithCancel(ctx)
 			defer stop()
-			cmd := exec.CommandContext(ctx, "/bin/sh", "-c", tc.script)
-			e := runActive(cmd, stop, 2*time.Second, 400*time.Millisecond, io.Discard, io.Discard)
-			if errors.Is(e, errWireSilence) != tc.expired || !tc.expired && e != nil {
-				t.Fatal(e)
+			reader, writer, err := os.Pipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer closeBestEffort(reader)
+			defer closeBestEffort(writer)
+			cmd := exec.CommandContext(processCtx, "/bin/sh", "-c", `
+echo proxy-banner >&2
+IFS= read -r start || exit 2
+printf 'cx-wire: ready\n' >&2
+IFS= read -r next || exit 2
+echo progress
+IFS= read -r finish || exit 2
+`)
+			cmd.Stdin = reader
+			done := make(chan error, 1)
+			const connect, idle = time.Minute, time.Second
+			go func() {
+				_, runErr := runWithActivity(ctx, cmd, stop, connect, idle, io.Discard, io.Discard)
+				done <- runErr
+			}()
+			waitFor := func(d time.Duration) {
+				t.Helper()
+				if waitErr := clock.WaitDeadline(ctx, clock.Now().Add(d)); waitErr != nil {
+					t.Fatal(waitErr)
+				}
+			}
+			write := func(text string) {
+				t.Helper()
+				if _, writeErr := io.WriteString(writer, text+"\n"); writeErr != nil {
+					t.Fatal(writeErr)
+				}
+			}
+			waitFor(connect)
+			if scenario == "handshake" {
+				clock.Advance(2 * idle)
+			}
+			write("start")
+			waitFor(idle)
+			if scenario == "silence" {
+				clock.AdvanceToNext()
+			} else {
+				clock.Advance(idle / 2)
+				write("next")
+				waitFor(idle)
+				clock.Advance(idle / 2)
+				write("finish")
+			}
+			err = <-done
+			if scenario == "silence" {
+				if !errors.Is(err, errWireSilence) {
+					t.Fatal(err)
+				}
+			} else if err != nil {
+				t.Fatal(err)
 			}
 		})
 	}
@@ -503,7 +549,7 @@ esac
 	t.Setenv("CX_HOSTS", "slow,fast,failed")
 	t.Setenv("CX_HOSTS_FIXTURE_RELEASE", release)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := fixtureContext(t)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, f.cx, "hosts")
 	cmd.WaitDelay = time.Second

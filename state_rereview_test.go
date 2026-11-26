@@ -12,6 +12,8 @@ import (
 	"slices"
 	"testing"
 	"time"
+
+	"github.com/djylb/timeshim"
 )
 
 func appendFaultFrame(t *testing.T, file *os.File, record stateRecord) {
@@ -105,7 +107,7 @@ func TestRecoveryRejectsCrossSegmentSequenceReuse(t *testing.T) {
 	if err := f.Close(); err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(t.Context(), 4*time.Second)
+	ctx, cancel := fixtureContext(t)
 	defer cancel()
 	if err := run(ctx, []string{"resume", "--state", root, "--job", s.Job}); !errors.Is(err, errLogDamage) {
 		t.Fatalf("resume reached the engine after losing a valid claim: %v", err)
@@ -153,7 +155,7 @@ func TestCloseWaitUsesLatestPastDamageAfterPublication(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	ctx, cancel := fixtureContext(t)
 	defer cancel()
 	type answer struct {
 		confirmation *closeConfirmation
@@ -237,7 +239,7 @@ func testWaitAnyWithdrawalAndCompletion(t *testing.T, saved bool) {
 	}
 	r := runner{dir: dir, c: c, s: s}
 	startFixtureWriter(t, &r)
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	ctx, cancel := fixtureContext(t)
 	defer cancel()
 	ticks := make(chan time.Time)
 	baseline := make(map[string]waitCursor)
@@ -339,7 +341,7 @@ func TestWorkspaceUserIgnoresLostOwnerWithoutTakingRegistry(t *testing.T) {
 	if err := register(root, dir, c, status{Job: "consumer", State: "waiting", Engine: c.Engine}); err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	ctx, cancel := fixtureContext(t)
 	defer cancel()
 	registry, err := registryLock(ctx, root)
 	if err != nil {
@@ -412,15 +414,16 @@ func TestClaudeExitGraceMeasuresReadsNotBackpressure(t *testing.T) {
 		}
 		defer closeBestEffort(reader)
 		defer closeBestEffort(writer)
-		const grace = 20 * time.Millisecond
-		pipe := &claudeOutput{file: reader, grace: grace}
+		const grace = time.Second
+		clock := timeshim.NewFake(time.Now())
+		pipe := &claudeOutput{file: reader, grace: grace, clock: clock}
 		if _, err := fmt.Fprintln(writer, `{"type":"first"}`); err != nil {
 			t.Fatal(err)
 		}
 		event := make(chan string)
 		unblock := make(chan struct{})
 		done := make(chan error, 1)
-		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+		ctx, cancel := fixtureContext(t)
 		defer cancel()
 		go func() {
 			done <- decodeClaudeOutput(pipe, func(f claudeFrame) bool {
@@ -448,9 +451,10 @@ func TestClaudeExitGraceMeasuresReadsNotBackpressure(t *testing.T) {
 			t.Fatal(ctx.Err())
 		}
 		pipe.childExited()
-		if err := pause(ctx, 4*grace); err != nil {
-			t.Fatal(err)
+		if clock.Pending() != 0 {
+			t.Fatal("a pipe read timer was armed during event delivery")
 		}
+		clock.Advance(4 * grace)
 		if _, err := fmt.Fprintln(writer, `{"type":"second"}`); err != nil {
 			t.Fatalf("pipe closed during backpressure: %v", err)
 		}
@@ -484,17 +488,21 @@ func TestClaudeExitGraceMeasuresReadsNotBackpressure(t *testing.T) {
 		}
 		defer closeBestEffort(reader)
 		defer closeBestEffort(inherited)
-		pipe := &claudeOutput{file: reader, grace: 20 * time.Millisecond}
+		ctx, cancel := fixtureContext(t)
+		defer cancel()
+		clock := timeshim.NewFake(time.Now())
+		pipe := &claudeOutput{file: reader, grace: time.Second, clock: clock}
 		pipe.childExited()
 		done := make(chan error, 1)
 		go func() { done <- decodeClaudeOutput(pipe, func(claudeFrame) bool { return true }) }()
+		advanceFixture(t, ctx, clock)
 		select {
 		case err := <-done:
 			if !errors.Is(err, io.EOF) {
 				t.Fatalf("idle inherited stdout did not end cleanly: %v", err)
 			}
-		case <-time.After(time.Second):
-			t.Fatal("inherited stdout held the decoder indefinitely")
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
 		}
 	})
 }
@@ -740,7 +748,7 @@ func TestWorkerWaitsForOwnerProbeGate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(t.Context(), 4*time.Second)
+	ctx, cancel := fixtureContext(t)
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
@@ -787,7 +795,7 @@ func TestWorkerWaitsForOwnerProbeGate(t *testing.T) {
 func TestResumeWaitsForTerminalOwner(t *testing.T) {
 	h := newRuns(t, "complete")
 	const job = "terminal"
-	if err := <-h.start(job); err != nil {
+	if err := h.finishFirstTurn(job); err != nil {
 		t.Fatal(err)
 	}
 	dir := filepath.Join(h.root, job)
@@ -806,9 +814,10 @@ func TestResumeWaitsForTerminalOwner(t *testing.T) {
 		t.Fatal(err)
 	}
 	result := make(chan error, 1)
+	clock := h.withClock(job)
 	go func() {
 		defer close(result)
-		result <- h.ctl("resume", job, "--launch-id", "terminal-handoff")
+		result <- run(runnerClockContext(h.ctx, clock), []string{"resume", "--job", job, "--launch-id", "terminal-handoff"})
 	}()
 	defer func() {
 		closeBestEffort(gate)
@@ -843,7 +852,9 @@ func TestResumeWaitsForTerminalOwner(t *testing.T) {
 	if closeErr := errors.Join(owner.Close(), registry.Close()); closeErr != nil {
 		t.Fatal(closeErr)
 	}
-	if resumeErr := <-result; resumeErr != nil {
+	if resumeErr := h.idleExit(job, result, func(s status) bool {
+		return s.Generation > before.Generation && s.State == "waiting"
+	}); resumeErr != nil {
 		t.Fatal(resumeErr)
 	}
 	after, _, err := loadJobStatus(dir)
@@ -855,7 +866,7 @@ func TestResumeWaitsForTerminalOwner(t *testing.T) {
 func TestRevertEmptyHistoryKeepsHistoricalReportAcrossResume(t *testing.T) {
 	h := newRuns(t, "revert-empty")
 	const job = "reverted"
-	done := h.start(job, "--idle-exit", "30s")
+	done := h.start(job, "--idle-exit", "2m")
 	s := h.await(job, func(s status) bool { return s.State == "waiting" && s.LastCompleted == "first" })
 	dir := filepath.Join(h.root, job)
 	archive := filepath.Join(dir, "result", "turn-1")
@@ -930,7 +941,7 @@ func TestDedupClaimRetiresSupersededAttempts(t *testing.T) {
 
 func TestLiveJobProjectionDoesNotWaitForRegistry(t *testing.T) {
 	dir := fixture(t, "running")
-	ctx, cancel := context.WithTimeout(t.Context(), 250*time.Millisecond)
+	ctx, cancel := fixtureContext(t)
 	defer cancel()
 	guard, err := registryLock(ctx, filepath.Dir(dir))
 	if err != nil {
@@ -971,7 +982,7 @@ func TestCleanupRetriesDetachedDirectoryAfterReapFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = os.Chmod(stale, 0700) }()
-	ctx, cancel := context.WithTimeout(t.Context(), 4*time.Second)
+	ctx, cancel := fixtureContext(t)
 	defer cancel()
 	args := []string{"clean", "--state", root, "--job", "job"}
 	if err := run(ctx, args); err == nil {
@@ -1108,7 +1119,7 @@ func TestArchiveFailureLeavesOriginalJobRegistered(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(t.Context(), 4*time.Second)
+	ctx, cancel := fixtureContext(t)
 	defer cancel()
 	guard, err := registryLock(ctx, root)
 	if err != nil {

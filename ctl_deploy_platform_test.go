@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
@@ -11,7 +10,6 @@ import (
 	"runtime"
 	"strings"
 	"testing"
-	"time"
 	"unicode/utf16"
 )
 
@@ -48,7 +46,7 @@ func TestWindowsMissingVersionProbe(t *testing.T) {
 	}
 	if runtime.GOOS == "windows" {
 		// PowerShell cold start on a busy CI runner can take several seconds.
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		ctx, cancel := fixtureContext(t)
 		defer cancel()
 		out, err := exec.CommandContext(ctx, args[0], args[1:]...).CombinedOutput()
 		var exit *exec.ExitError
@@ -77,7 +75,7 @@ os.execl("/bin/sh", "sh", "-c", line)
 	t.Setenv("PATH", f.home+string(os.PathListSeparator)+os.Getenv("PATH"))
 	for _, plat := range []string{"linux/amd64", "windows/amd64"} {
 		h := endpoint{SSH: "fixture", Platform: plat, CX: filepath.Join(f.home, "missing 'cx'")}
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		ctx, cancel := fixtureContext(t)
 		cmd, err := h.command(ctx, []string{"version"})
 		if err != nil {
 			cancel()

@@ -384,7 +384,7 @@ func TestStateLogCrashAtEveryFrameByte(t *testing.T) {
 		_ = w.Append("status", "crash")
 		t.Fatal("crash hook did not run")
 	}
-	ctx, cancel := context.WithTimeout(t.Context(), 25*time.Second)
+	ctx, cancel := fixtureContext(t)
 	defer cancel()
 	size := len(testLogFrame(t, 3, "status", "crash"))
 	for k := 0; k <= size; k++ {
@@ -395,7 +395,7 @@ func TestStateLogCrashAtEveryFrameByte(t *testing.T) {
 				t.Fatal(err)
 			}
 			closeWriter()
-			cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestStateLogCrashAtEveryFrameByte$", "-test.timeout=5s")
+			cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestStateLogCrashAtEveryFrameByte$", "-test.timeout=2m")
 			cmd.Env = append(os.Environ(), "CX_TEST_STATELOG_CRASH_DIR="+dir, "CX_TEST_STATELOG_CRASH_BYTES="+strconv.Itoa(k))
 			out, err := cmd.CombinedOutput()
 			var ex *exec.ExitError
@@ -437,18 +437,27 @@ func TestStateLogConcurrentReaders(t *testing.T) {
 	if err := w.Append("status", 0); err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(t.Context(), 8*time.Second)
+	ctx, cancel := fixtureContext(t)
 	defer cancel()
+	const readers = 32
+	ready := make(chan struct{}, readers)
 	var wg sync.WaitGroup
-	for i := range 32 {
+	for i := range readers {
 		wg.Go(func() {
-			if err := pollTestLog(ctx, dir, i%2 == 0); err != nil {
+			initial := func() { ready <- struct{}{} }
+			if err := pollTestLog(ctx, dir, i%2 == 0, initial); err != nil {
 				t.Error(err)
 			}
 		})
 	}
-	until := time.Now().Add(2 * time.Second)
-	for i := 1; time.Now().Before(until); i++ {
+	for range readers {
+		select {
+		case <-ready:
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		}
+	}
+	for i := 1; i <= 1024; i++ {
 		if err := w.Append("status", i); err != nil {
 			t.Fatal(err)
 		}
@@ -457,7 +466,6 @@ func TestStateLogConcurrentReaders(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		time.Sleep(time.Millisecond)
 	}
 	if err := w.Final(0); err != nil {
 		t.Fatal(err)
@@ -465,7 +473,7 @@ func TestStateLogConcurrentReaders(t *testing.T) {
 	wg.Wait()
 }
 
-func pollTestLog(ctx context.Context, dir string, useTail bool) error {
+func pollTestLog(ctx context.Context, dir string, useTail bool, initial func()) error {
 	var read func() ([]stateRecord, error)
 	if useTail {
 		tail, err := openStateTail(dir, stateCursor{})
@@ -495,6 +503,10 @@ func pollTestLog(ctx context.Context, dir string, useTail bool) error {
 				return fmt.Errorf("sequence regressed from %d to %d", seq, r.Seq)
 			}
 			seq = r.Seq
+			if initial != nil {
+				initial()
+				initial = nil
+			}
 			if r.Final {
 				return nil
 			}
@@ -520,12 +532,12 @@ func TestMailboxConcurrentAppend(t *testing.T) {
 	}
 	dir := fixture(t, "waiting")
 	path := filepath.Join(dir, "inbox")
-	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	ctx, cancel := fixtureContext(t)
 	defer cancel()
 	var wg sync.WaitGroup
 	for range 8 {
 		wg.Go(func() {
-			cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestMailboxConcurrentAppend$", "-test.timeout=10s")
+			cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestMailboxConcurrentAppend$", "-test.timeout=2m")
 			cmd.Env = append(os.Environ(), "CX_TEST_STATELOG_APPEND_DIR="+dir)
 			if out, err := cmd.CombinedOutput(); err != nil {
 				t.Errorf("mailbox append child: %v: %s", err, out)

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"os"
@@ -9,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/djylb/timeshim"
 )
 
 func TestWaitAndStatusBeforeRegistration(t *testing.T) {
@@ -16,7 +17,8 @@ func TestWaitAndStatusBeforeRegistration(t *testing.T) {
 	dir := filepath.Join(root, "j")
 	statusArgs := []string{"status", "--state", root, "--job", "j"}
 	waitArgs := []string{"wait", "--state", root, "--job", "j", "--timeout"}
-	ctx := context.Background()
+	ctx, cancel := fixtureContext(t)
+	defer cancel()
 	if err := os.Mkdir(dir, 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -43,16 +45,18 @@ func TestWaitAndStatusBeforeRegistration(t *testing.T) {
 	if !strings.Contains(output, "status=not_registered wait_timeout=true") {
 		t.Fatalf("registration deadline: %q", output)
 	}
-	registered := make(chan error, 1)
-	timer := time.AfterFunc(40*time.Millisecond, func() {
-		registered <- register(root, dir, config{}, status{Job: "j", State: "done"})
-	})
-	defer timer.Stop()
-	if err := run(ctx, append(waitArgs, "2s")); err != nil {
-		t.Fatalf("wait through registration: %v", err)
-	}
-	if err := <-registered; err != nil {
+	clock := timeshim.NewFake(time.Now())
+	waiting := make(chan error, 1)
+	go func() { waiting <- run(clockContext(ctx, clock), append(waitArgs, "1m")) }()
+	if err := clock.WaitDeadline(ctx, clock.Now().Add(200*time.Millisecond)); err != nil {
 		t.Fatal(err)
+	}
+	if err := register(root, dir, config{}, status{Job: "j", State: "done"}); err != nil {
+		t.Fatal(err)
+	}
+	clock.AdvanceToNext()
+	if err := <-waiting; err != nil {
+		t.Fatalf("wait through registration: %v", err)
 	}
 	if err := run(ctx, statusArgs); err != nil {
 		t.Fatal(err)
@@ -62,7 +66,7 @@ func TestWaitAndStatusBeforeRegistration(t *testing.T) {
 	if err := r.stateLog.Append("status", "invalid status payload"); err != nil {
 		t.Fatal(err)
 	}
-	if err := run(ctx, append(waitArgs, "2s")); err == nil || errors.Is(err, errObserveTimeout) {
+	if err := run(ctx, append(waitArgs, "2m")); err == nil || errors.Is(err, errObserveTimeout) {
 		t.Fatalf("broken status should fail immediately: %v", err)
 	}
 }

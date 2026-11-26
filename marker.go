@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"os"
 	"time"
+
+	"github.com/djylb/timeshim"
 )
 
 type markerOptions struct {
@@ -66,7 +68,8 @@ func deliverClose(ctx context.Context, dir string, opt markerOptions, args []str
 		return nil, err
 	}
 	defer closeBestEffort(tail)
-	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	clock := timeshim.Or(contextClock(ctx))
+	ctx, cancel := timeshim.WithTimeout(ctx, clock, 60*time.Second)
 	defer cancel()
 	var probe time.Time
 	for {
@@ -102,7 +105,7 @@ func deliverClose(ctx context.Context, dir string, opt markerOptions, args []str
 		if withdrawn {
 			return nil, nil
 		}
-		if time.Now().After(probe) {
+		if clock.Now().After(probe) {
 			if _, err := projectJobStatus(ctx, dir, &s, id); err != nil {
 				return nil, err
 			}
@@ -116,9 +119,9 @@ func deliverClose(ctx context.Context, dir string, opt markerOptions, args []str
 			if s.final && cursor.Seq >= start.Seq {
 				return &closeConfirmation{id, s, cursor}, nil
 			}
-			probe = time.Now().Add(time.Second)
+			probe = clock.Now().Add(time.Second)
 		}
-		if err := pause(ctx, 50*time.Millisecond); err != nil {
+		if err := timeshim.Sleep(ctx, clock, 50*time.Millisecond); err != nil {
 			return nil, fmt.Errorf("close completion pending: %w", err)
 		}
 	}

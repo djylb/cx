@@ -2,14 +2,12 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 )
 
 func TestControllerHelp(t *testing.T) {
@@ -49,7 +47,7 @@ func TestControllerHelp(t *testing.T) {
 		{"chat", "read", "#room", "--unknown"}, {"project", "init", "p", "--unknown"},
 		{"node", "--unknown"},
 	} {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := fixtureContext(t)
 		out, err := exec.CommandContext(ctx, f.cx, args...).CombinedOutput()
 		cancel()
 		var exit *exec.ExitError

@@ -9,7 +9,6 @@ import (
 	"slices"
 	"strings"
 	"testing"
-	"time"
 )
 
 func TestAgentToolsAppServerConfig(t *testing.T) {
@@ -50,19 +49,20 @@ func TestAgentToolsAppServerConfig(t *testing.T) {
 
 func TestAgentToolSession(t *testing.T) {
 	h := newRuns(t, "manual")
-	job := h.start("p/j")
-	id := "p/j"
+	const id = "p/j"
+	clock := h.withClock(id)
+	job := h.start(id)
 	dir := filepath.Join(h.root, "p", "j")
 	h.await(id, func(s status) bool { return s.State == "running" })
-	invoke := func(name, args string) (string, error) {
+	invoke := func(ctx context.Context, name, args string) (string, error) {
 		in := strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"` + name + `","arguments":` + args + `}}`)
 		var out bytes.Buffer
-		err := serveToolsFor(h.ctx, dir, "", in, &out)
+		err := serveToolsFor(ctx, dir, "", in, &out)
 		return out.String(), err
 	}
 	check := func(name, args, want string) {
 		t.Helper()
-		s, err := invoke(name, args)
+		s, err := invoke(h.ctx, name, args)
 		if err != nil || !strings.Contains(s, want) || !strings.Contains(s, `"isError":false`) {
 			t.Fatalf("%s: %v %s", name, err, s)
 		}
@@ -77,21 +77,22 @@ func TestAgentToolSession(t *testing.T) {
 	if err := h.ctl("say", id, "hello"); err != nil {
 		t.Fatal(err)
 	}
-	h.await(id, func(s status) bool {
-		in, err := readInboxState(dir)
-		return err == nil && in.acks[1].Result == "delivered"
+	h.awaitRecord(id, func(row stateRecord) bool {
+		var ack inboxAck
+		return row.Kind == "inbox_ack" && json.Unmarshal(row.Value, &ack) == nil &&
+			ack.Seq == 1 && ack.Result == "delivered"
 	})
 	check("inbox", "{}", "hello")
 	done := make(chan string, 1)
 	go func() {
-		s, err := invoke("ask", `{"question":"choose","options":["blue"],"blocking":true,"timeout":8}`)
+		s, err := invoke(h.ctx, "ask", `{"question":"choose","options":["blue"],"blocking":true,"timeout":120}`)
 		if err != nil {
 			s = err.Error()
 		}
 		done <- s
 	}()
 	h.await(id, func(s status) bool { return s.State == "waiting_input" && s.InputKind == agentAsk })
-	fixtureCLI(t, 6, "wait", "--job", id, "--timeout", "2s")
+	fixtureCLI(t, 6, "wait", "--job", id, "--timeout", "2m")
 	if err := h.ctl("say", id, "--request", "ask-3", "blue"); err != nil {
 		t.Fatal(err)
 	}
@@ -109,14 +110,36 @@ func TestAgentToolSession(t *testing.T) {
 	if err := json.Unmarshal([]byte(line), &m); err != nil || m.Seq != 3 || m.Question != "choose" {
 		t.Fatalf("outbox %s %v", line, err)
 	}
-	expired, err := invoke("ask", `{"question":"deadline","blocking":true,"timeout":0.6}`)
-	if err != nil || !strings.Contains(expired, `"isError":true`) {
-		t.Fatalf("expired: %s %v", expired, err)
+	type outcome struct {
+		err  error
+		body string
 	}
-	h.await(id, func(s status) bool {
-		in, err := readInboxState(dir)
-		return err == nil && in.outbox.Seq == 4 && s.State == "running" && len(s.Approvals) == 0
+	expired := make(chan outcome, 1)
+	go func() {
+		body, err := invoke(clockContext(h.ctx, clock), "ask", `{"question":"deadline","blocking":true,"timeout":120}`)
+		expired <- outcome{body: body, err: err}
+	}()
+	asking := h.await(id, func(s status) bool {
+		return s.InputKind == agentAsk && len(s.Approvals) == 1 && s.Approvals[0].Summary == "deadline"
 	})
+	deadline := asking.Approvals[0].Deadline
+	if err := clock.WaitDeadline(h.ctx, deadline); err != nil {
+		t.Fatal(err)
+	}
+	clock.AdvanceTo(deadline)
+	select {
+	case result := <-expired:
+		if result.err != nil || !strings.Contains(result.body, `"isError":true`) {
+			t.Fatalf("expired: %s %v", result.body, result.err)
+		}
+	case <-h.ctx.Done():
+		t.Fatal(h.ctx.Err())
+	}
+	h.awaitRecord(id, func(row stateRecord) bool {
+		var cursor stateCursor
+		return row.Kind == outboxSeenKind && json.Unmarshal(row.Value, &cursor) == nil && cursor.Seq == 4
+	})
+	h.await(id, func(s status) bool { return s.State == "running" && len(s.Approvals) == 0 })
 	if err := h.ctl("close", id); err != nil {
 		t.Fatal(err)
 	}
@@ -130,7 +153,7 @@ func TestHostFactsFingerprint(t *testing.T) {
 	t.Setenv("PATH", dir)
 	t.Setenv("HOME", dir)
 	t.Setenv("USERPROFILE", dir)
-	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	ctx, cancel := fixtureContext(t)
 	defer cancel()
 	f := hostFacts(ctx, dir)
 	for _, key := range strings.Fields("os os_version arch cpu_model cpu_cores memory_total_bytes memory_available_bytes disk_free_bytes load1 cpu_usage_percent engines version_managers") {

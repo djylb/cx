@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"time"
+
+	"github.com/djylb/timeshim"
 )
 
 // A nil handle denotes contention. The caller owns every non-nil handle.
@@ -43,14 +45,15 @@ func registryLock(ctx context.Context, root string) (*os.File, error) {
 	return lockUntil(ctx, filepath.Join(dir, "registry.lock"))
 }
 func lockUntil(ctx context.Context, path string) (*os.File, error) {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	clock := timeshim.Or(contextClock(ctx))
+	ctx, cancel := timeshim.WithTimeout(ctx, clock, 5*time.Second)
 	defer cancel()
 	for {
 		f, err := lockPath(path, os.O_CREATE)
 		if err != nil || f != nil {
 			return f, err
 		}
-		if err = pause(ctx, 20*time.Millisecond); err != nil {
+		if err = timeshim.Sleep(ctx, clock, 20*time.Millisecond); err != nil {
 			return nil, err
 		}
 	}
@@ -116,8 +119,8 @@ func (t *queueTicket) first() (bool, error) {
 	}
 	return false, errors.New("queue ticket disappeared")
 }
-func loadOK(ctx context.Context, command string) bool {
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+func loadOK(ctx context.Context, command string, clock timeshim.Clock) bool {
+	ctx, cancel := timeshim.WithTimeout(ctx, clock, 10*time.Second)
 	defer cancel()
 	var cmd *exec.Cmd
 	if runtime.GOOS == "windows" {
@@ -150,12 +153,12 @@ func (r *runner) startRuntime() func() {
 }
 func (r *runner) resumeRuntime() {
 	b := r.budget
-	b.deadline = time.Now().Add(b.remaining)
-	r.ctx, b.cancel = context.WithDeadline(b.parent, b.deadline)
+	b.deadline = timeshim.Or(r.clock).Now().Add(b.remaining)
+	r.ctx, b.cancel = timeshim.WithDeadline(b.parent, timeshim.Or(r.clock), b.deadline)
 }
 func (r *runner) pauseRuntime() error {
 	b := r.budget
-	b.remaining = time.Until(b.deadline)
+	b.remaining = b.deadline.Sub(timeshim.Or(r.clock).Now())
 	if b.remaining <= 0 {
 		return context.DeadlineExceeded
 	}
@@ -204,7 +207,7 @@ func (r *runner) admit(t *queueTicket) (err error) {
 	ctx := r.ctx
 	if r.c.QueueTimeout > 0 {
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeoutCause(ctx, r.c.QueueTimeout, errQueueTimeout)
+		ctx, cancel = timeshim.WithTimeoutCause(ctx, timeshim.Or(r.clock), r.c.QueueTimeout, errQueueTimeout)
 		defer cancel()
 		defer func() {
 			if errors.Is(context.Cause(ctx), errQueueTimeout) {
@@ -248,6 +251,7 @@ func (r *runner) setQueueReason(reason string) error {
 }
 
 func (r *runner) reserve(ctx context.Context, t *queueTicket, controls bool, report func(string) error) error {
+	clock := timeshim.Or(r.clock)
 	host, err := readHostConfig(r.root)
 	if err != nil {
 		return err
@@ -285,7 +289,7 @@ func (r *runner) reserve(ctx context.Context, t *queueTicket, controls bool, rep
 				return errQueuedClose
 			}
 		}
-		if time.Since(diskChecked) >= time.Second {
+		if clock.Now().Sub(diskChecked) >= time.Second {
 			policy, err := readHostConfig(r.root)
 			if err != nil {
 				return err
@@ -304,7 +308,7 @@ func (r *runner) reserve(ctx context.Context, t *queueTicket, controls bool, rep
 				maintenanceDone = make(chan struct{})
 				go func(policy *hostConfig, done chan struct{}) {
 					defer close(done)
-					scanCtx, cancel := context.WithTimeout(maintenanceCtx, transferLimit)
+					scanCtx, cancel := timeshim.WithTimeout(maintenanceCtx, clock, transferLimit)
 					defer cancel()
 					if err := maintainCaches(scanCtx, r.root, policy, false); err != nil && scanCtx.Err() == nil {
 						diagnosticf("cache maintenance: %v\n", err)
@@ -312,13 +316,13 @@ func (r *runner) reserve(ctx context.Context, t *queueTicket, controls bool, rep
 				}(host, maintenanceDone)
 			}
 			diskReason = disk.queueReason()
-			diskChecked = time.Now()
+			diskChecked = clock.Now()
 		}
 		reason := diskReason
 		if reason == "" && host.LoadCmd != "" {
-			if time.Since(loadChecked) >= loadInterval {
-				allowed = loadOK(ctx, host.LoadCmd)
-				loadChecked = time.Now()
+			if clock.Now().Sub(loadChecked) >= loadInterval {
+				allowed = loadOK(ctx, host.LoadCmd, clock)
+				loadChecked = clock.Now()
 			}
 			if !allowed {
 				reason = "host load check did not pass"
@@ -333,7 +337,7 @@ func (r *runner) reserve(ctx context.Context, t *queueTicket, controls bool, rep
 			}
 			if slot != nil {
 				diskReason = host.diskStatus(r.root).queueReason()
-				diskChecked = time.Now()
+				diskChecked = clock.Now()
 				if diskReason == "" {
 					if err = report(""); err == nil {
 						r.slot = slot
@@ -348,9 +352,9 @@ func (r *runner) reserve(ctx context.Context, t *queueTicket, controls bool, rep
 				slotBlockedSince, slotReason = time.Time{}, ""
 			} else {
 				if slotReason != blocked {
-					slotBlockedSince, slotReason = time.Now(), blocked
+					slotBlockedSince, slotReason = clock.Now(), blocked
 				}
-				if time.Since(slotBlockedSince) >= slotQueueGrace {
+				if clock.Now().Sub(slotBlockedSince) >= slotQueueGrace {
 					reason = slotReason
 				}
 			}
@@ -358,7 +362,7 @@ func (r *runner) reserve(ctx context.Context, t *queueTicket, controls bool, rep
 		if err := report(reason); err != nil {
 			return err
 		}
-		if err := pause(ctx, 100*time.Millisecond); err != nil {
+		if err := timeshim.Sleep(ctx, timeshim.Or(contextClock(ctx)), 100*time.Millisecond); err != nil {
 			return err
 		}
 	}
@@ -422,14 +426,14 @@ func (r *runner) followSlot() (bool, error) {
 		ctx, cancel := context.WithCancel(r.ctx)
 		if r.c.QueueTimeout > 0 {
 			var stop context.CancelFunc
-			ctx, stop = context.WithTimeoutCause(ctx, r.c.QueueTimeout, errQueueTimeout)
+			ctx, stop = timeshim.WithTimeoutCause(ctx, timeshim.Or(r.clock), r.c.QueueTimeout, errQueueTimeout)
 			parentCancel := cancel
 			cancel = func() { stop(); parentCancel() }
 		}
 		q := &followAdmission{done: make(chan slotResult), cancel: cancel, abandoned: make(chan struct{}), stopped: make(chan struct{}), reasons: make(chan string, 1)}
 		r.follow = q
 		// The admission worker owns the ticket and slot until the result is collected.
-		worker := runner{root: r.root, c: r.c, s: status{Job: r.s.Job, Project: r.s.Project}}
+		worker := runner{root: r.root, c: r.c, clock: r.clock, s: status{Job: r.s.Job, Project: r.s.Project}}
 		go func() {
 			defer close(q.stopped)
 			err := worker.reserve(ctx, nil, false, func(reason string) error {

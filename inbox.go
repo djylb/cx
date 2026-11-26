@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"slices"
 	"time"
+
+	"github.com/djylb/timeshim"
 )
 
 func inputMethod(m string) bool {
@@ -49,7 +51,11 @@ func (r *runner) request(m message, capturedParams json.RawMessage) error {
 			return err
 		}
 		now := time.Now().UTC()
-		a := approval{ID: m.ID, Method: m.Method, Reason: r.c.secret.text(p.Reason), Requested: now, Deadline: now.Add(r.c.Approval), Permissions: p.Permissions}
+		deadline := now.Add(r.c.Approval)
+		if r.clock != nil {
+			deadline = timeshim.Or(r.clock).Now().UTC().Add(r.c.Approval)
+		}
+		a := approval{ID: m.ID, Method: m.Method, Reason: r.c.secret.text(p.Reason), Requested: now, Deadline: deadline, Permissions: p.Permissions}
 		a.Generation = r.s.Generation
 		a.Summary = brief(string(capturedParams))
 		var q struct {
@@ -90,7 +96,7 @@ func (r *runner) removeApproval(id json.RawMessage) error {
 	for i, a := range r.s.Approvals {
 		if bytes.Equal(a.ID, id) {
 			r.s.Approvals = append(r.s.Approvals[:i], r.s.Approvals[i+1:]...)
-			r.lastAction = time.Now()
+			r.lastAction = timeshim.Or(r.clock).Now()
 			r.deriveState()
 			return r.save()
 		}
@@ -523,7 +529,7 @@ func (r *runner) approvalFiles() error {
 						record.Time.Before(a.Requested) || (id == "" && len(r.s.Approvals) != 1) {
 						continue
 					}
-					if time.Now().Before(a.Deadline) {
+					if timeshim.Or(r.clock).Now().Before(a.Deadline) {
 						if err = r.claimInbox(record, "deliver"); err != nil {
 							return err
 						}
@@ -548,7 +554,7 @@ func (r *runner) approvalFiles() error {
 		}
 	}
 	for _, a := range append([]approval(nil), r.s.Approvals...) {
-		if !time.Now().Before(a.Deadline) {
+		if !timeshim.Or(r.clock).Now().Before(a.Deadline) {
 			if a.Method == agentAsk {
 				if err := r.removeApproval(a.ID); err != nil {
 					return err
@@ -711,7 +717,7 @@ func (r *runner) withdrawQueued(interrupt stateRecord, targets []stateRecord) er
 		}
 		r.s.QueueReason = ""
 		r.deriveState()
-		r.idleSince = time.Now()
+		r.idleSince = timeshim.Or(r.clock).Now()
 		if err := r.save(); err != nil {
 			return err
 		}
@@ -764,7 +770,7 @@ func (r *runner) poll() (bool, error) {
 	}
 	if closing || !r.closing.IsZero() {
 		if r.closing.IsZero() {
-			r.closing = time.Now()
+			r.closing = timeshim.Or(r.clock).Now()
 			if err = r.interrupt(); err != nil {
 				return false, err
 			}
@@ -772,12 +778,12 @@ func (r *runner) poll() (bool, error) {
 		if !r.active() {
 			return true, nil
 		}
-		if time.Since(r.closing) > 10*time.Second {
+		if timeshim.Or(r.clock).Now().Sub(r.closing) > 10*time.Second {
 			return false, errors.New("close: turn did not acknowledge interrupt")
 		}
 		return false, nil
 	}
-	if r.active() && time.Since(r.turnSince) > r.c.TurnLimit {
+	if r.active() && timeshim.Or(r.clock).Now().Sub(r.turnSince) > r.c.TurnLimit {
 		return false, fmt.Errorf("turn %s exceeded %s", r.s.Turn, r.c.TurnLimit)
 	}
 	if err = r.rpcFiles(false); err != nil {
@@ -802,5 +808,5 @@ func (r *runner) poll() (bool, error) {
 			return false, r.deliver(record)
 		}
 	}
-	return r.s.State != "waiting_input" && !r.active() && time.Since(r.idleSince) >= r.c.Idle, nil
+	return r.s.State != "waiting_input" && !r.active() && timeshim.Or(r.clock).Now().Sub(r.idleSince) >= r.c.Idle, nil
 }

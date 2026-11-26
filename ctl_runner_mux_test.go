@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -71,7 +70,7 @@ func TestMuxRunnerCarriesStateAcrossDaemon(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := fixtureContext(t)
 	defer cancel()
 	if err = launchMuxRunner(ctx, root, exe, root, root, []string{"host"}, nil, "fixture", "token", func() {}); err != nil {
 		t.Fatal(err)
@@ -99,7 +98,7 @@ func TestRunnerHandoffReportsOwnerBusyWithoutAcceptingOldStatus(t *testing.T) {
 	if err := writeJobBytes(rejection, []byte("owner-busy")); err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	ctx, cancel := fixtureContext(t)
 	defer cancel()
 	if err := awaitRunner(ctx, dir, "same-run", "requested-worker", 0, nil, rejection); !errors.Is(err, errJobOwnerBusy) {
 		t.Fatalf("runner handoff = %v", err)
