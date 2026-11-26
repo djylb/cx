@@ -137,6 +137,41 @@ func TestSnapWorkspace(t *testing.T) {
 		t.Fatalf("applied result: got %q (%v), want job edit", b, err)
 	}
 }
+
+func TestSnapProjectWorkspaceUnion(t *testing.T) {
+	ctx := snapTestCtx(t)
+	app := snapWorkspaceFixture(t, ctx)
+	t.Setenv("GOWORK", filepath.Join(app, "go.work"))
+	tools := filepath.Join(filepath.Dir(app), "tools")
+	snapWriteTest(t, filepath.Join(tools, "tool"), "fixture")
+	if _, e := (snapGit{ctx: ctx, dir: tools}).get("init", "-q"); e != nil {
+		t.Fatal(e)
+	}
+	// The workspace also discovers app. The project-only repository is kept,
+	// and app's include is still applied when the Go entry is deduplicated.
+	_, m, e := Freeze(ctx, app, FreezeOptions{Repositories: []projectRepository{
+		{Path: tools},
+		{Path: app, Include: []string{"ignored"}},
+	}})
+	if e != nil {
+		t.Fatal(e)
+	}
+	if m.Main != "app" || len(m.Repositories) != 3 || m.Repositories[0].Path != "app" ||
+		m.Repositories[1].Path != "library" || m.Repositories[2].Path != "tools" ||
+		len(m.Repositories[0].Include) != 1 || m.Repositories[0].Include[0] != "ignored" ||
+		m.Workspace == nil || !strings.Contains(m.Workspace.Text, "./tree/library") {
+		t.Fatalf("wrong project workspace union: %+v", m)
+	}
+}
+
+func TestSnapManifestV1Encoding(t *testing.T) {
+	m := Manifest{Version: 1, Main: "app", Repositories: []SnapshotRepo{{Path: "app", OID: "object", RepoID: "repository"}}}
+	const original = `{"main":"app","repositories":[{"head":null,"oid":"object","path":"app","repo_id":"repository"}],"version":1,"workspace":null}`
+	if b, e := snapJSON(m); e != nil || string(b) != original {
+		t.Fatalf("v1 snapshot encoding: %s (%v)", b, e)
+	}
+}
+
 func TestSnapDirectoryIncrement(t *testing.T) {
 	ctx := snapTestCtx(t)
 	if runtime.GOOS == "windows" {

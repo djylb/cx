@@ -414,12 +414,9 @@ func applyTurn(ctx context.Context, dir, patchDir, id, host string, since int64,
 	if e != nil {
 		return e
 	}
-	root := origin.Source
-	for range strings.Split(manifest.Main, "/") {
-		root = filepath.Dir(root)
-	}
-	if filepath.Join(root, manifest.Main) != origin.Source {
-		return errors.New("snapshot source layout changed")
+	root, e := manifest.sourceRoot(ctx, origin.Source)
+	if e != nil {
+		return e
 	}
 	scratch, e := os.MkdirTemp("", "cx-preflight-")
 	if e != nil {

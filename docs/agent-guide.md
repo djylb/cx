@@ -10,7 +10,7 @@ Before dispatching, set `CX_SESSION` or use a supported session environment. cx 
 
 - `cx run HOST DIR TAG PROMPTFILE` snapshots the source and prints `project/tag`. Add `--sync` to wait for registration. `cx agent --host HOST --dir DIR TEXT` submits, waits, and prints the report. It also takes `@FILE` or `-` for stdin and prints the job ID to stderr.
 - Choose `--engine`, `--sandbox`, `--queue-timeout`, and `--turn-timeout` for the task. Use `--profile NAME` to select a [configured execution account](agent-install.md#configure-execution-credentials). Keep secrets in that account's login or environment file.
-- Snapshots can include uncommitted work. Use `--clean-base` to require a clean Git source, `--with-history` to include commit history, or `--snapshot ID` to reuse the ID from `cx snapshot DIR`. Non-Git directories work too. For several repositories, register them with `cx project init NAME --repo DIR [DIR …]`.
+- Snapshots can include uncommitted work. Use `--clean-base` to require a clean Git source, `--with-history` to include commit history, or `--snapshot ID` to reuse the ID from `cx snapshot DIR`. Non-Git directories work too.
 - Include needed files in the snapshot, attach them, or inline their contents in the prompt. Review inputs before sending work to an execution host or model service. Write deliverable files to `artifacts/` in the job checkout. `--inplace` uses the original directory on `local`; use snapshots for the patch workflow.
 - For another controller, or to disambiguate a job, use `HOST:project/tag`.
 
@@ -24,6 +24,20 @@ cx exec local --wait --queue-timeout 10s --timeout 5s --script "$script" --shell
 ```
 
 Scripts default to `sh` on Unix and `powershell` on Windows. Choose an installed interpreter with `--shell`.
+
+### Mount several repositories
+
+Put every repository the job needs in the same project:
+
+```sh
+cx project init demo --repo ./app ./library --include 'app:.cargo/config.toml'
+cx project show demo
+cx run local ./app check prompt.txt --project demo
+```
+
+With no explicit selection, cx can infer the project from the source repository. The job starts in the selected member's repository root with the project layout preserved, so it can read `../library`. Go workspace discovery adds other referenced repositories to the snapshot.
+
+Repeat `--include REPO:PATH` for each input file or quoted glob. These entries are stored as the repository's `include` list in the project definition. Use them for local configuration needed by the job. Each entry must match a file, and job edits to the matched files are excluded from collected patches. Keep credentials out of these files.
 
 ## Observe and follow up
 
@@ -58,7 +72,7 @@ Jobs run on their hosts without the controller and keep their state on the node.
 ## Collect, review, and clean up
 
 1. Use `cx result JOB --wait` for the report, `--json` for metadata and artifact paths, or `--log` for the full log. With `--wait`, cx waits for the turn active when it first observes the job, or collects the latest sealed turn if the job is idle. Use `--turn N` to select a specific turn, including a future turn. The observation deadline is set by `--timeout`, `CXRUN_MONITOR_TIMEOUT`, or the 24-hour default. Exit 124 means the wait timed out. Exit 44 reports why the result is unavailable on stderr. Without `--wait`, exit 12 means collection is underway. For a full report, add `--full`.
-2. Inspect `cx patch JOB` for statistics and `cx patch JOB --full --repo PATH` for the selected repository's patch. Use `cx apply JOB` after review, then commit through the project's Git workflow.
+2. Inspect `cx patch JOB` for statistics and `cx patch JOB --full --repo PATH` for the selected repository's patch. Use `cx apply JOB` after review, or `cx apply JOB --repo PATH` to apply one repository, then commit through the project's Git workflow.
 3. By default, patches are cumulative from the dispatch snapshot. If turn 1 is already applied and committed, inspect turn 2 with `cx patch JOB --turn 2 --incremental`. Use `cx apply JOB --since-turn 2` to apply turn 2 through the latest sealed turn, using turn 1 as the base. Run incremental operations from the submitting controller.
 4. On conflicts, `apply` reports the files and leaves the selected repositories untouched. Choose `--allow-conflicts` to write the merge with conflict markers and unmerged index entries, or `cx rebase JOB TEXT` to dispatch a follow-up against a fresh snapshot.
 5. Use `cx close JOB` to end an agent session and release its private checkout once unused. Collect what you need before using `cx clean JOB` to remove terminal job state.

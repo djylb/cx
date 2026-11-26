@@ -14,6 +14,7 @@ import (
 	"path"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"syscall"
@@ -74,7 +75,66 @@ func snapList(s string) []string {
 	}
 	return strings.Split(strings.TrimSuffix(s, "\x00"), "\x00")
 }
-func snapStage(source, stage snapGit, head string, isGit bool, tmp string) (string, error) {
+
+// Expand only configured patterns, without following a symlink directory when
+// selecting files. A directory match alone does not satisfy a pattern.
+func snapIncludes(repo string, patterns []string) ([]string, error) {
+	if len(patterns) == 0 {
+		return nil, nil
+	}
+	root, e := os.OpenRoot(repo)
+	if e != nil {
+		return nil, e
+	}
+	defer closeBestEffort(root)
+	files := map[string]bool{}
+	var missing []string
+	for _, pattern := range patterns {
+		if !snapIncludePattern(pattern) {
+			return nil, fmt.Errorf("invalid snapshot include pattern: %q", pattern)
+		}
+		names, e := fs.Glob(root.FS(), pattern)
+		if e != nil {
+			return nil, e
+		}
+		found := false
+		for _, name := range names {
+			if !snapIncludePath(name) {
+				continue
+			}
+			st, e := root.Lstat(name)
+			if os.IsNotExist(e) {
+				continue
+			}
+			if e != nil {
+				return nil, e
+			}
+			parent := filepath.Join(repo, filepath.FromSlash(path.Dir(name)))
+			real, e := filepath.EvalSymlinks(parent)
+			if e != nil {
+				return nil, e
+			}
+			if st.IsDir() || real != parent {
+				continue
+			}
+			files[name], found = true, true
+		}
+		if !found {
+			missing = append(missing, fmt.Sprintf("%q", pattern))
+		}
+	}
+	if len(missing) > 0 {
+		return nil, fmt.Errorf("missing snapshot include files: %s", strings.Join(missing, ", "))
+	}
+	var names []string
+	for name := range files {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	return names, nil
+}
+
+func snapStage(source, stage snapGit, head, tmp string, isGit bool, include []string) (string, error) {
 	modes := map[string]string{}
 	tracked := map[string]bool{}
 	indexed := map[string]string{}
@@ -130,6 +190,11 @@ func snapStage(source, stage snapGit, head string, isGit bool, tmp string) (stri
 				}
 			}
 		}
+		for _, n := range include {
+			if _, ok := modes[n]; !ok {
+				modes[n] = ""
+			}
+		}
 		var names bytes.Buffer
 		for n := range modes {
 			names.WriteString(n)
@@ -171,21 +236,33 @@ func snapStage(source, stage snapGit, head string, isGit bool, tmp string) (stri
 		parent, e := filepath.EvalSymlinks(filepath.Dir(p))
 		if e != nil {
 			if os.IsNotExist(e) || errors.Is(e, syscall.ENOTDIR) {
+				if _, required := slices.BinarySearch(include, n); required {
+					return "", fmt.Errorf("snapshot include disappeared: %s", n)
+				}
 				continue
 			}
 			return "", e
 		}
 		if parent != filepath.Dir(p) {
+			if _, required := slices.BinarySearch(include, n); required {
+				return "", fmt.Errorf("snapshot include parent changed: %s", n)
+			}
 			continue
 		}
 		st, e := os.Lstat(p)
 		if os.IsNotExist(e) || errors.Is(e, syscall.ENOTDIR) {
+			if _, required := slices.BinarySearch(include, n); required {
+				return "", fmt.Errorf("snapshot include disappeared: %s", n)
+			}
 			continue
 		}
 		if e != nil {
 			return "", e
 		}
 		if st.IsDir() {
+			if _, required := slices.BinarySearch(include, n); required {
+				return "", fmt.Errorf("snapshot include became a directory: %s", n)
+			}
 			if mode == "" {
 				return "", fmt.Errorf("nested repository: %s", n)
 			}
@@ -245,17 +322,13 @@ func snapStage(source, stage snapGit, head string, isGit bool, tmp string) (stri
 	}
 	return stage.get("write-tree")
 }
-func snapCapture(ctx context.Context, repo, store, tmp, history string, isGit bool) (SnapshotRepo, error) {
-	var r SnapshotRepo
+func snapCapture(ctx context.Context, repo, store, tmp, history string, isGit bool, include []string) (SnapshotRepo, error) {
+	r := SnapshotRepo{Include: include}
 	g := snapGit{ctx: ctx, dir: repo}
 	identity, format, head := repo, "sha1", ""
 	var e error
 	if isGit {
-		identity, e = g.get("rev-parse", "--path-format=absolute", "--git-common-dir")
-		if e != nil {
-			return r, e
-		}
-		identity, e = filepath.EvalSymlinks(identity)
+		identity, e = projectRepoIdentity(ctx, repo)
 		if e != nil {
 			return r, e
 		}
@@ -291,7 +364,7 @@ func snapCapture(ctx context.Context, repo, store, tmp, history string, isGit bo
 			return r, objectsErr
 		}
 	}
-	tree, e := snapStage(g, stage, head, isGit, tmp)
+	tree, e := snapStage(g, stage, head, tmp, isGit, include)
 	if e != nil {
 		return r, e
 	}
@@ -405,18 +478,34 @@ func Freeze(ctx context.Context, src string, opts FreezeOptions) (SnapshotID, Ma
 			return nil, freezeErr
 		}
 		defer removeTreeBestEffort(tmp)
-		repos, root, w, isGit, freezeErr := snapLayout(ctx, src, tmp)
+		layout, freezeErr := snapLayout(ctx, src, tmp, opts.Repositories)
 		if freezeErr != nil {
 			return nil, freezeErr
 		}
-		main, freezeErr := filepath.Rel(root, src)
+		main, freezeErr := filepath.Rel(layout.root, layout.main)
 		if freezeErr != nil {
 			return nil, freezeErr
 		}
-		m = Manifest{Version: 1, Main: filepath.ToSlash(main), Workspace: w}
-		for i, p := range repos {
+		m = Manifest{Version: 1, Main: filepath.ToSlash(main), Workspace: layout.workspace}
+		paths := make([]string, 0, len(layout.repos))
+		for p := range layout.repos {
+			paths = append(paths, p)
+		}
+		sort.Strings(paths)
+		var includeErr error
+		for _, p := range paths {
+			names, err := snapIncludes(p, layout.repos[p])
+			if err != nil {
+				includeErr = errors.Join(includeErr, fmt.Errorf("%s: %w", p, err))
+			}
+			layout.repos[p] = names
+		}
+		if includeErr != nil {
+			return nil, includeErr
+		}
+		for i, p := range paths {
 			if snapWithin(p, store) {
-				if !isGit {
+				if !layout.git {
 					return nil, errors.New("store inside source directory")
 				}
 				g := snapGit{ctx: ctx, dir: p}
@@ -432,11 +521,11 @@ func Freeze(ctx context.Context, src string, opts FreezeOptions) (SnapshotID, Ma
 			if h != "" && h != "HEAD" && !snapWithin(p, src) {
 				h = "HEAD..HEAD"
 			}
-			r, repoErr := snapCapture(ctx, p, store, d, h, isGit)
+			r, repoErr := snapCapture(ctx, p, store, d, h, layout.git, layout.repos[p])
 			if repoErr != nil {
 				return nil, repoErr
 			}
-			rel, repoErr := filepath.Rel(root, p)
+			rel, repoErr := filepath.Rel(layout.root, p)
 			if repoErr != nil {
 				return nil, repoErr
 			}

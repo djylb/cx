@@ -10,8 +10,6 @@ import (
 	"slices"
 	"strings"
 	"time"
-
-	"github.com/BurntSushi/toml"
 )
 
 func mirror(ctx context.Context, hs endpoints, o ctlOptions) error {
@@ -31,12 +29,8 @@ func mirror(ctx context.Context, hs endpoints, o ctlOptions) error {
 			return e
 		}
 		if p != o.project {
-			dir, e := projectDirectory()
+			def, e := readProject(o.project)
 			if e != nil {
-				return e
-			}
-			var def struct{ Repositories []struct{ Path string } }
-			if _, e = toml.DecodeFile(filepath.Join(dir, o.project+".toml"), &def); e != nil {
 				return e
 			}
 			if len(def.Repositories) != 1 {

@@ -15,7 +15,8 @@ type ctlCommand struct {
 }
 
 const submissionSessionFlags = "session no-session"
-const submitFlags = "profile engine model effort sandbox role parent snapshot with-history input-json image idle-exit turn-timeout approval-timeout stall queue-timeout inplace interactive web-search hard network no-network force sync no-tools clean-base context " + submissionSessionFlags
+const submitFlags = "project profile engine model effort sandbox role parent snapshot with-history input-json image idle-exit turn-timeout approval-timeout stall queue-timeout inplace interactive web-search hard network no-network force sync no-tools clean-base context " + submissionSessionFlags
+const projectInitUsage = "NAME --repo DIR [DIR ...] [--include REPO:PATH ...] [--default-host HOST]"
 
 var ctlCommands = map[string]ctlCommand{
 	"adopt":        {"JOB [--session NAME]", "Move an existing job into a session.", "session"},
@@ -52,8 +53,8 @@ var ctlCommands = map[string]ctlCommand{
 	"overview":     {"", "Summarize jobs and project channels.", "json project session all max-bytes"},
 	"patch":        {"JOB", "Show collected patch statistics or contents.", "turn incremental full repo max-bytes"},
 	"plan":         {"JOB", "Read recorded plan events.", ""},
-	"project":      {"ls | show NAME | init NAME --repo DIR [DIR ...] [--default-host HOST]", "List, inspect, or initialize projects.", ""},
-	"project-init": {"NAME --repo DIR [DIR ...] [--default-host HOST]", "Initialize a project.", ""},
+	"project":      {"ls | show NAME | init " + projectInitUsage, "List, inspect, or initialize projects.", ""},
+	"project-init": {projectInitUsage, "Initialize a project.", ""},
 	"project-ls":   {"", "List configured projects.", ""},
 	"project-show": {"NAME", "Print project configuration.", ""},
 	"rebase":       {"JOB TEXT", "Submit a follow-up to resolve patch conflicts.", submissionSessionFlags},
@@ -68,7 +69,7 @@ var ctlCommands = map[string]ctlCommand{
 	"settings":     {"JOB --scope turn|thread [--model MODEL] [--effort EFFORT]", "Update agent turn or thread settings.", ""},
 	"setup":        {"HOST", "Install or update cx on an execution host.", ""},
 	"show":         {"JOB", "Show a job or turn summary.", "full json turn max-bytes"},
-	"snapshot":     {"DIR", "Freeze and publish a source snapshot.", "with-history"},
+	"snapshot":     {"DIR", "Freeze and publish a source snapshot.", "project with-history"},
 	"status":       {"JOB", "Print the current job status.", "json"},
 	"tail":         {"JOB", "Follow job progress, agent messages or raw output.", "raw messages cursor since from-start timeout"},
 	"test":         {"[TEST-ARGS ...]", "Run the executable configured by CX_TEST_COMMAND.", ""},
@@ -137,7 +138,7 @@ func printCtlHelp(w io.Writer, op string) {
 		_, _ = fmt.Fprintln(w, "\nActions:")
 		printCtlCommands(w, op+"-")
 	case "project-init":
-		_, _ = fmt.Fprintln(w, "  --repo DIR [DIR ...]\n    \tGit checkouts in the project (required).\n  --default-host HOST\n    \tExecution host (CX_DEFAULT_HOST, otherwise local).")
+		_, _ = fmt.Fprintln(w, "  --repo DIR [DIR ...]\n    \tGit checkouts in the project (required).\n  --include REPO:PATH\n    \tSnapshot-only file or glob relative to the named repository (repeatable). Keep credentials out of include.\n  --default-host HOST\n    \tExecution host (CX_DEFAULT_HOST, otherwise local).")
 	case "node":
 		_, _ = fmt.Fprintln(w, "\nCOMMAND and ARGS use the cxrun execution-node interface and wire protocol.")
 	case "test", "gate":
@@ -145,6 +146,10 @@ func printCtlHelp(w io.Writer, op string) {
 	}
 	if strings.Contains(cmd.usage, "JOB") {
 		_, _ = fmt.Fprintln(w, "\nJOB accepts [HOST:]PROJECT/TAG or TAG in the current project.")
+	}
+	switch op {
+	case "snapshot", "run", "agent":
+		_, _ = fmt.Fprintln(w, "\nPut repositories that should be mounted together in one project with cx project init. A member's snapshot includes all project repositories and any discovered Go workspace repositories.")
 	}
 	switch op {
 	case "adopt", "wait", "run", "agent", "exec", "fork", "rebase", "ls", "overview":
@@ -264,8 +269,11 @@ func ctlFlagHelp(op, key string) string {
 			return "replay retained turn completions and pending events for a new --any cursor"
 		}
 	case "project":
-		if op == "wait" {
+		switch op {
+		case "wait":
 			return "select `PROJECT` (repeatable with --any)"
+		case "snapshot", "run", "agent":
+			return "select `PROJECT` (otherwise use CX_PROJECT or match DIR to a project member)"
 		}
 	case "log":
 		return "stream the complete command log or the selected agent turn's progress log"

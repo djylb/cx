@@ -254,7 +254,8 @@ func Materialize(ctx context.Context, job string, m Manifest, target string) (Pr
 			if len(m.Repositories) > 1 {
 				prefix = r.Path + "/"
 			}
-			b, diffErr := g.input(nil, "diff", "--binary", "--no-ext-diff", "--no-textconv", "--src-prefix=a/"+prefix, "--dst-prefix=b/"+prefix, r.Base, r.OID, "--")
+			args := []string{"diff", "--binary", "--no-ext-diff", "--no-textconv", "--src-prefix=a/" + prefix, "--dst-prefix=b/" + prefix, r.Base, r.OID, "--"}
+			b, diffErr := g.input(nil, r.excludeIncludes(args)...)
 			if diffErr != nil {
 				return out, diffErr
 			}
@@ -401,6 +402,9 @@ func collectSnapshotPatch(ctx context.Context, out *SnapshotResult, r SnapshotRe
 	}
 	var force bytes.Buffer
 	for _, n := range snapList(string(ignored)) {
+		if _, found := slices.BinarySearch(r.Include, n); found {
+			continue
+		}
 		p := filepath.Join(repo, n)
 		if st, statErr := os.Lstat(p); statErr == nil && !st.IsDir() && !snapWithin(art, p) {
 			force.WriteString(n)
@@ -421,6 +425,9 @@ func collectSnapshotPatch(ctx context.Context, out *SnapshotResult, r SnapshotRe
 			return indexErr
 		}
 	}
+	// Keep includes in the staging scope. Excluding the only tracked
+	// child of an ignored directory makes Git reject the directory at add.
+	scope = r.excludeIncludes(scope)
 	opts := []string{"diff", "--cached", "--no-ext-diff", "--no-textconv", "--no-renames", "--no-relative"}
 	args := append(append([]string{}, opts...), "--binary", "--full-index", "--src-prefix=a/", "--dst-prefix=b/", r.OID)
 	data, indexErr := g.input(nil, append(args, scope...)...)

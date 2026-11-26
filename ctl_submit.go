@@ -12,8 +12,6 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
-
-	"github.com/BurntSushi/toml"
 )
 
 func controllerPolicy(name string) (string, error) {
@@ -48,9 +46,9 @@ func defaultSubmitHost() string {
 	}
 	return "local"
 }
-func submitSnapshot(ctx context.Context, src string, o ctlOptions) (SnapshotID, error) {
+func submitSnapshot(ctx context.Context, src string, o ctlOptions, def projectDefinition) (SnapshotID, error) {
 	if o.snapshot == "" {
-		sid, _, e := Freeze(ctx, src, FreezeOptions{History: o.history})
+		sid, _, e := Freeze(ctx, src, FreezeOptions{History: o.history, Repositories: def.Repositories})
 		return sid, e
 	}
 	if o.history != "" || !snapHex(o.snapshot, 64) {
@@ -78,7 +76,11 @@ func ctlSubmit(ctx context.Context, hs endpoints, op string, o ctlOptions) error
 		if o.history == "" {
 			o.snapshot = os.Getenv("LAN_SNAPSHOT_ID")
 		}
-		id, e := submitSnapshot(ctx, o.pos[0], o)
+		_, def, e := resolveProject(ctx, o.pos[0], o.project)
+		if e != nil {
+			return e
+		}
+		id, e := submitSnapshot(ctx, o.pos[0], o, def)
 		if e != nil {
 			return e
 		}
@@ -113,6 +115,9 @@ func ctlSubmit(ctx context.Context, hs endpoints, op string, o ctlOptions) error
 			return e
 		}
 		if o.previous != "" {
+			if o.project != "" {
+				return errors.New("--project applies to new jobs")
+			}
 			name, id, continueErr := resolveJob(ctx, o.previous)
 			if continueErr != nil {
 				return continueErr
@@ -158,29 +163,6 @@ func ctlSubmit(ctx context.Context, hs endpoints, op string, o ctlOptions) error
 			tag = fmt.Sprintf("%s-%x", time.Now().Format("20060102-150405"), nonce)
 		}
 		host = o.host
-		if host == "auto" || host == "" {
-			host = defaultSubmitHost()
-			if os.Getenv("CX_DEFAULT_HOST") == "" {
-				p, e := projectAt(ctx, src)
-				if e != nil {
-					return e
-				}
-				dir, e := projectDirectory()
-				if e != nil {
-					return e
-				}
-				var def struct {
-					Host string `toml:"default_host"`
-				}
-				_, e = toml.DecodeFile(filepath.Join(dir, p+".toml"), &def)
-				if e != nil && !os.IsNotExist(e) {
-					return e
-				}
-				if def.Host != "" {
-					host = def.Host
-				}
-			}
-		}
 	} else {
 		if len(o.pos) < 2 {
 			return errors.New("run HOST DIR TAG PROMPTFILE")
@@ -205,21 +187,27 @@ func ctlSubmit(ctx context.Context, hs endpoints, op string, o ctlOptions) error
 		}
 		tag = o.pos[2]
 	}
+	src, e := filepath.Abs(src)
+	if e != nil {
+		return e
+	}
+	p, j, e := submissionTag(tag, o.project)
+	if e != nil {
+		return e
+	}
+	p, def, e := resolveProject(ctx, src, p)
+	if e != nil {
+		return e
+	}
+	if op == "agent" && (host == "auto" || host == "") {
+		host = defaultSubmitHost()
+		if os.Getenv("CX_DEFAULT_HOST") == "" && def.Host != "" {
+			host = def.Host
+		}
+	}
 	h, e := hs.get(host)
 	if e != nil {
 		return e
-	}
-	src, e = filepath.Abs(src)
-	if e != nil {
-		return e
-	}
-	p, j, ok := strings.Cut(tag, "/")
-	if !ok {
-		j = tag
-		p, e = projectAt(ctx, src)
-		if e != nil {
-			return e
-		}
 	}
 	id := p + "/" + j
 	if _, e = jobDir("", id); e != nil {
@@ -334,7 +322,7 @@ func ctlSubmit(ctx context.Context, hs endpoints, op string, o ctlOptions) error
 		req.Preamble = strings.TrimRight(req.Preamble, "\n") + "\n" + jobToolsNote
 	}
 	if !o.inplace {
-		req.Snapshot, e = submitSnapshot(ctx, src, o)
+		req.Snapshot, e = submitSnapshot(ctx, src, o, def)
 		if e != nil {
 			return e
 		}
@@ -380,6 +368,16 @@ func ctlSubmit(ctx context.Context, hs endpoints, op string, o ctlOptions) error
 	return nil
 }
 
+func submissionTag(tag, project string) (string, string, error) {
+	if p, j, ok := strings.Cut(tag, "/"); ok {
+		if p == "" || project != "" && p != project {
+			return "", "", errors.New("job project does not match --project")
+		}
+		return p, j, nil
+	}
+	return project, tag, nil
+}
+
 func submitBatch(ctx context.Context, hs endpoints, o ctlOptions) error {
 	if len(o.pos) != 2 || o.command || o.inplace {
 		return errors.New("batch needs HOST DIR and snapshot jobs")
@@ -389,19 +387,33 @@ func submitBatch(ctx context.Context, hs endpoints, o ctlOptions) error {
 		return e
 	}
 	var jobs [][]string
-	project, e := projectAt(ctx, o.pos[1])
-	if e != nil {
-		return e
-	}
+	var defaultName string
+	definitions := map[string]projectDefinition{}
 	seen := map[string]bool{}
 	for _, line := range strings.Split(strings.TrimSuffix(string(b), "\n"), "\n") {
 		parts := strings.Split(strings.TrimSuffix(line, "\r"), "\t")
 		if len(parts) != 2 {
 			return errors.New("batch rows require TAG and PROMPTFILE")
 		}
-		if !strings.Contains(parts[0], "/") {
-			parts[0] = project + "/" + parts[0]
+		project, tag, tagErr := submissionTag(parts[0], o.project)
+		if tagErr != nil {
+			return tagErr
 		}
+		if project == "" {
+			project = defaultName
+		}
+		if _, ok := definitions[project]; !ok {
+			name, def, projectErr := resolveProject(ctx, o.pos[1], project)
+			if projectErr != nil {
+				return projectErr
+			}
+			if project == "" {
+				defaultName = name
+			}
+			definitions[name] = def
+			project = name
+		}
+		parts[0] = project + "/" + tag
 		if _, e = jobDir("", parts[0]); e != nil {
 			return e
 		}
@@ -415,13 +427,22 @@ func submitBatch(ctx context.Context, hs endpoints, o ctlOptions) error {
 		seen[parts[0]] = true
 		jobs = append(jobs, append(append([]string{}, o.pos...), parts...))
 	}
-	sid, e := submitSnapshot(ctx, o.pos[1], o)
-	if e != nil {
-		return e
+	snapshots := map[string]SnapshotID{}
+	for _, row := range jobs {
+		project, _, _ := strings.Cut(row[2], "/")
+		if _, ok := snapshots[project]; !ok {
+			sid, snapshotErr := submitSnapshot(ctx, o.pos[1], o, definitions[project])
+			if snapshotErr != nil {
+				return snapshotErr
+			}
+			snapshots[project] = sid
+		}
 	}
-	o.batch, o.history, o.snapshot = "", "", string(sid)
+	o.batch, o.history = "", ""
 	var first error
 	for _, row := range jobs {
+		project, _, _ := strings.Cut(row[2], "/")
+		o.snapshot = string(snapshots[project])
 		o.pos = row
 		if e = ctlSubmit(ctx, hs, "run", o); first == nil {
 			first = e
@@ -585,7 +606,11 @@ func legacyGate(ctx context.Context, args []string) error {
 			if e != nil {
 				return e
 			}
-			sid, e := submitSnapshot(ctx, src, ctlOptions{snapshot: os.Getenv("LAN_SNAPSHOT_ID")})
+			_, def, e := resolveProject(ctx, src, "")
+			if e != nil {
+				return e
+			}
+			sid, e := submitSnapshot(ctx, src, ctlOptions{snapshot: os.Getenv("LAN_SNAPSHOT_ID")}, def)
 			if e != nil {
 				return e
 			}
@@ -615,16 +640,9 @@ func verifySourceBase(ctx context.Context, src string, req *jobSubmission, o ctl
 	if e != nil {
 		return e
 	}
-	src, e = filepath.EvalSymlinks(src)
+	root, e := m.sourceRoot(ctx, src)
 	if e != nil {
 		return e
-	}
-	root := src
-	for range strings.Split(m.Main, "/") {
-		root = filepath.Dir(root)
-	}
-	if filepath.Join(root, m.Main) != src {
-		return errors.New("source does not match snapshot layout")
 	}
 	req.Sources = map[string]string{}
 	req.Branches = map[string]*string{}
@@ -650,7 +668,7 @@ func verifySourceBase(ctx context.Context, src string, req *jobSubmission, o ctl
 		if o.snapshot == "" && head != *r.Head {
 			return fmt.Errorf("HEAD moved: %s", r.Path)
 		}
-		dirty, e := g.get("status", "--porcelain", "-z", "--untracked-files=all")
+		dirty, e := g.get(r.excludeIncludes([]string{"status", "--porcelain", "-z", "--untracked-files=all", "--", "."})...)
 		if e != nil {
 			return e
 		}
@@ -660,7 +678,7 @@ func verifySourceBase(ctx context.Context, src string, req *jobSubmission, o ctl
 				return e
 			}
 			g.dir = r.bare(store)
-			dirty, e = g.get("diff", "--name-only", r.Base, r.OID, "--")
+			dirty, e = g.get(r.excludeIncludes([]string{"diff", "--name-only", r.Base, r.OID, "--"})...)
 			if e != nil {
 				return e
 			}

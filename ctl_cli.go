@@ -17,8 +17,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/BurntSushi/toml"
-
 	"github.com/djylb/timeshim"
 )
 
@@ -228,49 +226,8 @@ func defaultProject(ctx context.Context) (string, error) {
 	return projectAt(ctx, ".")
 }
 func projectAt(ctx context.Context, dir string) (string, error) {
-	if p := os.Getenv("CX_PROJECT"); p != "" {
-		return p, nil
-	}
-	identity := probe(ctx, "git", "-C", dir, "rev-parse", "--path-format=absolute", "--git-common-dir")
-	if identity != "" {
-		directory, e := projectDirectory()
-		if e != nil {
-			return "", e
-		}
-		files, e := filepath.Glob(filepath.Join(directory, "*.toml"))
-		if e != nil {
-			return "", e
-		}
-		match := ""
-		for _, path := range files {
-			var def struct{ Repositories []struct{ Path string } }
-			if _, e = toml.DecodeFile(path, &def); e != nil {
-				return "", e
-			}
-			for _, repo := range def.Repositories {
-				if probe(ctx, "git", "-C", repo.Path, "rev-parse", "--path-format=absolute", "--git-common-dir") == identity {
-					if match != "" {
-						return "", errors.New("repository belongs to multiple projects; set CX_PROJECT")
-					}
-					match = strings.TrimSuffix(filepath.Base(path), ".toml")
-					break
-				}
-			}
-		}
-		if match != "" {
-			return match, nil
-		}
-	}
-	p := probe(ctx, "git", "-C", dir, "rev-parse", "--show-toplevel")
-	if p == "" {
-		p, _ = filepath.Abs(dir)
-	}
-	p = regexp.MustCompile("[^A-Za-z0-9_.-]").ReplaceAllString(filepath.Base(p), "-")
-	p = strings.TrimLeft(p, "._-")
-	if p == "" {
-		return "project", nil
-	}
-	return p[:min(48, len(p))], nil
+	name, _, e := resolveProject(ctx, dir, "")
+	return name, e
 }
 func controller(ctx context.Context, a []string) error {
 	if len(a) == 1 && isHelp(a[0]) {

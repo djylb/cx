@@ -34,6 +34,16 @@ Review the execution host's `host.json` with `cx host HOST`. Update an individua
 
 Use `cx hosts [HOST]` or `cx node facts` for host facts. `engines.<name>` reports `path`, `version`, and `login_status` (`logged_in`, `logged_out`, or null). After setup, `cx doctor HOST --json` also reports state and cache checks and profile login probes. Use a smoke turn to verify credentials supplied through `env_file`.
 
+## Projects and multi-repository snapshots
+
+Put repositories that a job needs to mount together in the same project. `cx project init NAME --repo DIR [DIR ...]` writes their primary checkouts to `~/.config/cx/projects/NAME.toml`. Use `cx project show NAME` to inspect the configuration.
+
+`cx run`, `cx agent`, and `cx snapshot` accept `--project NAME`. Without an explicit selection, cx uses `CX_PROJECT` or matches the source Git repository to a project. When the source belongs to a multi-repository project, cx snapshots all its members relative to their common parent. The source repository root becomes the job working directory, so sibling repositories are available at paths such as `../library`. A source outside the selected project uses its ordinary snapshot layout. Go workspace discovery also runs and adds any additional repositories.
+
+For local inputs such as an ignored build configuration, add `include = [".cargo/config.toml"]` to the appropriate `[[repositories]]` entry. At initialization, repeat `--include REPO:PATH` for each path or glob. `REPO` can be a checkout path or a unique repository directory name. Quote globs to pass them to cx and use paths relative to the repository root with `/` separators. Each entry must match a file. cx reports missing entries and stops the snapshot. Matched files travel with the snapshot and are excluded from collected patches. Keep credentials out of `include`.
+
+Results group patches by repository. Use `cx patch JOB --full --repo PATH` to inspect one repository's patch and `cx apply JOB --repo PATH` to apply it. `PATH` is relative to the snapshot's common parent.
+
 ## Node state
 
 The default state root is `~/.local/share/cx/state` on Unix and `%LOCALAPPDATA%\cx\state` on Windows. Set `CXRUN_STATE` to override it. Direct node operations that accept `--state PATH` can select it per call.

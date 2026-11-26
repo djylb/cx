@@ -91,6 +91,115 @@ func TestB3SnapshotResult(t *testing.T) {
 	}
 }
 
+func TestProjectSnapshotCLI(t *testing.T) {
+	f := newControllerFixture(t)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(f.home, "config"))
+	t.Setenv("CX_SNAPSHOT_STORE", filepath.Join(f.home, "snapshots"))
+	t.Setenv("CX_DEFAULT_HOST", "local")
+	t.Setenv("GOWORK", "off")
+	src, dep := filepath.Join(f.home, "worker"), filepath.Join(f.home, "dependency")
+	for _, repo := range []string{src, dep} {
+		snapWriteTest(t, filepath.Join(repo, "content"), "base\n")
+		snapWriteTest(t, filepath.Join(repo, ".gitignore"), ".cargo/\n")
+		snapWriteTest(t, filepath.Join(repo, "subdir", "content"), "subdir\n")
+		cliOutput(t, 0, nil, "git", "-C", repo, "init", "--quiet")
+		cliOutput(t, 0, nil, "git", "-C", repo, "add", ".")
+		cliOutput(t, 0, nil, "git", "-C", repo, "-c", "user.name=fixture", "-c", "user.email=fixture@invalid", "commit", "-qm", "baseline")
+	}
+	snapWriteTest(t, filepath.Join(src, ".cargo", "config.toml"), "explicit\n")
+	snapWriteTest(t, filepath.Join(src, ".cargo", "omitted"), "ignored\n")
+	snapWriteTest(t, filepath.Join(dep, "input.local"), "local\n")
+	cliOutput(t, 0, nil, f.cx, "project", "init", "demo", "--repo", dep, src,
+		"--include", "worker:.cargo/*.toml", "--include", src+":.cargo/config.toml", "--include", "dependency:input.local")
+	show := cliOutput(t, 0, nil, f.cx, "project", "show", "demo")
+	for _, pattern := range []string{".cargo/*.toml", ".cargo/config.toml", "input.local"} {
+		if !bytes.Contains(show, []byte(`"`+pattern+`"`)) {
+			t.Fatalf("project show omitted %q: %s", pattern, show)
+		}
+	}
+	input := filepath.Join(src, "subdir")
+	freeze := func(args ...string) SnapshotID {
+		t.Helper()
+		return SnapshotID(strings.TrimSpace(string(cliOutput(t, 0, nil, f.cx, append([]string{"snapshot", input}, args...)...))))
+	}
+	explicit := freeze("--project", "demo")
+	t.Setenv("CX_PROJECT", "")
+	if discovered := freeze(); discovered != explicit {
+		t.Fatalf("different snapshot IDs for explicit and inferred project: %s vs %s", explicit, discovered)
+	}
+	m, e := loadSnapshot(explicit)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if m.Main != "worker" || len(m.Repositories) != 2 || m.Repositories[0].Path != "dependency" || m.Repositories[1].Path != "worker" ||
+		!reflect.DeepEqual(m.Repositories[1].Include, []string{".cargo/config.toml"}) {
+		t.Fatalf("unexpected project snapshot: %+v", m)
+	}
+	cliOutput(t, 0, nil, f.cx, "project", "init", "other", "--repo", dep)
+	single, e := loadSnapshot(freeze("--project", "other"))
+	if e != nil || single.Main != "worker/subdir" || len(single.Repositories) != 1 || len(single.Repositories[0].Include) != 0 {
+		t.Fatalf("unexpected standalone snapshot: %+v (%v)", single, e)
+	}
+	const command = `set -eu
+test "$(cat content)" = base
+test "$(cat ../dependency/content)" = base
+test "$(cat .cargo/config.toml)" = explicit
+test -f ../dependency/input.local
+test ! -e .cargo/omitted
+echo edited > .cargo/config.toml
+rm ../dependency/input.local
+echo worker-edit > content
+echo dependency-edit > ../dependency/content`
+	cliOutput(t, 0, nil, f.cx, "run", "local", input, "roundtrip", "--project", "demo", "--clean-base", "--cmd", "--timeout", "10s", "--", "sh", "-c", command)
+	const job = "demo/roundtrip"
+	cliOutput(t, 0, nil, f.cx, "wait", job, "--timeout", "20s")
+	for _, repo := range []string{"worker", "dependency"} {
+		patch := cliOutput(t, 0, nil, f.cx, "patch", job, "--repo", repo, "--full")
+		if !bytes.Contains(patch, []byte("+"+repo+"-edit\n")) || bytes.Contains(patch, []byte(".cargo/")) || bytes.Contains(patch, []byte("input.local")) {
+			t.Fatalf("unexpected %s patch: %s", repo, patch)
+		}
+	}
+	assertFile := func(path, want string) {
+		t.Helper()
+		if b, e := os.ReadFile(path); e != nil || string(b) != want {
+			t.Fatalf("%s = %q (%v), want %q", path, b, e, want)
+		}
+	}
+	cliOutput(t, 0, nil, f.cx, "apply", job, "--repo", "dependency")
+	assertFile(filepath.Join(src, "content"), "base\n")
+	assertFile(filepath.Join(dep, "content"), "dependency-edit\n")
+	cliOutput(t, 0, nil, f.cx, "apply", job, "--repo", "worker")
+	assertFile(filepath.Join(src, "content"), "worker-edit\n")
+	for _, repo := range []string{src, dep} {
+		cliOutput(t, 0, nil, "git", "-C", repo, "restore", "--source=HEAD", "--staged", "--worktree", "--", "content")
+	}
+	cliOutput(t, 0, nil, f.cx, "apply", job)
+	assertFile(filepath.Join(src, "content"), "worker-edit\n")
+	assertFile(filepath.Join(dep, "content"), "dependency-edit\n")
+	assertFile(filepath.Join(src, ".cargo", "config.toml"), "explicit\n")
+	assertFile(filepath.Join(dep, "input.local"), "local\n")
+	cliOutput(t, 0, nil, f.cx, "close", job)
+	cliOutput(t, 0, nil, f.cx, "clean", job)
+
+	cliOutput(t, 0, nil, f.cx, "project", "init", "missing", "--repo", src, dep,
+		"--include", "worker:.cargo/missing.toml", "--include", "worker:.cargo/omitted/*",
+		"--include", "dependency:missing-*.local")
+	_, diag := cliStreams(t, 2, nil, f.cx, "snapshot", input, "--project", "missing")
+	for _, pattern := range []string{".cargo/missing.toml", ".cargo/omitted/*", "missing-*.local"} {
+		if !strings.Contains(diag, pattern) {
+			t.Fatalf("missing include diagnostic omitted %q: %s", pattern, diag)
+		}
+	}
+	prompt, batch := filepath.Join(f.home, "prompt"), filepath.Join(f.home, "batch")
+	snapWriteTest(t, prompt, "fixture")
+	snapWriteTest(t, batch, "other/first\t"+prompt+"\nmissing/second\t"+prompt+"\n")
+	_, diag = cliStreams(t, 2, nil, f.cx, "run", "local", input, "--batch", batch)
+	if !strings.Contains(diag, "missing-*.local") {
+		t.Fatalf("batch did not check the second project's includes: %s", diag)
+	}
+	cliOutput(t, 11, nil, f.cx, "node", "status", "--job", "other/first")
+}
+
 func TestB3CenterBuildAndTaskResume(t *testing.T) {
 	f := newControllerFixture(t)
 	module := filepath.Join(f.home, "module")

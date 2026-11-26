@@ -10,9 +10,11 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"strings"
 	"time"
 	"unicode/utf16"
@@ -20,26 +22,30 @@ import (
 )
 
 type SnapshotID string
-type FreezeOptions struct{ History string }
+type FreezeOptions struct {
+	History      string
+	Repositories []projectRepository
+}
 
-// Manifest describes a frozen snapshot. Fields follow v1's sorted wire order.
+// Manifest describes a frozen snapshot.
 type Manifest struct {
+	Workspace    *SnapshotWorkspace `json:"workspace"`
 	Main         string             `json:"main"`
 	Repositories []SnapshotRepo     `json:"repositories"`
 	Version      int                `json:"version"`
-	Workspace    *SnapshotWorkspace `json:"workspace"`
 }
 
-// SnapshotRepo describes one frozen repository. Field order is part of the v1 snapshot hash.
+// SnapshotRepo describes one frozen repository.
 type SnapshotRepo struct {
-	Base    string   `json:"base,omitempty"`
 	Head    *string  `json:"head"`
-	History bool     `json:"history,omitempty"`
+	Base    string   `json:"base,omitempty"`
 	OID     string   `json:"oid"`
 	Path    string   `json:"path"`
 	RepoID  string   `json:"repo_id"`
-	Shallow []string `json:"shallow,omitempty"`
 	StoreID string   `json:"store_id,omitempty"`
+	Include []string `json:"include,omitempty"`
+	Shallow []string `json:"shallow,omitempty"`
+	History bool     `json:"history,omitempty"`
 }
 type SnapshotWorkspace struct {
 	Sum  *string `json:"sum"`
@@ -53,6 +59,14 @@ func (r SnapshotRepo) key() string {
 	return r.RepoID
 }
 func (r SnapshotRepo) bare(store string) string { return filepath.Join(store, "repos", r.key()+".git") }
+
+func (r SnapshotRepo) excludeIncludes(scope []string) []string {
+	for _, name := range r.Include {
+		scope = append(scope, ":(top,exclude,literal)"+name)
+	}
+	return scope
+}
+
 func snapStore() (string, error) {
 	if s := os.Getenv("CX_SNAPSHOT_STORE"); s != "" {
 		return filepath.Abs(s)
@@ -62,10 +76,22 @@ func snapStore() (string, error) {
 }
 func snapSum(b []byte) string { return fmt.Sprintf("%x", sha256.Sum256(b)) }
 func snapJSON(v any) ([]byte, error) {
+	// Encode objects with sorted keys for the v1 snapshot hash, independent
+	// of how fields are laid out in memory.
+	raw, e := json.Marshal(v)
+	if e != nil {
+		return nil, e
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var canonical any
+	if e = dec.Decode(&canonical); e != nil {
+		return nil, e
+	}
 	var b bytes.Buffer
 	enc := json.NewEncoder(&b)
 	enc.SetEscapeHTML(false)
-	if e := enc.Encode(v); e != nil {
+	if e = enc.Encode(canonical); e != nil {
 		return nil, e
 	}
 	var result bytes.Buffer
@@ -121,6 +147,13 @@ func snapWithin(root, path string) bool {
 func snapPath(s string) bool {
 	return utf8.ValidString(s) && s != "" && filepath.IsLocal(s) && filepath.ToSlash(filepath.Clean(s)) == s && !strings.ContainsAny(s, "\\:\x00") && s != "."
 }
+func snapIncludePath(s string) bool {
+	return snapPath(s) && !slices.Contains(strings.Split(strings.ToLower(s), "/"), ".git")
+}
+func snapIncludePattern(s string) bool {
+	_, e := path.Match(s, "")
+	return e == nil && snapIncludePath(s)
+}
 func snapHex(s string, n int) bool {
 	if len(s) != n || s != strings.ToLower(s) {
 		return false
@@ -143,6 +176,11 @@ func (m Manifest) validate() error {
 				return errors.New("invalid shallow boundary")
 			}
 		}
+		for j, name := range r.Include {
+			if !snapIncludePath(name) || j > 0 && r.Include[j-1] >= name {
+				return errors.New("invalid snapshot include paths")
+			}
+		}
 		if len(r.Shallow) > 0 {
 			data, e := snapJSON([]any{r.RepoID, r.Shallow})
 			if e != nil {
@@ -163,6 +201,41 @@ func (m Manifest) validate() error {
 		return errors.New("main outside repositories")
 	}
 	return nil
+}
+
+// Resolve the source side of the frozen layout. A multi-repository project's
+// Main may be the Git root even when the user submitted one of its subdirectories.
+func (m Manifest) sourceRoot(ctx context.Context, src string) (string, error) {
+	src, e := filepath.EvalSymlinks(src)
+	if e != nil {
+		return "", e
+	}
+	relativeRoot := func(p string) (string, bool) {
+		root := p
+		for range strings.SplitSeq(m.Main, "/") {
+			root = filepath.Dir(root)
+		}
+		return root, filepath.Join(root, m.Main) == p
+	}
+	for _, r := range m.Repositories {
+		if r.Path == m.Main {
+			g := snapGit{ctx: ctx, dir: src}
+			if top, gitErr := g.get("rev-parse", "--show-toplevel"); gitErr == nil {
+				top, e = filepath.EvalSymlinks(top)
+				if e != nil {
+					return "", e
+				}
+				if root, ok := relativeRoot(top); ok {
+					return root, nil
+				}
+			}
+			break
+		}
+	}
+	if root, ok := relativeRoot(src); ok {
+		return root, nil
+	}
+	return "", errors.New("source does not match snapshot layout")
 }
 func snapImmutable(path string, data []byte) error {
 	return publishImmutable(path, data, "")
