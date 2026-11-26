@@ -40,6 +40,15 @@ type turnResult struct {
 	Turn         int64                 `json:"turn"`
 }
 
+type resultUnavailable string
+
+func (e resultUnavailable) Error() string { return string(e) }
+func (e resultUnavailable) Unwrap() error { return ctlExit(44) }
+
+func unsealedTurn(n int64) error {
+	return resultUnavailable(fmt.Sprintf("turn %d not sealed yet", n))
+}
+
 func currentTurnID(s status) string {
 	if s.Turn != "" {
 		return s.Turn
@@ -47,8 +56,14 @@ func currentTurnID(s status) string {
 	return s.LastCompleted
 }
 
+func resultInProgress(s status) bool {
+	return !isTerminal(s.State) && (s.TurnStatus == "inProgress" || s.State == "running" ||
+		s.State == "queued" || s.State == "waiting_approval" ||
+		s.State == "waiting_input" && s.InputKind == "server_request")
+}
+
 func readyResult(s status) bool {
-	if s.State == "running" || s.State == "waiting_approval" || s.State == "queued" || s.State == "waiting_input" && s.InputKind == "server_request" {
+	if resultInProgress(s) {
 		return false
 	}
 	if s.Finished == 0 {
@@ -56,6 +71,14 @@ func readyResult(s status) bool {
 	}
 	return s.LastCompleted != "" && currentTurnID(s) == s.LastCompleted
 }
+
+func canSealResult(s status) bool {
+	// Admission can queue the next turn before it starts. Its runner seals
+	// the prior turn before allowing any further worktree changes.
+	return readyResult(s) || s.State == "queued" && s.TurnStatus != "inProgress" &&
+		s.LastCompleted != "" && currentTurnID(s) == s.LastCompleted
+}
+
 func resultCheckout(work string) (string, error) {
 	if _, err := os.Stat(filepath.Join(work, "input", "manifest.json")); err == nil {
 		return work, nil
@@ -96,13 +119,38 @@ func sealTurn(ctx context.Context, dir string, s status, n int64) (string, error
 		return "", e
 	}
 	defer closeBestEffort(lock)
+	var current status
+	if e = loadJobStatusInto(dir, &current); e != nil {
+		return "", e
+	}
+	if s.RunID != current.RunID {
+		return "", errJobReplaced
+	}
+	s = current
 	if _, e = os.Stat(filepath.Join(folder, "result.json")); e == nil {
 		return folder, nil
 	} else if !os.IsNotExist(e) {
 		return "", e
 	}
-	if n != s.Finished || !readyResult(s) {
-		return "", ctlExit(44)
+	if n > s.Finished {
+		return "", unsealedTurn(n)
+	}
+	if n < s.Finished {
+		return "", resultUnavailable(fmt.Sprintf("turn %d was not sealed before the job advanced", n))
+	}
+	missingReport := resultUnavailable(fmt.Sprintf("turn %d report missing", n))
+	if n > 0 && s.LastCompleted == "" && !resultInProgress(s) {
+		return "", missingReport
+	}
+	if !canSealResult(s) {
+		return "", unsealedTurn(n)
+	}
+	report, e := readTurnReport(ctx, dir, s.LastCompleted)
+	if os.IsNotExist(e) || e == nil && report == nil && s.LastCompleted != "" {
+		return "", missingReport
+	}
+	if e != nil {
+		return "", e
 	}
 	var result SnapshotResult
 	checkout, e := resultCheckout(work)
@@ -125,13 +173,6 @@ func sealTurn(ctx context.Context, dir string, s status, n int64) (string, error
 		return "", e
 	}
 	defer removeTreeBestEffort(result.Dir)
-	report, e := readTurnReport(ctx, dir, s.LastCompleted)
-	if e != nil {
-		return "", e
-	}
-	if report == nil && s.LastCompleted != "" {
-		return "", fmt.Errorf("no published report for turn %q", s.LastCompleted)
-	}
 	// last.md is the report entry in the sealed result archive.
 	if e = writeJobBytes(filepath.Join(result.Dir, "last.md"), report); e != nil {
 		return "", e
@@ -178,7 +219,7 @@ func sealTurn(ctx context.Context, dir string, s status, n int64) (string, error
 		return "", e
 	}
 	if s.Finished != after.Finished || s.Turn != after.Turn || s.LastCompleted != after.LastCompleted ||
-		s.CompletedStatus != after.CompletedStatus || s.RunID != after.RunID || !readyResult(after) {
+		s.CompletedStatus != after.CompletedStatus || s.RunID != after.RunID || !canSealResult(after) {
 		return "", errors.New("job changed during collection")
 	}
 	if e = os.Rename(result.Dir, folder); e != nil {
@@ -319,6 +360,50 @@ func nodeResult(ctx context.Context, a []string) error {
 	}
 	_, e = io.Copy(os.Stdout, f)
 	return e
+}
+
+func resultTurnCompleted(s status, n int64) bool {
+	return n <= s.Finished && (s.Finished > 0 || readyResult(s))
+}
+
+func nodeObserveResult(ctx context.Context, a []string) error {
+	if len(a) != 3 {
+		return errors.New("invalid result observation arguments")
+	}
+	n, err := strconv.ParseInt(a[2], 10, 64)
+	if err != nil || n < 0 {
+		return errors.New("invalid result turn")
+	}
+	root, err := stateRoot()
+	if err != nil {
+		return err
+	}
+	dir, err := jobDir(root, a[0])
+	if err != nil {
+		return err
+	}
+	observer, err := openJobObservation(dir, stateCursor{}, "")
+	if err != nil {
+		return err
+	}
+	defer closeBestEffort(observer)
+	for {
+		if observer.s.RunID != a[1] {
+			return errJobReplaced
+		}
+		if resultTurnCompleted(observer.s, n) || observer.s.final {
+			return json.NewEncoder(os.Stdout).Encode(observer.s)
+		}
+		if err = pause(ctx, 200*time.Millisecond); err == nil {
+			err = observer.poll(ctx)
+		}
+		if err != nil {
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				return errObserveTimeout
+			}
+			return err
+		}
+	}
 }
 
 type resultReader struct {
@@ -488,6 +573,13 @@ func downloadTurn(ctx context.Context, h endpoint, id, dest string, details bool
 		}
 		var ex *exec.ExitError
 		if errors.As(e, &ex) && ex.ExitCode() >= 0 && ex.ExitCode() != 255 {
+			if ex.ExitCode() == 44 {
+				reason := strings.TrimPrefix(strings.TrimSpace(cleanDiag(diag.Bytes())), "cx: ")
+				if reason == "" {
+					reason = fmt.Sprintf("turn %d unavailable on %s", target.Number, id)
+				}
+				return resultUnavailable(reason)
+			}
 			diagnosticf("%s", cleanDiag(diag.Bytes()))
 			return ctlExit(ex.ExitCode())
 		}
@@ -528,7 +620,86 @@ func resultDest(host, id, gen, turn string) (string, error) {
 	}
 	return filepath.Join(p, "turn-"+turn), nil
 }
-func ctlResult(ctx context.Context, host, id, op string, o ctlOptions) error {
+func selectResultTurn(ctx context.Context, h endpoint, id, turn string, wait bool) (status, observedResult, error) {
+	var target observedResult
+	if turn != "" {
+		n, err := strconv.ParseInt(turn, 10, 64)
+		if err != nil || n < 0 {
+			return status{}, target, errors.New("invalid result turn")
+		}
+		target.Number = n
+	}
+	r, err := h.call(ctx, 30*time.Second, "status", "--job", id)
+	if err != nil {
+		return status{}, target, err
+	}
+	if r.code != 0 {
+		return status{}, target, r.output()
+	}
+	var s status
+	if err = json.Unmarshal(r.data, &s); err != nil {
+		return s, target, err
+	}
+	target.RunID = s.RunID
+	if turn == "" {
+		target.Number = s.Finished
+		switch {
+		case resultInProgress(s):
+			target.Number++
+		case !readyResult(s) && (!wait || s.LastCompleted == ""):
+			return s, target, resultUnavailable("no completed turn selected by the job")
+		}
+	}
+	if !resultTurnCompleted(s, target.Number) {
+		if !wait {
+			return s, target, unsealedTurn(target.Number)
+		}
+		if !isTerminal(s.State) {
+			deadline, _ := ctx.Deadline()
+			r, err = h.call(ctx, time.Until(deadline), "observe-result", id, target.RunID, strconv.FormatInt(target.Number, 10))
+			if err != nil {
+				return s, target, err
+			}
+			if r.code != 0 {
+				return s, target, r.output()
+			}
+			s = status{}
+			if err = json.Unmarshal(r.data, &s); err != nil {
+				return s, target, err
+			}
+			if s.RunID != target.RunID {
+				return s, target, errJobReplaced
+			}
+		}
+		if !resultTurnCompleted(s, target.Number) {
+			return s, target, resultUnavailable(fmt.Sprintf("turn %d not sealed (job is %s)", target.Number, s.State))
+		}
+	}
+	if turn == "" && target.Number == s.Finished {
+		target.TurnID = s.LastCompleted
+	}
+	return s, target, nil
+}
+
+func ctlResult(ctx context.Context, host, id, op string, o ctlOptions) (err error) {
+	wait := op == "result" && o.wait
+	if wait {
+		limit, e := observation(o.timeout)
+		if e != nil {
+			return e
+		}
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, limit)
+		defer cancel()
+		defer func() {
+			if err != nil && ctx.Err() != nil {
+				err = ctx.Err()
+			}
+		}()
+		if handled, e := observeSubmission(ctx, host, id, "wait", limit); handled || e != nil {
+			return e
+		}
+	}
 	details := o.json || o.log
 	if op == "result" || op == "patch" {
 		if o.turn != "" && !o.refresh && !o.incremental {
@@ -558,28 +729,11 @@ func ctlResult(ctx context.Context, host, id, op string, o ctlOptions) error {
 			return e
 		}
 	}
-	r, e := h.call(ctx, 30*time.Second, "status", "--job", id)
+	s, target, e := selectResultTurn(ctx, h, id, o.turn, wait)
 	if e != nil {
 		return e
 	}
-	if r.code != 0 {
-		return r.output()
-	}
-	var s status
-	if e = json.Unmarshal(r.data, &s); e != nil {
-		return e
-	}
-	turn := o.turn
-	if turn == "" {
-		if !readyResult(s) {
-			return ctlExit(44)
-		}
-		turn = strconv.FormatInt(s.Finished, 10)
-	}
-	n, e := strconv.ParseInt(turn, 10, 64)
-	if e != nil || n < 0 {
-		return errors.New("invalid result turn")
-	}
+	n := target.Number
 	var since int64
 	if o.incremental {
 		since = n
@@ -592,11 +746,7 @@ func ctlResult(ctx context.Context, host, id, op string, o ctlOptions) error {
 			return fmt.Errorf("--since-turn must be between 1 and the latest completed turn (%d)", n)
 		}
 	}
-	turn = strconv.FormatInt(n, 10)
-	target := observedResult{RunID: s.RunID, Number: n}
-	if o.turn == "" {
-		target.TurnID = s.LastCompleted
-	}
+	turn := strconv.FormatInt(n, 10)
 	dest, e := resultDest(host, id, s.RunID, turn)
 	if e != nil {
 		return e
@@ -608,13 +758,16 @@ func ctlResult(ctx context.Context, host, id, op string, o ctlOptions) error {
 		}
 	}
 	if _, e = os.Stat(filepath.Join(dest, "result.json")); os.IsNotExist(e) {
-		if n > s.Finished || (n == s.Finished && !readyResult(s) && n == 0) {
-			return ctlExit(44)
-		}
 		if op == "result" && !o.wait && (details || s.CompletedStatus != "failed") {
 			if !o.refresh {
 				var failure fetchFailure
 				if e = readJSON(dest+".error", &failure); e == nil && failure.Code != 9 && (failure.Code != 44 || !readyResult(s)) {
+					if failure.Code == 44 {
+						if failure.Message == "" || failure.Message == ctlExit(44).Error() {
+							return unsealedTurn(n)
+						}
+						return resultUnavailable(failure.Message)
+					}
 					diagnosticf("%v\n", failure.Message)
 					return ctlExit(failure.Code)
 				}
@@ -650,8 +803,7 @@ func ctlResult(ctx context.Context, host, id, op string, o ctlOptions) error {
 			}
 			if err = fetchTurn(ctx, h, id, s.RunID, strconv.FormatInt(since-1, 10), previous, false); err != nil {
 				if errors.Is(err, ctlExit(44)) {
-					diagnosticf("Sealed turn %d is unavailable for %s. Use the cumulative patch or cx rebase %s TEXT.\n", since-1, id, id)
-					return ctlExit(44)
+					return resultUnavailable(fmt.Sprintf("Sealed turn %d is unavailable for %s (%v). Use the cumulative patch or cx rebase %s TEXT.", since-1, id, err, id))
 				}
 				return err
 			}

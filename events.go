@@ -751,8 +751,8 @@ func (r *runner) input(text, id string, steer bool) error {
 	return r.sendInput(input, id, steer)
 }
 func (r *runner) sendInput(input any, id string, steer bool) error {
-	if !steer {
-		if err := r.sealSnapshotTurn(); err != nil {
+	if !steer && r.s.Finished > 0 && r.s.LastCompleted != "" && canSealResult(r.s) {
+		if _, err := sealTurn(r.ctx, r.dir, r.s, r.s.Finished); err != nil {
 			return fmt.Errorf("seal previous turn before starting the next: %w", err)
 		}
 	}

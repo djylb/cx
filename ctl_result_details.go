@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -46,7 +45,7 @@ func stageResultDetails(ctx context.Context, dir, folder, extra string, s status
 		return err
 	}
 	latest := s.Finished == m.Turn && readyResult(s)
-	log, err := copyResultLog(ctx, dir, extra, s.logName(), m.TurnID, latest, progress)
+	log, bounded, err := copyResultLog(ctx, dir, extra, s.logName(), m.TurnID, latest, progress)
 	if err != nil {
 		return err
 	}
@@ -56,10 +55,18 @@ func stageResultDetails(ctx context.Context, dir, folder, extra string, s status
 		if err = loadJobStatusInto(dir, &after); err != nil {
 			return err
 		}
-		if s.RunID != after.RunID || s.Finished != after.Finished || s.Turn != after.Turn || !readyResult(after) {
-			return fmt.Errorf("%w: job advanced while collecting result log", ctlExit(44))
+		if s.RunID != after.RunID {
+			return errJobReplaced
 		}
-		m.Status, m.ExitCode = &after.State, after.ExitCode
+		if s.Finished == after.Finished && s.Turn == after.Turn && readyResult(after) {
+			m.Status, m.ExitCode = &after.State, after.ExitCode
+		} else if !bounded && log != "" {
+			// An unbounded log belongs to the result only while it is current.
+			if err = os.Remove(filepath.Join(extra, log)); err != nil {
+				return err
+			}
+			m.Log = ""
+		}
 	}
 	data, err := json.Marshal(m)
 	if err != nil {
@@ -68,42 +75,42 @@ func stageResultDetails(ctx context.Context, dir, folder, extra string, s status
 	return snapImmutable(filepath.Join(extra, "result.json"), data)
 }
 
-func copyResultLog(ctx context.Context, dir, stage, name, turnID string, latest bool, progress io.Writer) (string, error) {
+func copyResultLog(ctx context.Context, dir, stage, name, turnID string, latest bool, progress io.Writer) (string, bool, error) {
 	if (name == "output.log" || turnID == "") && !latest {
-		return "", nil
+		return "", false, nil
 	}
 	in, err := openJobFile(filepath.Join(dir, name), jobFileRead)
 	if os.IsNotExist(err) {
-		return "", nil
+		return "", false, nil
 	}
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	defer closeBestEffort(in)
 	fi, err := in.Stat()
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	start, end := int64(0), fi.Size()
+	var found bool
 	if name == "progress.log" && turnID != "" {
-		var found bool
 		start, end, found, err = turnLogRange(ctx, io.TeeReader(in, progress), turnID, end)
 		if err != nil || (!found && !latest) {
-			return "", err
+			return "", false, err
 		}
 	}
 	out, err := openJobFile(filepath.Join(stage, name), jobFileNew)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	copied, err := io.Copy(io.MultiWriter(out, progress), io.NewSectionReader(in, start, end-start))
 	if err = errors.Join(err, out.Close()); err != nil {
-		return "", err
+		return "", false, err
 	}
 	if copied != end-start {
-		return "", errors.New("log changed while collecting result")
+		return "", false, errors.New("log changed while collecting result")
 	}
-	return name, nil
+	return name, found, nil
 }
 
 func turnLogRange(ctx context.Context, in io.Reader, id string, size int64) (start, end int64, found bool, err error) {

@@ -82,6 +82,42 @@ func TestCodexResultDetailsFromSealedTurn(t *testing.T) {
 	}
 }
 
+func TestResultDetailsKeepsCompletedLogWhenJobAdvances(t *testing.T) {
+	s := status{Job: "log", State: "waiting", RunID: "run", Engine: "codex",
+		Turn: "first", LastCompleted: "first", Finished: 1, TurnStatus: "completed", CompletedStatus: "completed"}
+	r := waitFixture(t, t.TempDir(), "log", s)
+	if err := r.publishTurnReport("first", []byte("first report")); err != nil {
+		t.Fatal(err)
+	}
+	folder, err := sealTurn(t.Context(), r.dir, s, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := "1\ttime\tturn/started\tfirst\n2\ttime\tturn/completed\tfirst completed\n"
+	log := first + "3\ttime\tturn/started\tsecond\n"
+	if err = os.WriteFile(filepath.Join(r.dir, "progress.log"), []byte(log), 0600); err != nil {
+		t.Fatal(err)
+	}
+	stage := t.TempDir()
+	progress := waitWriterFunc(func(p []byte) (int, error) {
+		if r.s.Turn != "second" {
+			r.s.State, r.s.Turn, r.s.TurnStatus = "running", "second", "inProgress"
+			return len(p), r.save()
+		}
+		return len(p), nil
+	})
+	if err = stageResultDetails(t.Context(), r.dir, folder, stage, s, progress); err != nil {
+		t.Fatal(err)
+	}
+	var m turnResult
+	if err = readJSON(filepath.Join(stage, "result.json"), &m); err != nil || m.ResultDetails == nil || m.Status != nil || m.Log != "progress.log" {
+		t.Fatalf("result details: %+v, %v", m.ResultDetails, err)
+	}
+	if b, err := os.ReadFile(filepath.Join(stage, m.Log)); err != nil || string(b) != first {
+		t.Fatalf("archived log: %q, %v", b, err)
+	}
+}
+
 func TestResultOutputClarity(t *testing.T) {
 	f := newControllerFixture(t)
 	t.Setenv("CLAUDE_CODE_HOST_SESSION_ID", "local_x")

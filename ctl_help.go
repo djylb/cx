@@ -57,7 +57,7 @@ var ctlCommands = map[string]ctlCommand{
 	"rebase":       {"JOB TEXT", "Submit a follow-up to resolve patch conflicts.", ""},
 	"reply":        {"JOB [--request ID] (--result JSON|@FILE | --error JSON|@FILE)", "Reply to a pending engine request.", ""},
 	"requests":     {"JOB", "List pending engine requests.", ""},
-	"result":       {"JOB", "Collect a sealed turn's report, JSON metadata, or full log.", "turn full json log wait refresh max-bytes"},
+	"result":       {"JOB", "Collect a sealed turn's report, JSON metadata, or full log.", "turn full json log wait timeout refresh max-bytes"},
 	"resume":       {"JOB [--profile NAME]", "Restart a recoverable agent job.", ""},
 	"review":       {"JOB --target JSON|@FILE", "Start an engine review.", ""},
 	"rpc":          {"JOB METHOD", "Invoke an engine RPC method.", ""},
@@ -180,9 +180,9 @@ func printCtlHelp(w io.Writer, op string) {
 		if op == "apply" {
 			failure = "apply failed or had conflicts (even with --allow-conflicts)"
 		}
-		_, _ = fmt.Fprintf(w, "  1 %s\n  9 transport failure\n  44 result unavailable\n", failure)
+		_, _ = fmt.Fprintf(w, "  1 %s\n  9 transport failure\n  44 result unavailable (reason on stderr)\n", failure)
 		if op == "result" {
-			_, _ = fmt.Fprintln(w, "  12 background download in progress")
+			_, _ = fmt.Fprintln(w, "  12 background download in progress\n  124 observation timeout\n  130 observation canceled")
 		}
 		if op == "apply" {
 			_, _ = fmt.Fprintln(w, "  10 changes applied but Git status failed")
@@ -258,7 +258,18 @@ func ctlFlagHelp(op, key string) string {
 		if op == "exec" || op == "run" {
 			return "command runtime `DURATION` (defaults to no deadline)"
 		}
+		if op == "result" {
+			return fmt.Sprintf("limit --wait to `DURATION` (defaults to CXRUN_MONITOR_TIMEOUT or %s)", defaultMonitorTimeout)
+		}
 		return fmt.Sprintf("observation `DURATION` (defaults to CXRUN_MONITOR_TIMEOUT or %s)", defaultMonitorTimeout)
+	case "wait":
+		if op == "result" {
+			return "wait for the selected turn to seal and collect it. By default, select the active turn or the latest sealed turn when idle"
+		}
+	case "turn":
+		if op == "result" {
+			return "select turn `N`. Use --wait to wait for that turn to seal"
+		}
 	case "cursor":
 		if op == "wait" || op == "chat-wait" {
 			return "consumer cursor `NAME` (defaults to default)"

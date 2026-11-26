@@ -78,7 +78,7 @@ Pass durations such as `15s` or `2m` to deadline flags.
 | `--turn-timeout` / `--idle-exit` | 6 hours per agent turn / 30 minutes idle. |
 | `--approval-timeout` | 2 minutes on engines that support approvals. |
 | `--stall` | 10 minutes without agent events; 0 disables stall handling. |
-| Wait and follow observation | 24 hours, or `CXRUN_MONITOR_TIMEOUT` when set. An observation deadline leaves the job running. |
+| Wait, follow, and `result --wait` observation | 24 hours, or `CXRUN_MONITOR_TIMEOUT` when set. An observation deadline leaves the job running. |
 
 Direct agent starts can set `--cmd-stall` (30 minutes for a silent command within a turn) and `--max-restarts` (3 automatic engine restarts per job).
 
@@ -129,5 +129,5 @@ Read `cx COMMAND --help` for the codes relevant to an operation. `cx node states
 | 11 | Node observation did not find a registered job. |
 | 12 | Result download in progress. Retry or use `result --wait`. |
 | 13 | Admission notice when stdout is JSON with `status: "queued"`. The job remains queued. |
-| 44 | Result or required sealed turn unavailable. |
+| 44 | Result or required sealed turn unavailable. The reason is printed to stderr. |
 | 124 / 130 | Observation timed out or was canceled. |

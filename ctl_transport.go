@@ -297,6 +297,8 @@ func nodeCLI(ctx context.Context, args []string) error {
 			return errors.New("invalid clean arguments")
 		case "result-download":
 			return nodeResult(ctx, args[1:])
+		case "observe-result":
+			return nodeObserveResult(ctx, args[1:])
 		case "fetch-turn":
 			return workerFetch(ctx, args[1:])
 		case "start-job":
@@ -407,7 +409,7 @@ func (h endpoint) transportCommand(ctx context.Context, args []string, idle time
 	for len(watch) > 2 && watch[0] == "forward" {
 		watch = watch[2:]
 	}
-	live := len(watch) > 0 && (watch[0] == "channel" || watch[0] == "wait-poll" || watch[0] == "observe-one" || watch[0] == "follow")
+	live := len(watch) > 0 && (watch[0] == "channel" || watch[0] == "wait-poll" || watch[0] == "observe-one" || watch[0] == "observe-result" || watch[0] == "follow")
 	if live {
 		argv[1] = "watch-wire"
 	}

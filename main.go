@@ -1159,6 +1159,10 @@ func main() {
 	if err := dispatch(ctx, os.Args[1:]); err != nil {
 		var code ctlExit
 		if errors.As(err, &code) {
+			var reason resultUnavailable
+			if errors.As(err, &reason) {
+				diagnosticf("cx: %s\n", reason)
+			}
 			os.Exit(int(code))
 		}
 		switch {

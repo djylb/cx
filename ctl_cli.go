@@ -198,6 +198,9 @@ func parseCtl(op string, args []string) (ctlOptions, error) {
 	if op == "result" && (o.json && o.log || o.full && (o.json || o.log)) {
 		return o, errors.New("--full, --json and --log are mutually exclusive")
 	}
+	if op == "result" && o.timeout != "" && !o.wait {
+		return o, errors.New("--timeout requires --wait")
+	}
 	if o.max < 0 {
 		return o, errors.New("negative output budget")
 	}
@@ -376,7 +379,7 @@ func controller(ctx context.Context, a []string) error {
 	if e != nil {
 		return e
 	}
-	if id != "" && op != "clean" {
+	if id != "" && op != "clean" && !(op == "result" && o.wait) {
 		var d time.Duration
 		if op == "tail" || op == "wait" {
 			d, e = observation(o.timeout)

@@ -57,7 +57,7 @@ Jobs run on their hosts without the controller: a dispatched job needs no connec
 
 ## Collect, review, and clean up
 
-1. Use `cx result JOB --wait` for the report, `--json` for metadata and artifact paths, or `--log` for the full log. Choose a historical sealed turn with `--turn N`. Without `--wait`, exit 12 means collection is underway. For a full report, add `--full`.
+1. Use `cx result JOB --wait` for the report, `--json` for metadata and artifact paths, or `--log` for the full log. With `--wait`, cx waits for the turn active when it first observes the job, or collects the latest sealed turn if the job is idle. Use `--turn N` to select a specific turn, including a future turn. The observation deadline is set by `--timeout`, `CXRUN_MONITOR_TIMEOUT`, or the 24-hour default. Exit 124 means the wait timed out. Exit 44 reports why the result is unavailable on stderr. Without `--wait`, exit 12 means collection is underway. For a full report, add `--full`.
 2. Inspect `cx patch JOB` for statistics and `cx patch JOB --full --repo PATH` for the selected repository's patch. Use `cx apply JOB` after review, then commit through the project's Git workflow.
 3. By default, patches are cumulative from the dispatch snapshot. If turn 1 is already applied and committed, inspect turn 2 with `cx patch JOB --turn 2 --incremental`. Use `cx apply JOB --since-turn 2` to apply turn 2 through the latest sealed turn, using turn 1 as the base. Run incremental operations from the submitting controller.
 4. On conflicts, `apply` reports the files and leaves the selected repositories untouched. Choose `--allow-conflicts` to write the merge with conflict markers and unmerged index entries, or `cx rebase JOB TEXT` to dispatch a follow-up against a fresh snapshot.
