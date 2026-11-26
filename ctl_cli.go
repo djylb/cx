@@ -379,7 +379,7 @@ func controller(ctx context.Context, a []string) error {
 	if e != nil {
 		return e
 	}
-	if id != "" && op != "clean" && !(op == "result" && o.wait) {
+	if id != "" && op != "clean" && (op != "result" || !o.wait) {
 		var d time.Duration
 		if op == "tail" || op == "wait" {
 			d, e = observation(o.timeout)
