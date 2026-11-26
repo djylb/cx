@@ -85,6 +85,11 @@ func decodeWaitBaseline(b []byte) (map[string]waitCursor, error) {
 
 func validateWaitBaseline(baseline map[string]waitCursor) error {
 	for id, before := range baseline {
+		// An empty state cursor means the job had no readable state log when the
+		// baseline was taken; polling treats it as "no position" and resumes.
+		if before.StateCursor == "" {
+			continue
+		}
 		if _, err := parseCursor(before.StateCursor); err != nil {
 			return fmt.Errorf("wait baseline for %s: %w", id, err)
 		}

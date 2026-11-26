@@ -205,3 +205,12 @@ func TestEnvFileExpansion(t *testing.T) {
 		t.Fatalf("%v", env)
 	}
 }
+
+func TestWaitBaselineAcceptsEmptyStateCursor(t *testing.T) {
+	if err := validateWaitBaseline(map[string]waitCursor{"old/job": {}, "new/job": {StateCursor: "1:0:1"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateWaitBaseline(map[string]waitCursor{"bad/job": {StateCursor: "x"}}); err == nil {
+		t.Fatal("malformed cursor accepted")
+	}
+}
