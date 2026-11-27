@@ -141,7 +141,7 @@ func submitRebase(ctx context.Context, host, dest, result, id string, req rebase
 		if submitErr != nil || done {
 			return submitErr
 		}
-		return queueJob(ctx, queued, true)
+		return queueJob(ctx, queued, true, true)
 	}
 	if !os.IsNotExist(err) {
 		return err

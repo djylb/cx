@@ -31,7 +31,7 @@ func TestJobStorageDoesNotReplaceFiles(t *testing.T) {
 		"ctl_node.go":            {"hostSettings": 1},
 		"ctl_observe.go":         {"ctlWaitAny": 1, "saveLSSnapshot": 1}, // Controller-local ls cache, replaced whole.
 		"ctl_project.go":         {"ctlProject": 1},
-		"ctl_queue.go":           {"deployJob": 1, "submissionWorker": 3},
+		"ctl_queue.go":           {"deployJob": 1, "submissionWorker": 3, "queueJob": 1},                            // A failed submission request is replaced under the submit lock.
 		"ctl_rebase.go":          {"ctlRebase": 2, "recordRebaseFailure": 1, "dispatchRebase": 1, "claimRebase": 1}, // Controller-local pending rebase requests, replaced whole.
 		"ctl_result.go":          {"sealTurn": 1, "unpackTurn": 1, "publishResultMarker": 1, "forgetResult": 1, "Write": 1},
 		"ctl_route.go":           {"rememberRoute": 1},

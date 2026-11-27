@@ -926,3 +926,84 @@ func TestB3RetryWindow(t *testing.T) {
 		t.Fatal(attempts, err)
 	}
 }
+
+func TestB3FailedSubmissionReplacementAndClean(t *testing.T) {
+	f := newControllerFixture(t)
+	src := filepath.Join(f.home, "input")
+	if err := os.Mkdir(src, 0700); err != nil {
+		t.Fatal(err)
+	}
+	payload := filepath.Join(src, "payload")
+	if err := os.WriteFile(payload, []byte("old"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	old := SnapshotID(strings.TrimSpace(string(cliOutput(t, 0, nil, f.cx, "snapshot", src))))
+	seed := func(host, id string) string {
+		t.Helper()
+		dir, err := submissionDir(host, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = os.MkdirAll(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		q := queuedJob{Request: jobSubmission{Host: host, ID: id, Snapshot: old}}
+		data, err := json.Marshal(q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = snapImmutable(filepath.Join(dir, "input.json"), data); err != nil {
+			t.Fatal(err)
+		}
+		if err = writeJSON(filepath.Join(dir, "submission.json"), submissionProgress{State: "submit_failed", Reason: "fixture disconnect"}); err != nil {
+			t.Fatal(err)
+		}
+		if err = rememberRoute(id, host); err != nil {
+			t.Fatal(err)
+		}
+		return dir
+	}
+
+	t.Run("replace", func(t *testing.T) {
+		dir := seed("local", "p/retry")
+		if err := os.WriteFile(payload, []byte("new"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		args := []string{"local", src, "retry", "--cmd", "--sync", "--", "sh", "-c", "cat payload"}
+		_, diag := cliStreams(t, 2, nil, f.cx, append([]string{"run"}, args...)...)
+		if !strings.Contains(diag, "--force") {
+			t.Errorf("missing retry guidance: %s", diag)
+		}
+		cliOutput(t, 0, nil, f.cx, append([]string{"run", "--force"}, args...)...)
+		var q queuedJob
+		if err := readJSON(filepath.Join(dir, "input.json"), &q); err != nil || q.Request.Snapshot == "" || q.Request.Snapshot == old {
+			t.Fatalf("replacement snapshot = %q, old = %q, error = %v", q.Request.Snapshot, old, err)
+		}
+		cliOutput(t, 0, nil, f.cx, "wait", "local:p/retry", "--timeout", "10s")
+	})
+
+	t.Run("clean", func(t *testing.T) {
+		dir := seed("offline", "p/failed")
+		config := filepath.Join(f.home, ".config", "cx", "hosts.toml")
+		if err := os.MkdirAll(filepath.Dir(config), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(config, []byte("[hosts.offline]\nssh = 'fixture'\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(f.home, "ssh"), []byte("#!/bin/sh\nexit 255\n"), 0700); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("PATH", f.home+string(os.PathListSeparator)+os.Getenv("PATH"))
+		cliOutput(t, 0, nil, f.cx, "clean", "offline:p/failed")
+		route, err := routePath("p/failed")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, path := range []string{filepath.Join(dir, "input.json"), filepath.Join(dir, "submission.json"), route} {
+			if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+				t.Errorf("failed record remains at %s: %v", path, statErr)
+			}
+		}
+	})
+}

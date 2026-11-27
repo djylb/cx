@@ -395,7 +395,7 @@ func ctlSubmitWithRebase(ctx context.Context, hs endpoints, op string, o ctlOpti
 	if e = forgetResult(host, id); e != nil {
 		return e
 	}
-	if e = queueJob(ctx, queuedJob{Request: req, Origin: origin, Rebase: rebase.key}, o.sync || o.inplace || op == "agent"); e != nil {
+	if e = queueJob(ctx, queuedJob{Request: req, Origin: origin, Rebase: rebase.key}, o.sync || o.inplace || op == "agent", o.force); e != nil {
 		return e
 	}
 	if op == "agent" {

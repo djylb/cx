@@ -105,7 +105,7 @@ func deployJob(ctx context.Context, h endpoint, q queuedJob, report func(string,
 	}
 	return writeJSON(origin, q.Origin)
 }
-func queueJob(ctx context.Context, q queuedJob, sync bool) error {
+func queueJob(ctx context.Context, q queuedJob, sync, force bool) error {
 	req := q.Request
 	dir, e := submissionDir(req.Host, req.ID)
 	if e != nil {
@@ -124,18 +124,40 @@ func queueJob(ctx context.Context, q queuedJob, sync bool) error {
 	if e != nil {
 		return e
 	}
-	if e = snapImmutable(input, data); e != nil {
+	worker, e := lockPath(filepath.Join(dir, "worker.lock"), os.O_CREATE)
+	if e != nil {
+		return e
+	}
+	var failed bool
+	if worker != nil {
+		defer func() {
+			if worker != nil {
+				closeBestEffort(worker)
+			}
+		}()
+		s, progressErr := readInactiveSubmissionProgress(dir)
+		if progressErr != nil && !os.IsNotExist(progressErr) {
+			return progressErr
+		}
+		failed = s.State == "submit_failed"
+	}
+	if failed {
+		if !force {
+			return errors.New("previous submission failed; use --force to resubmit")
+		}
+		e = atomicWrite(input, data)
+	} else {
+		e = snapImmutable(input, data)
+	}
+	if e != nil {
 		return e
 	}
 	if e = rememberRoute(req.ID, req.Host); e != nil {
 		return e
 	}
-	worker, e := lockPath(filepath.Join(dir, "worker.lock"), os.O_CREATE)
-	if e != nil {
-		return e
-	}
 	if worker != nil {
-		_ = worker.Close()
+		closeBestEffort(worker)
+		worker = nil
 		exe, launchErr := os.Executable()
 		if launchErr != nil {
 			return launchErr
@@ -253,8 +275,15 @@ func readSubmissionProgress(dir string) (submissionProgress, error) {
 	if err != nil || l == nil {
 		return s, err
 	}
-	_ = l.Close()
-	if err = readJSON(path, &s); err == nil && s.State == "submitting" {
+	defer closeBestEffort(l)
+	return readInactiveSubmissionProgress(dir)
+}
+
+// The caller owns worker.lock, so a submitting record is from a stopped worker.
+func readInactiveSubmissionProgress(dir string) (submissionProgress, error) {
+	var s submissionProgress
+	err := readJSON(filepath.Join(dir, "submission.json"), &s)
+	if err == nil && s.State == "submitting" {
 		s.State = "submit_failed"
 		s.Reason = "submission worker stopped before registration"
 		code := 125

@@ -280,12 +280,18 @@ func cleanControllerJob(ctx context.Context, h endpoint, host, id string) error 
 		return errors.New("job is still being submitted")
 	}
 	defer closeBestEffort(owner)
-	r, e := h.invoke(ctx, 90*time.Second, false, "clean-job", id)
-	if e != nil {
+	s, e := readInactiveSubmissionProgress(dir)
+	if e != nil && !os.IsNotExist(e) {
 		return e
 	}
-	if r.code != 0 {
-		return r.output()
+	if s.State != "submit_failed" {
+		r, invokeErr := h.invoke(ctx, 90*time.Second, false, "clean-job", id)
+		if invokeErr != nil {
+			return invokeErr
+		}
+		if r.code != 0 {
+			return r.output()
+		}
 	}
 	entries, e := os.ReadDir(dir)
 	if e != nil {
