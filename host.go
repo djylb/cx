@@ -28,17 +28,27 @@ func (h *hostConfig) minFreeBytes(total uint64) uint64 {
 	return max(defaultMinFreeBytes, total/defaultMinFreeDivisor)
 }
 
+func (h *hostConfig) cacheMaxBytes(total uint64) uint64 {
+	if h.CacheMaxBytes != nil {
+		return *h.CacheMaxBytes
+	}
+	if total == 0 {
+		return defaultCacheMaxBytes
+	}
+	return min(defaultCacheMaxBytes, total/10)
+}
+
 type hostConfig struct {
 	Profiles       map[string]hostProfile `json:"profiles,omitempty"`
 	Slots          map[string]int         `json:"slots"`
 	MinFreeBytes   *uint64                `json:"min_free_bytes,omitempty"`
+	CacheMaxBytes  *uint64                `json:"cache_max_bytes,omitempty"`
 	EnvFile        string                 `json:"env_file,omitempty"`
 	DefaultProfile string                 `json:"default_profile,omitempty"`
 	LoadCmd        string                 `json:"load_cmd"`
 	Psmux          string                 `json:"psmux,omitempty"`       // Windows: path of psmux.exe when it is not on PATH
 	MuxSocket      string                 `json:"mux_socket,omitempty"`  // tmux/psmux -L socket (e.g. a logged-in psmux server)
 	MuxSession     string                 `json:"mux_session,omitempty"` // existing psmux session that hosts jobs as windows
-	CacheMaxBytes  uint64                 `json:"cache_max_bytes"`
 }
 
 func defaultSlots() int {
@@ -54,7 +64,7 @@ func defaultSlots() int {
 
 func readHostConfig(root string) (*hostConfig, error) {
 	slots := defaultSlots()
-	host := &hostConfig{CacheMaxBytes: defaultCacheMaxBytes, Slots: map[string]int{
+	host := &hostConfig{Slots: map[string]int{
 		agentSlotClass: slots,
 		testSlotClass:  slots,
 		"system":       defaultSystemSlots,

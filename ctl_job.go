@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -49,7 +51,7 @@ func startNodeJob(ctx context.Context, raw string) error {
 		if receiptErr != nil || string(b) != raw {
 			return errors.New("job already registered with different input")
 		}
-		return printStatus(dir)
+		return printStatus(ctx, dir)
 	} else if !errors.Is(e, os.ErrNotExist) {
 		return e
 	}
@@ -129,7 +131,7 @@ func startNodeJob(ctx context.Context, raw string) error {
 		argv = append(argv, "--cmd", "--")
 		argv = append(argv, req.Command...)
 	}
-	if e = launchRunner(ctx, root, dir, work, argv, env, jobIdentity{}, bound, unlock); e != nil {
+	if e = launchRunner(ctx, root, dir, work, argv, env, jobIdentity{}, bound, unlock, os.Stdout); e != nil {
 		// Another submission of the same receipt can win the worker's
 		// operation lock after the launcher hands it off.
 		identity, current, _, readErr := captureJobIdentity(dir)
@@ -140,13 +142,13 @@ func startNodeJob(ctx context.Context, raw string) error {
 		if readErr != nil || string(data) != raw || identity.checkDir(dir) != nil {
 			return e
 		}
-		return json.NewEncoder(os.Stdout).Encode(current)
+		return json.NewEncoder(os.Stdout).Encode(current.view(statusTime(ctx)))
 	}
 	return nil
 }
 
 // The runner owns its lifetime. The caller waits only for registration.
-func launchRunner(ctx context.Context, root, dir, work string, argv []string, env map[string]string, source jobIdentity, workIdentity workspaceBinding, release func()) error {
+func launchRunner(ctx context.Context, root, dir, work string, argv []string, env map[string]string, source jobIdentity, workIdentity workspaceBinding, release func(), out io.Writer) error {
 	exe, e := os.Executable()
 	if e != nil {
 		return e
@@ -164,7 +166,7 @@ func launchRunner(ctx context.Context, root, dir, work string, argv []string, en
 		argv = append([]string{argv[0], "--expect-workspace", workIdentity.key}, argv[1:]...)
 	}
 	if runtime.GOOS == "windows" {
-		return launchMuxRunner(ctx, root, exe, dir, work, argv, env, expected, token, release)
+		return launchMuxRunner(ctx, root, exe, dir, work, argv, env, expected, token, release, out)
 	}
 	log, e := openJobFile(filepath.Join(work, "launch.log"), jobFileAppendCreate)
 	if e != nil {
@@ -186,12 +188,12 @@ func launchRunner(ctx context.Context, root, dir, work string, argv []string, en
 	release()
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
-	return awaitRunner(ctx, dir, expected, token, cmd.Process.Pid, done, "")
+	return awaitRunner(ctx, dir, expected, token, cmd.Process.Pid, done, "", out)
 }
 
 // A worker acknowledges ownership with its launch token or, for the command
 // handoff, the expected RunID and its first nonzero PID/terminal publication.
-func awaitRunner(ctx context.Context, dir, runID, token string, pid int, done <-chan error, rejected string) error {
+func awaitRunner(ctx context.Context, dir, runID, token string, pid int, done <-chan error, rejected string, out io.Writer) error {
 	end, stop := context.WithTimeout(ctx, 10*time.Second)
 	defer stop()
 	observer, err := openJobObservation(dir, stateCursor{}, runID)
@@ -211,7 +213,7 @@ func awaitRunner(ctx context.Context, dir, runID, token string, pid int, done <-
 		}
 		if (token != "" && s.LaunchID == token && (s.PID != 0 && (s.PID == pid || pid == 0 || s.Engine == "cmd") || s.final)) ||
 			(token == "" && s.RunID == runID && (s.PID != 0 || s.final)) {
-			return json.NewEncoder(os.Stdout).Encode(s)
+			return json.NewEncoder(out).Encode(s.view(statusTime(ctx)))
 		}
 		if rejected != "" {
 			data, err := readSharedFile(rejected)
@@ -289,7 +291,7 @@ func ctlRestart(ctx context.Context, op string, o ctlOptions) error {
 	fmt.Println(host + ":" + child)
 	return nil
 }
-func restartNode(ctx context.Context, a []string) error {
+func restartNode(ctx context.Context, a []string, expected *jobIdentity, out io.Writer) error {
 	if len(a) != 7 {
 		return errors.New("invalid restart arguments")
 	}
@@ -318,12 +320,20 @@ func restartNode(ctx context.Context, a []string) error {
 	if e != nil {
 		return e
 	}
+	if expected != nil {
+		if *expected != identity {
+			return errJobReplaced
+		}
+		if !isTerminal(s.State) {
+			return nil
+		}
+	}
 	work, e := workDir(dir, s)
 	if e != nil {
 		return e
 	}
-	var saved config
-	if e = readJobConfig(dir, &saved); e != nil {
+	saved, prep, e := readRestartInputs(ctx, dir, work, s, expected != nil)
+	if e != nil {
 		return e
 	}
 	bound, e := bindWorkspace(root, saved.Dir)
@@ -342,6 +352,9 @@ func restartNode(ctx context.Context, a []string) error {
 		return e
 	}
 
+	if expected != nil && !isTerminal(s.State) {
+		return nil
+	}
 	switch op {
 	case "resume":
 		if e = checkResumeProfile(root, s.Profile, profile); e != nil {
@@ -358,16 +371,7 @@ func restartNode(ctx context.Context, a []string) error {
 	}
 	argv := []string{"resume", "--job", id}
 	env := map[string]string{"CX_PARENT": host + ":" + id}
-	prep, prepared, e := readPreparedSnapshot(ctx, work)
-	if e != nil {
-		return e
-	}
-	if prepared {
-		if _, err := os.Stat(prep.Source); os.IsNotExist(err) {
-			return errors.New("job checkout was reclaimed; submit a new job")
-		} else if err != nil {
-			return err
-		}
+	if prep != nil {
 		var manifest Manifest
 		if err := readJSON(filepath.Join(work, "input", "manifest.json"), &manifest); err != nil {
 			return err
@@ -382,9 +386,7 @@ func restartNode(ctx context.Context, a []string) error {
 		if err := validateSnapshotRepos(ctx, store, manifest); err != nil {
 			return fmt.Errorf("snapshot repository unavailable: %w", err)
 		}
-		for k, v := range prep.Env {
-			env[k] = v
-		}
+		maps.Copy(env, prep.Env)
 	}
 	if st, statErr := os.Stat(filepath.Join(work, "context")); statErr == nil && st.IsDir() {
 		env["CX_CONTEXT"] = filepath.Join(work, "context")
@@ -421,7 +423,7 @@ func restartNode(ctx context.Context, a []string) error {
 	if profile != "" {
 		argv = append(argv, "--profile", profile)
 	}
-	return launchRunner(ctx, root, dir, work, argv, env, identity, bound, unlock)
+	return launchRunner(ctx, root, dir, work, argv, env, identity, bound, unlock, out)
 }
 
 func continueNode(ctx context.Context, host, id, text, profile string) error {
@@ -440,10 +442,48 @@ func continueNode(ctx context.Context, host, id, text, profile string) error {
 	if e = checkResumeProfile(root, s.Profile, profile); e != nil {
 		return e
 	}
-	if isTerminal(s.State) && s.Thread != "" {
-		if e = restartNode(ctx, []string{"resume", host, id, "", "", "", ""}); e != nil {
-			return e
+	return nodeAction(ctx, []string{"say", id, host, "--cx-text", text})
+}
+
+// readRestartInputs checks the saved thread and workspace used by automatic
+// resume. Explicit restart may recreate a first turn without a saved thread.
+func readRestartInputs(ctx context.Context, dir, work string, s status, requireThread bool) (config, *PreparedSnapshot, error) {
+	var saved config
+	if requireThread {
+		if s.Engine == "cmd" {
+			return saved, nil, errors.New("command jobs cannot be replayed by resume")
+		}
+		if s.Thread == "" {
+			return saved, nil, errors.New("job has no saved thread to resume")
 		}
 	}
-	return nodeAction(ctx, []string{"say", id, "--cx-text", text})
+	if err := readJobConfig(dir, &saved); err != nil {
+		return saved, nil, err
+	}
+
+	var prep *PreparedSnapshot
+	source := saved.Dir
+	if work != dir {
+		p, prepared, err := readPreparedSnapshot(ctx, work)
+		if err != nil {
+			return saved, nil, err
+		}
+		if prepared {
+			prep, source = &p, p.Source
+		}
+	}
+	if source == "" && prep == nil {
+		return saved, nil, nil
+	}
+	info, err := os.Stat(source)
+	switch {
+	case os.IsNotExist(err) && prep != nil:
+		return saved, nil, errors.New("job checkout was reclaimed; submit a new job")
+	case err != nil:
+		return saved, nil, err
+	case !info.IsDir():
+		return saved, nil, fmt.Errorf("working directory is not a directory: %s", source)
+	default:
+		return saved, prep, nil
+	}
 }

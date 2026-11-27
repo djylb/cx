@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"os"
 	"os/exec"
@@ -32,7 +33,7 @@ type muxWindow struct {
 	Name    string `json:"name"`
 }
 
-func (w muxWindow) launchArgs(argv ...string) []string {
+func (w *muxWindow) launchArgs(argv ...string) []string {
 	if w.Session == w.Name {
 		return append([]string{"-L", w.Socket, "new-session", "-d", "-s", w.Session, "--"}, argv...)
 	}
@@ -123,7 +124,7 @@ func runMuxWorker(ctx context.Context, path string) (result error) {
 	}
 	return err
 }
-func launchMuxRunner(ctx context.Context, root, exe, dir, work string, argv []string, env map[string]string, runID, token string, release func()) error {
+func launchMuxRunner(ctx context.Context, root, exe, dir, work string, argv []string, env map[string]string, runID, token string, release func(), out io.Writer) error {
 	window, err := newMuxWindow(root)
 	if err != nil {
 		return err
@@ -136,7 +137,7 @@ func launchMuxRunner(ctx context.Context, root, exe, dir, work string, argv []st
 	}
 	defer dispose()
 	release()
-	return awaitRunner(ctx, dir, runID, token, 0, nil, path+".rejected")
+	return awaitRunner(ctx, dir, runID, token, 0, nil, path+".rejected", out)
 }
 
 func newMuxWindow(root string) (*muxWindow, error) {

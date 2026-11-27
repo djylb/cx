@@ -148,7 +148,7 @@ func TestControllerListSubmissionReceipts(t *testing.T) {
 	}
 	listing := cliOutput(t, 0, nil, f.cx, "ls", "--json", "--session", "suite", "--role", "worker")
 	got := make(map[string]submissionProgress)
-	for _, line := range bytes.Split(bytes.TrimSpace(listing), []byte("\n")) {
+	for line := range bytes.SplitSeq(bytes.TrimSpace(listing), []byte("\n")) {
 		var row submissionProgress
 		if err := json.Unmarshal(line, &row); err != nil {
 			t.Fatal(err)

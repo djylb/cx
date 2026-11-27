@@ -25,7 +25,7 @@ func TestRecoveryAndRotationAfterFirstSegmentReclaimed(t *testing.T) {
 			t.Fatal(recordErr)
 		}
 		rec.ID = id
-		msg, recordErr := appendInbox(t.Context(), dir, rec, nil)
+		msg, recordErr := appendInbox(t.Context(), dir, nil, rec, nil)
 		if recordErr != nil {
 			t.Fatal(recordErr)
 		}

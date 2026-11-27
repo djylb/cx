@@ -101,8 +101,7 @@ func TestPreswitchCacheAndDiskAdmission(t *testing.T) {
 	const repo = "command-src"
 	source := prepareCacheFixture(t, root, "p", repo)
 	makeCacheFixture(t, cache, 1000)
-	goCache := filepath.Join(f.home, "go-cache")
-	t.Setenv("GOCACHE", goCache)
+	t.Setenv("GOCACHE", filepath.Join(f.home, "go-cache"))
 	cliOutput(t, 0, nil, f.cx, "exec", "local", "--cwd", source, "--tag", "disk", "--queue-timeout", "2m", "--", "sh", "-c", "printf \"%s\\n%s\\n\" \"$CARGO_TARGET_DIR\" \"$GOCACHE\"")
 	t.Cleanup(func() { cliOutput(t, 0, nil, f.cx, "close", "local:p/disk") })
 	dir := filepath.Join(root, "p", "disk")
@@ -157,7 +156,7 @@ func TestPreswitchCacheAndDiskAdmission(t *testing.T) {
 		t.Fatalf("completed queue reason = %q, %v", done.QueueReason, err)
 	}
 	target := filepath.Join(cargoCachePath(root), "p", repo)
-	want := target + "\n" + goCache + "\n"
+	want := target + "\n" + filepath.Join(packageCachePath(root), "go-build") + "\n"
 	if string(out) != want {
 		t.Fatalf("build env = %q, want %q", out, want)
 	}
@@ -260,7 +259,7 @@ func TestQueueNoticePreservesPendingWaitEvents(t *testing.T) {
 	if err := appendMail(ctx, dir, identity, "send-1", &mail); err != nil {
 		t.Fatal(err)
 	}
-	baseline := map[string]waitCursor{"j": {RunID: c.RunID, StateCursor: start.String()}}
+	baseline := map[string]waitCursor{"j": {DirKey: identity.key, RunID: c.RunID, StateCursor: start.String()}}
 	expect := func(code int, finished int64, mailSeq uint64) {
 		t.Helper()
 		report, err := pollWaitAny(ctx, root, nil, "", baseline)

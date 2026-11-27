@@ -507,8 +507,12 @@ func fetchTurn(ctx context.Context, h endpoint, id, gen, turn, dest string, deta
 }
 
 func fetchResultTurn(ctx context.Context, h endpoint, id, dest string, details bool, target observedResult) error {
-	ctx, cancel := context.WithTimeout(ctx, collectLimit)
+	ctx, cancel := timeshim.WithTimeout(ctx, timeshim.Or(contextClock(ctx)), collectLimit)
 	defer cancel()
+	return collectResultTurn(ctx, h, id, dest, details, target)
+}
+
+func collectResultTurn(ctx context.Context, h endpoint, id, dest string, details bool, target observedResult) error {
 	lock, e := transferLock(ctx, dest+".lock")
 	if e != nil {
 		return e
@@ -536,7 +540,11 @@ func fetchResultTurn(ctx context.Context, h endpoint, id, dest string, details b
 	if e = f.Close(); e != nil {
 		return e
 	}
-	return installResultTurn(ctx, partial, dest, target)
+	if e = installResultTurn(ctx, partial, dest, target); e != nil {
+		return e
+	}
+	removeBestEffort(dest + ".total")
+	return nil
 }
 
 func installResultTurn(ctx context.Context, partial, dest string, target observedResult) error {
@@ -658,7 +666,7 @@ func selectResultTurn(ctx context.Context, h endpoint, id, turn string, wait boo
 		}
 		if !isTerminal(s.State) {
 			deadline, _ := ctx.Deadline()
-			r, err = h.call(ctx, time.Until(deadline), "observe-result", id, target.RunID, strconv.FormatInt(target.Number, 10))
+			r, err = h.call(ctx, deadline.Sub(timeshim.Or(contextClock(ctx)).Now()), "observe-result", id, target.RunID, strconv.FormatInt(target.Number, 10))
 			if err != nil {
 				return s, target, err
 			}
@@ -685,27 +693,34 @@ func selectResultTurn(ctx context.Context, h endpoint, id, turn string, wait boo
 
 func ctlResult(ctx context.Context, host, id, op string, o ctlOptions) (err error) {
 	wait := op == "result" && o.wait
-	if wait {
+	if op == "result" {
 		limit, e := observation(o.timeout)
 		if e != nil {
 			return e
 		}
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, limit)
+		ctx, cancel = timeshim.WithTimeout(ctx, timeshim.Or(contextClock(ctx)), limit)
 		defer cancel()
 		defer func() {
-			if err != nil && ctx.Err() != nil {
+			if err != nil && ctx.Err() != nil && !errors.Is(err, ctlExit(44)) {
 				err = ctx.Err()
 			}
 		}()
-		if handled, e := observeSubmission(ctx, host, id, "wait", limit); handled || e != nil {
-			return e
+		if wait {
+			if handled, e := observeSubmission(ctx, host, id, "wait", limit); handled || e != nil {
+				return e
+			}
 		}
+	}
+	fetch := fetchResultTurn
+	if op == "result" && o.timeout != "" {
+		// The explicit command deadline also bounds collection.
+		fetch = collectResultTurn
 	}
 	details := o.json || o.log
 	if op == "result" || op == "patch" {
 		if o.turn != "" && !o.refresh && !o.incremental {
-			cached, e := cachedResultDir(host, id, o.turn, details)
+			cached, e := cachedResultDir(host, id, o.turn, details, o.path)
 			if e != nil {
 				return e
 			}
@@ -759,26 +774,19 @@ func ctlResult(ctx context.Context, host, id, op string, o ctlOptions) (err erro
 			return e
 		}
 	}
-	if _, e = os.Stat(filepath.Join(dest, "result.json")); os.IsNotExist(e) {
-		if op == "result" && !o.wait && (details || s.CompletedStatus != "failed") {
-			if !o.refresh {
-				var failure fetchFailure
-				if e = readJSON(dest+".error", &failure); e == nil && failure.Code != 9 && (failure.Code != 44 || !readyResult(s)) {
-					if failure.Code == 44 {
-						if failure.Message == "" || failure.Message == ctlExit(44).Error() {
-							return unsealedTurn(n)
-						}
-						return resultUnavailable(failure.Message)
-					}
-					diagnosticf("%v\n", failure.Message)
-					return ctlExit(failure.Code)
-				}
-			}
-			return backgroundFetch(host, id, s.RunID, turn, dest, o)
+	if o.path {
+		cached, err := cachedResultReport(dest, target)
+		if err != nil {
+			return err
 		}
-		if e = fetchResultTurn(ctx, h, id, dest, details, target); e != nil {
-			if op == "agent" && errors.Is(e, ctlExit(9)) {
-				return backgroundFetch(host, id, s.RunID, turn, dest, ctlOptions{})
+		if cached != "" {
+			return displayTurn(ctx, cached, id, op, o)
+		}
+	}
+	if _, e = os.Stat(filepath.Join(dest, "result.json")); os.IsNotExist(e) {
+		if e = fetch(ctx, h, id, dest, details, target); e != nil {
+			if op == "result" && !errors.Is(e, ctlExit(44)) {
+				return resultUnavailable(fmt.Sprintf("collect turn %d for %s: %v", n, id, e))
 			}
 			return e
 		}
@@ -789,13 +797,10 @@ func ctlResult(ctx context.Context, host, id, op string, o ctlOptions) (err erro
 			return e
 		}
 	}
-	if op == "apply" || op == "rebase" || since > 1 {
+	if op == "apply" || since > 1 {
 		var m turnResult
 		if e = readJSON(filepath.Join(dest, "result.json"), &m); e != nil {
 			return e
-		}
-		if op == "rebase" {
-			return rebaseTurn(ctx, dest, host, id, o.dir, o.session, m)
 		}
 		patchDir := dest
 		if since > 1 {
@@ -820,54 +825,24 @@ func ctlResult(ctx context.Context, host, id, op string, o ctlOptions) (err erro
 			}
 		}
 		if op == "apply" {
-			return applyTurn(ctx, dest, patchDir, id, host, since, o, m)
+			return applyTurn(ctx, dest, patchDir, id, host, target.RunID, since, o, m)
 		}
 		return displayTurn(ctx, patchDir, id, op, o)
 	}
 	return displayTurn(ctx, dest, id, op, o)
 }
-func workerFetch(ctx context.Context, a []string) error {
-	details, e := resultDetailsArg(a)
-	if e != nil {
-		return e
-	}
-	n, e := strconv.ParseUint(a[3], 10, 63)
-	if e != nil {
-		return e
-	}
-	t := strconv.FormatUint(n, 10)
-	dest, e := resultDest(a[0], a[1], a[2], t)
-	if e != nil {
-		return e
-	}
-	dest = resultVariant(dest, details)
-	hs, e := loadEndpoints()
-	if e != nil {
-		return e
-	}
-	h, e := hs.get(a[0])
-	if e != nil {
-		return e
-	}
-	ctx, cancel := context.WithTimeout(ctx, collectLimit)
-	defer cancel()
-	l, e := lockPath(dest+".worker", os.O_CREATE)
-	if e != nil || l == nil {
-		return e
-	}
-	defer closeBestEffort(l)
-	e = retryTransfer(ctx, func() error { return fetchTurn(ctx, h, a[1], a[2], t, dest, details) })
-	if e != nil {
-		code := ctlExit(1)
-		errors.As(e, &code)
-		return errors.Join(e, writeJSON(dest+".error", fetchFailure{Code: int(code), Message: e.Error()}))
-	}
-	if err := os.Remove(dest + ".error"); err != nil && !os.IsNotExist(err) {
+func displayTurn(ctx context.Context, dir, id, op string, o ctlOptions) error {
+	if o.path {
+		path, err := resultReportPath(dir)
+		if err != nil {
+			return err
+		}
+		if err := checkResultReport(path); err != nil {
+			return resultUnavailable(err.Error())
+		}
+		_, err = fmt.Fprintln(os.Stdout, path)
 		return err
 	}
-	return nil
-}
-func displayTurn(ctx context.Context, dir, id, op string, o ctlOptions) error {
 	if o.json || o.log {
 		return displayResultDetails(os.Stdout, dir, id, o.log)
 	}
@@ -881,7 +856,7 @@ func displayTurn(ctx context.Context, dir, id, op string, o ctlOptions) error {
 			return errors.Join(previewErr, e)
 		}
 		if op == "result" && !o.full {
-			report, pathErr := filepath.Abs(filepath.Join(dir, "last.md"))
+			report, pathErr := resultReportPath(dir)
 			if pathErr != nil {
 				return errors.Join(pathErr, e)
 			}
@@ -1060,62 +1035,6 @@ func prefetchResult(ctx context.Context, h endpoint, host, id, marker string, se
 	}
 }
 
-type fetchFailure struct {
-	Message string
-	Code    int
-}
-
-func backgroundFetch(host, id, gen, turn, dest string, o ctlOptions) error {
-	details := o.json || o.log
-	lock, e := lockPath(dest+".worker", os.O_CREATE)
-	if e != nil {
-		return e
-	}
-	if lock != nil {
-		exe, e := os.Executable()
-		if e != nil {
-			_ = lock.Close()
-			return e
-		}
-		args := []string{"node", "fetch-turn", host, id, gen, turn}
-		if details {
-			args = append(args, "details")
-		}
-		cmd := exec.Command(exe, args...)
-		_ = lock.Close()
-		if e = startDetachedWorker(cmd); e != nil {
-			return e
-		}
-		go func() { _ = cmd.Wait() }()
-	}
-	count := int64(0)
-	if st, e := os.Stat(dest + ".part"); e == nil {
-		count = st.Size()
-	}
-	var total *int64
-	size := "?"
-	if readJSON(dest+".total", &total) == nil && total != nil {
-		size = strconv.FormatInt(*total, 10)
-	}
-	if details {
-		diagnosticf("collecting turn=%s bytes=%d/%s\n", turn, count, size)
-	} else {
-		fmt.Printf("collecting turn=%s bytes=%d/%s\n", turn, count, size)
-	}
-	if o.json {
-		n, e := strconv.ParseInt(turn, 10, 64)
-		if e != nil {
-			return e
-		}
-		if e = json.NewEncoder(os.Stdout).Encode(fields{
-			"job": id, "status": "collecting", "turn": n, "bytes": count, "total": total,
-		}); e != nil {
-			return e
-		}
-	}
-	return ctlExit(12)
-}
-
 type resultReference struct {
 	Generation string
 	Turn       int64
@@ -1186,7 +1105,7 @@ func forgetResult(host, id string) error {
 	return writeJSON(path, resultReference{Epoch: old.Epoch + 1})
 }
 
-func cachedResultDir(host, id, turn string, details bool) (string, error) {
+func cachedResultDir(host, id, turn string, details, reportOnly bool) (string, error) {
 	_, ref, e := resultMarkerSnapshot(host, id)
 	if e != nil {
 		return "", e
@@ -1204,6 +1123,9 @@ func cachedResultDir(host, id, turn string, details bool) (string, error) {
 	d, e := resultDest(host, id, ref.Generation, strconv.FormatInt(n, 10))
 	if e != nil {
 		return "", e
+	}
+	if reportOnly {
+		return cachedResultReport(d, observedResult{RunID: ref.Generation, Number: n})
 	}
 	d = resultVariant(d, details)
 	if _, e = os.Stat(filepath.Join(d, "result.json")); os.IsNotExist(e) {

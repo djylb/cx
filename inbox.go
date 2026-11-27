@@ -3,12 +3,16 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
+	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/djylb/timeshim"
@@ -467,13 +471,69 @@ func (r *runner) ackInbox(record stateRecord, result string) error {
 	return nil
 }
 
-func publishMessage(ctx context.Context, dir, id string, msg inboxMessage) error {
+var msgName = regexp.MustCompile(`^[0-9]{19}-[0-9a-f]{16}\.msg$`)
+
+func prepareMessage(o options, args []string) (string, inboxMessage, error) {
+	structured := o.input != "" || len(o.images) > 0
+	var msg inboxMessage
+	if len(args) > 1 || !structured && len(args) == 0 {
+		if structured {
+			return "", msg, errors.New("expected at most one text argument")
+		}
+		return "", msg, errors.New("say requires text or @file")
+	}
+	var text string
+	if len(args) == 1 {
+		text = args[0]
+		if path, file := strings.CutPrefix(text, "@"); file {
+			var err error
+			if structured {
+				text, err = readInputText(path)
+			} else {
+				var b []byte
+				b, err = readSharedFile(path)
+				text = string(b)
+			}
+			if err != nil {
+				return "", msg, err
+			}
+		}
+	}
+	if structured {
+		input, err := o.inputs(text)
+		if err != nil {
+			return "", msg, err
+		}
+		msg.Input = input
+	} else {
+		if strings.TrimSpace(text) == "" {
+			return "", msg, errors.New("empty message")
+		}
+		msg.Text = text
+	}
+	name := os.Getenv("CXRUN_MSG_NAME")
+	if name == "" {
+		var nonce [8]byte
+		if _, err := rand.Read(nonce[:]); err != nil {
+			return "", msg, err
+		}
+		name = fmt.Sprintf("%019d-%x.msg", time.Now().UnixNano(), nonce)
+	} else if !msgName.MatchString(name) {
+		return "", msg, errors.New("invalid CXRUN_MSG_NAME")
+	}
+	if structured {
+		name = strings.TrimSuffix(name, ".msg") + ".input.msg"
+	}
+	return name, msg, nil
+}
+
+func publishMessage(ctx context.Context, dir, id string, msg inboxMessage, identity jobIdentity) error {
 	record, err := newRecord("msg", msg)
 	if err != nil {
 		return err
 	}
 	record.ID = id
-	_, err = appendInbox(ctx, dir, record, func(_ *stateRecord, previous stateRecord, s status) error {
+	_, err = appendInbox(ctx, dir, &identity, record, func(_ *stateRecord, previous stateRecord, s status) error {
 		if previous.Seq != 0 {
 			return nil
 		}
@@ -486,8 +546,8 @@ func publishMessage(ctx context.Context, dir, id string, msg inboxMessage) error
 	return err
 }
 
-func appendInbox(ctx context.Context, dir string, record stateRecord, prepare func(*stateRecord, stateRecord, status) error) (stateRecord, error) {
-	return appendJobMailbox(ctx, dir, "inbox", nil, record, prepare)
+func appendInbox(ctx context.Context, dir string, expected *jobIdentity, record stateRecord, prepare func(*stateRecord, stateRecord, status) error) (stateRecord, error) {
+	return appendJobMailbox(ctx, dir, "inbox", expected, record, prepare)
 }
 
 // pendingInboxMessages supplies the message IDs and sequence numbers that a

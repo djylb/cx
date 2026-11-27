@@ -137,7 +137,7 @@ func removeUnpublishedWorktree(mirror snapGit, dst string) error {
 	if err != nil {
 		return err
 	}
-	for _, field := range strings.Split(paths, "\x00") {
+	for field := range strings.SplitSeq(paths, "\x00") {
 		path, ok := strings.CutPrefix(field, "worktree ")
 		if ok && (filepath.Clean(path) == filepath.Clean(dst) || filepath.Clean(path) == actual) {
 			return mirror.worktree("remove", "--force", dst)
@@ -290,13 +290,6 @@ func Materialize(ctx context.Context, job string, m Manifest, target string) (Pr
 		out.Env["GOFLAGS"] = ""
 	}
 	if runtime.GOOS == "windows" {
-		tmp := filepath.Join(job, "tmp")
-		if e = os.MkdirAll(tmp, 0700); e != nil {
-			return out, e
-		}
-		for _, k := range []string{"TEMP", "TMP", "GOTMPDIR"} {
-			out.Env[k] = tmp
-		}
 		out.Env["PATH"] = os.Getenv("PATH") + string(os.PathListSeparator) + filepath.Join(os.Getenv("APPDATA"), "npm")
 	}
 	if e = publishPreparedSnapshot(job, out); e != nil {
@@ -309,17 +302,64 @@ func Materialize(ctx context.Context, job string, m Manifest, target string) (Pr
 	ok = true
 	return out, nil
 }
-func Collect(ctx context.Context, job string) (SnapshotResult, error) {
+func readCheckoutManifest(job string) (Manifest, error) {
 	var m Manifest
+	if err := readJSON(filepath.Join(job, "input", "manifest.json"), &m); err != nil {
+		return m, err
+	}
+	return m, m.validate()
+}
+
+// Resolve the checkout through its working directory so forks keep the same
+// repository roots as their source job.
+func snapshotMemberRoots(root, cwd string) ([]string, error) {
+	bound, err := bindWorkspace(root, cwd)
+	if err != nil {
+		return nil, err
+	}
+	for _, id := range bound.ids {
+		job := filepath.Join(root, ".work", id)
+		tree, err := filepath.EvalSymlinks(filepath.Join(job, "work", "tree"))
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		if !snapWithin(tree, bound.path) {
+			continue
+		}
+		m, err := readCheckoutManifest(job)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		if bound.path != filepath.Join(tree, m.Main) {
+			continue
+		}
+		roots := make([]string, 0, len(m.Repositories))
+		for _, repo := range m.Repositories {
+			dir := filepath.Join(tree, repo.Path)
+			physical, err := filepath.EvalSymlinks(dir)
+			if err != nil {
+				return nil, err
+			}
+			if physical != dir {
+				return nil, fmt.Errorf("snapshot repository root changed: %s", repo.Path)
+			}
+			roots = append(roots, dir)
+		}
+		return roots, nil
+	}
+	return nil, nil
+}
+
+func Collect(ctx context.Context, job string) (SnapshotResult, error) {
 	var out SnapshotResult
-	raw, e := readSharedFile(filepath.Join(job, "input/manifest.json"))
+	m, e := readCheckoutManifest(job)
 	if e != nil {
-		return out, e
-	}
-	if e = json.Unmarshal(raw, &m); e != nil {
-		return out, e
-	}
-	if e = m.validate(); e != nil {
 		return out, e
 	}
 	job, e = filepath.Abs(job)

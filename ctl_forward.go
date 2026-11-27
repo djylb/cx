@@ -123,12 +123,14 @@ func ctlForward(ctx context.Context, op string, args []string) error {
 	if e != nil {
 		return e
 	}
+	action := []string{"control-action", op, id}
 	if op == "say" {
 		if e = forgetResult(name, id); e != nil {
 			return e
 		}
+		action = append(action, name)
 	}
-	r, e := h.invoke(ctx, controlCallIdle, false, append([]string{"control-action", op, id}, argv...)...)
+	r, e := h.invoke(ctx, controlCallIdle, false, append(action, argv...)...)
 	if e != nil {
 		return e
 	}
@@ -230,24 +232,26 @@ func nodeAction(ctx context.Context, a []string) error {
 		return errors.New("invalid control action")
 	}
 	op, id := a[0], a[1]
+	operands := a[2:]
+	var host string
+	if op == "say" {
+		if len(operands) == 0 {
+			return errors.New("missing execution host")
+		}
+		host, operands = operands[0], operands[1:]
+	}
 	root, e := stateRoot()
 	if e != nil {
 		return e
 	}
+	if op == "say" {
+		if _, e = checkNodeStateFormat(root); e != nil {
+			return e
+		}
+	}
 	dir, e := jobDir(root, id)
 	if e != nil {
 		return e
-	}
-	if op == "say" {
-		var s status
-		if e = loadJobStatusInto(dir, &s); e != nil {
-			return e
-		}
-		if readyResult(s) {
-			if _, e = sealTurn(ctx, dir, s, s.Finished); e != nil {
-				return e
-			}
-		}
 	}
 	if op == "interrupt" {
 		var s status
@@ -258,32 +262,32 @@ func nodeAction(ctx context.Context, a []string) error {
 			op = "close"
 		}
 	}
-	argv := []string{op, "--job", id}
+	var argv []string
 	var textPath string
-	for i := 2; i < len(a); i++ {
-		switch a[i] {
+	for i := 0; i < len(operands); i++ {
+		switch operands[i] {
 		case "--":
-			argv = append(argv, a[i:]...)
-			i = len(a)
+			argv = append(argv, operands[i:]...)
+			i = len(operands)
 		case "--cx-image", "--cx-text":
-			if op != "say" || i+1 >= len(a) {
+			if op != "say" || i+1 >= len(operands) {
 				return errors.New("invalid attachment")
 			}
 			folder := filepath.Join(dir, "attachments")
 			if e = os.MkdirAll(folder, 0700); e != nil {
 				return e
 			}
-			data := []byte(a[i+1])
+			data := []byte(operands[i+1])
 			suffix := ".txt"
-			isText := a[i] == "--cx-text"
+			isText := operands[i] == "--cx-text"
 			i++
 			if !isText {
 				suffix = safeExt(string(data))
-				if i+1 >= len(a) {
+				if i+1 >= len(operands) {
 					return errors.New("missing image data")
 				}
 				i++
-				data, e = base64.StdEncoding.DecodeString(a[i])
+				data, e = base64.StdEncoding.DecodeString(operands[i])
 				if e != nil {
 					return e
 				}
@@ -298,13 +302,66 @@ func nodeAction(ctx context.Context, a []string) error {
 				argv = append(argv, "--image", path)
 			}
 		default:
-			argv = append(argv, a[i])
+			argv = append(argv, operands[i])
 		}
 	}
 	if textPath != "" {
 		argv = append(argv, "--", "@"+textPath)
 	}
-	return run(ctx, argv)
+	if op == "say" {
+		f := cliFlags(op)
+		var opts options
+		opts.flags(f, op)
+		if e = f.Parse(argv); e != nil {
+			return e
+		}
+		return say(ctx, dir, host, id, opts, f.Args())
+	}
+	return run(ctx, append([]string{op, "--job", id}, argv...))
+}
+
+func say(ctx context.Context, dir, host, id string, opts options, args []string) error {
+	identity, s, _, err := captureJobIdentity(dir)
+	if err != nil {
+		return err
+	}
+	if host != "" {
+		if _, err = projectJobStatus(ctx, dir, &s, identity); err != nil {
+			return err
+		}
+	}
+	if handled, err := opts.dispatch(ctx, dir, "say", args, &identity); handled {
+		return err
+	}
+	name, msg, err := prepareMessage(opts, args)
+	if err != nil {
+		return err
+	}
+	if host != "" {
+		if isTerminal(s.State) {
+			if len(msg.Input) != 0 && s.Engine != "cmd" {
+				eng, err := lookupEngine(s.Engine)
+				if err != nil {
+					return err
+				}
+				if err = eng.checkInput(msg.Input); err != nil {
+					return err
+				}
+			}
+			if err = restartNode(ctx, []string{"resume", host, id, "", "", "", ""}, &identity, io.Discard); err != nil {
+				return err
+			}
+		} else if readyResult(s) {
+			if _, err = sealTurn(ctx, dir, s, s.Finished); err != nil {
+				return err
+			}
+		}
+	}
+	if err = publishMessage(ctx, dir, name, msg, identity); err != nil {
+		return err
+	}
+	fmt.Println(name)
+	return nil
 }
 
 func emitRows(data []byte, key, value string) error {

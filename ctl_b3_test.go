@@ -81,7 +81,7 @@ func TestB3SnapshotResult(t *testing.T) {
 	}
 	cliOutput(t, 0, nil, f.cx, "run", "local", src, "roundtrip", "--cmd", "--", "sh", "-c", "echo changed > original && mkdir artifacts && echo asset > artifacts/test && echo report")
 	cliOutput(t, 0, nil, f.cx, "wait", "p/roundtrip", "--timeout", "2m")
-	// wait collects the result, so a plain result reads the cache (no exit 12).
+	// Wait collects the result, so a plain result reads the cache.
 	cliOutput(t, 0, nil, f.cx, "result", "p/roundtrip")
 	if got := cliOutput(t, 0, nil, f.cx, "result", "p/roundtrip", "--wait"); !bytes.Contains(got, []byte("artifacts/test (6 bytes)")) {
 		t.Fatal(string(got))
@@ -291,13 +291,58 @@ func TestB3AllRepositoryPreflight(t *testing.T) {
 		cliOutput(t, 0, nil, "git", "-C", repo, "add", ".")
 		cliOutput(t, 0, nil, "git", "-C", repo, "commit", "-qm", "fixture")
 	}
-	work := filepath.Join(root, "go.work")
-	if e := os.WriteFile(work, []byte("go 1.23\nuse (\n ./first\n ./second\n)\n"), 0600); e != nil {
-		t.Fatal(e)
+	ctx, cancel := fixtureContext(t)
+	defer cancel()
+	t.Setenv("GOWORK", "off")
+	t.Setenv("CX_SNAPSHOT_STORE", t.TempDir())
+	snapshot, manifest, err := Freeze(ctx, src, FreezeOptions{Repositories: []projectRepository{{Path: src}, {Path: other}}})
+	if err != nil {
+		t.Fatal(err)
 	}
-	t.Setenv("GOWORK", work)
-	cliOutput(t, 0, nil, f.cx, "run", "local", src, "merge", "--cmd", "--", "sh", "-c", "echo worker > a; echo worker > ../second/a")
-	cliOutput(t, 0, nil, f.cx, "wait", "p/merge", "--timeout", "2m")
+	checkout := t.TempDir()
+	if _, err = Materialize(ctx, checkout, manifest, ""); err != nil {
+		t.Fatal(err)
+	}
+	for _, repo := range manifest.Repositories {
+		if err = os.WriteFile(filepath.Join(checkout, "work", "tree", repo.Path, "a"), []byte("worker\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	result, err := Collect(ctx, checkout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const id, runID, turnID = "p/merge", "fixture-run", "fixture-turn"
+	if err = writeFixtureStatus(filepath.Join(f.home, "state", id), status{
+		Project: "p", Job: "merge", RunID: runID, State: "done", Session: "fixture",
+		Finished: 1, LastCompleted: turnID, CompletedStatus: "completed",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	dest, err := resultDest("local", id, runID, "1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.MkdirAll(dest, 0700); err != nil {
+		t.Fatal(err)
+	}
+	m := turnResult{Turn: 1, TurnID: turnID}
+	for _, repo := range result.Repositories {
+		if err = copyFile(filepath.Join(result.Dir, repo.Patch), filepath.Join(dest, repo.Patch)); err != nil {
+			t.Fatal(err)
+		}
+		m.Repositories = append(m.Repositories, turnPatch{SnapshotPatch: repo})
+	}
+	if err = writeJSON(filepath.Join(dest, "result.json"), m); err != nil {
+		t.Fatal(err)
+	}
+	origin, err := originFile("local", id, runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = writeJSON(origin, submissionOrigin{Source: src, Snapshot: snapshot}); err != nil {
+		t.Fatal(err)
+	}
 	if e := os.WriteFile(filepath.Join(other, "a"), []byte("local\n"), 0600); e != nil {
 		t.Fatal(e)
 	}
@@ -306,7 +351,27 @@ func TestB3AllRepositoryPreflight(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	cliOutput(t, 1, nil, f.cx, "apply", "p/merge")
+	otherIndex := filepath.Join(other, ".git", "index")
+	otherBefore, err := os.ReadFile(otherIndex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	patch := cliOutput(t, 0, nil, f.cx, "patch", "p/merge", "--full")
+	for _, repo := range []string{"first", "second"} {
+		if !bytes.Contains(patch, []byte("# repo: "+repo+"\n")) {
+			t.Fatalf("missing %s patch: %s", repo, patch)
+		}
+	}
+	for _, args := range [][]string{nil, {"--allow-conflicts"}} {
+		_, diag := cliStreams(t, 1, nil, f.cx, append([]string{"apply", "p/merge"}, args...)...)
+		if !strings.Contains(diag, "second/a") {
+			t.Fatalf("missing conflicting repository: %s", diag)
+		}
+	}
+	second, err := os.ReadFile(filepath.Join(other, "a"))
+	if err != nil || string(second) != "local\n" {
+		t.Fatalf("preflight changed second worktree: %q (%v)", second, err)
+	}
 	b, e := os.ReadFile(filepath.Join(src, "a"))
 	if e != nil || string(b) != "base\n" {
 		t.Fatal(string(b), e)
@@ -315,6 +380,19 @@ func TestB3AllRepositoryPreflight(t *testing.T) {
 	if e != nil || !bytes.Equal(before, after) {
 		t.Fatal("preflight changed first index", e)
 	}
+	otherAfter, err := os.ReadFile(otherIndex)
+	if err != nil || !bytes.Equal(otherBefore, otherAfter) {
+		t.Fatal("preflight changed second index", err)
+	}
+	if _, err = os.Stat(filepath.Join(f.home, "out", "p", "apply-log.jsonl")); !os.IsNotExist(err) {
+		t.Fatalf("conflicting apply wrote a log: %v", err)
+	}
+	cliOutput(t, 0, nil, f.cx, "apply", "p/merge", "--repo", "first")
+	second, err = os.ReadFile(filepath.Join(other, "a"))
+	if err != nil || string(second) != "local\n" {
+		t.Fatalf("single repository apply changed second worktree: %q (%v)", second, err)
+	}
+	cliOutput(t, 0, nil, "git", "-C", src, "reset", "--hard", "HEAD")
 	if e = os.WriteFile(filepath.Join(other, "a"), []byte("base\n"), 0600); e != nil {
 		t.Fatal(e)
 	}
@@ -325,7 +403,7 @@ func TestB3AllRepositoryPreflight(t *testing.T) {
 		}
 	}
 	log, e := os.ReadFile(filepath.Join(f.home, "out", "p", "apply-log.jsonl"))
-	if e != nil || bytes.Count(log, []byte("\n")) != 2 {
+	if e != nil || bytes.Count(log, []byte("\n")) != 3 {
 		t.Fatal(string(log), e)
 	}
 }
@@ -342,7 +420,7 @@ func TestB3InteractiveContinuation(t *testing.T) {
 		t.Fatal(e)
 	}
 	t.Setenv("CX_CONTEXT_DIR", ctxDir)
-	t.Setenv("FIXPROMPT", "Workflow\nProject context is available in $CX_CONTEXT.\n"+strings.TrimRight(jobToolsNote, "\n")+"\n\ntask")
+	t.Setenv("FIXPROMPT", "Workflow\nProject context is available in $CX_CONTEXT.\n"+jobToolsNote+strings.TrimRight(sandboxNote, "\n")+"\n\ntask")
 	out := cliOutput(t, 6, nil, f.cx, "agent", "--host", "local", "--dir", src, "--inplace", "--interactive", "--tag", "conversation", "--idle-exit", "2m", "task")
 	defer cliOutput(t, 0, nil, f.cx, "close", "local:p/conversation")
 	if !bytes.Contains(out, []byte("STATUS: QUESTION")) || !bytes.Contains(out, []byte("JOB=p/conversation STATUS=QUESTION")) {
@@ -784,7 +862,7 @@ func TestB3SessionScope(t *testing.T) {
 		goOut := cliOutput(t, 0, nil, f.cx, args...)
 		parse := func(b []byte) map[string]string {
 			v := map[string]string{}
-			for _, line := range bytes.Split(bytes.TrimSpace(b), []byte("\n")) {
+			for line := range bytes.SplitSeq(bytes.TrimSpace(b), []byte("\n")) {
 				var row status
 				if e := json.Unmarshal(line, &row); e != nil {
 					t.Fatal(e)

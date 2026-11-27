@@ -15,7 +15,7 @@ import (
 )
 
 // After `cx wait` reports a completed turn, `cx result` without --wait must read the
-// local cache rather than start a background download (exit 12).
+// local cache.
 func TestWaitPrefetchesResult(t *testing.T) {
 	f := newControllerFixture(t)
 	_, src, prompt := runnerFixture(t)
@@ -23,7 +23,7 @@ func TestWaitPrefetchesResult(t *testing.T) {
 	t.Setenv("CX_POLICY_DIR", f.home)
 	t.Setenv("CX_CONTEXT_DIR", t.TempDir())
 	t.Setenv("FIXMODE", "sealed-patches")
-	t.Setenv("FIXPROMPT", "Fixture\n"+strings.TrimRight(jobToolsNote, "\n")+"\n\ntask")
+	t.Setenv("FIXPROMPT", "Fixture\n"+jobToolsNote+strings.TrimRight(sandboxNote, "\n")+"\n\ntask")
 	if err := os.WriteFile(filepath.Join(f.home, "preamble.md"), []byte("Fixture"), 0600); err != nil {
 		t.Fatal(err)
 	}

@@ -44,7 +44,7 @@ var ctlCommands = map[string]ctlCommand{
 	"context":      {"push HOST", "Copy this controller's context layers to HOST for a manager running there.", ""},
 	"interrupt":    {"JOB", "Stop an active turn or command.", ""},
 	"limits":       {"JOB", "Read the engine account's rate limits.", ""},
-	"ls":           {"[JOB]", "List jobs.", "json watch interval project session role all all-hosts max-bytes"},
+	"ls":           {"[JOB]", "List jobs.", "brief json watch interval project session role all all-hosts max-bytes"},
 	"mcp":          {"JOB list|reload|login|resource|call", "Call an engine MCP operation.", ""},
 	"mirror":       {"[DIR | --project PROJECT]", "Publish a source baseline.", "project"},
 	"models":       {"JOB", "List the engine's available models.", ""},
@@ -57,10 +57,10 @@ var ctlCommands = map[string]ctlCommand{
 	"project-init": {projectInitUsage, "Initialize a project.", ""},
 	"project-ls":   {"", "List configured projects.", ""},
 	"project-show": {"NAME", "Print project configuration.", ""},
-	"rebase":       {"JOB TEXT", "Submit a follow-up to resolve patch conflicts.", submissionSessionFlags},
+	"rebase":       {"JOB TEXT", "Submit a follow-up to resolve patch conflicts.", "turn " + submissionSessionFlags},
 	"reply":        {"JOB [--request ID] (--result JSON|@FILE | --error JSON|@FILE)", "Reply to a pending engine request.", ""},
 	"requests":     {"JOB", "List pending engine requests.", ""},
-	"result":       {"JOB", "Collect a sealed turn's report, JSON metadata, or full log.", "turn full json log wait timeout refresh max-bytes"},
+	"result":       {"JOB", "Collect a sealed turn and show its report, path, metadata, or log.", "turn full json log path wait timeout refresh max-bytes"},
 	"resume":       {"JOB [--profile NAME]", "Restart a recoverable agent job.", "profile"},
 	"review":       {"JOB --target JSON|@FILE", "Start an engine review.", ""},
 	"rpc":          {"JOB METHOD", "Invoke an engine RPC method.", ""},
@@ -77,7 +77,7 @@ var ctlCommands = map[string]ctlCommand{
 	"undo":         {"JOB --before TURN", "Revert an agent thread to before a turn.", ""},
 	"usage":        {"JOB", "Read the engine account's usage.", ""},
 	"version":      {"", "Print the cx version.", ""},
-	"wait":         {"JOB [--timeout DURATION]\n  cx wait --any [options]", "Wait for a turn, job, admission block, or matching message.", "any timeout host project session cursor from-start chat all"},
+	"wait":         {"JOB [--timeout DURATION]\n  cx wait --any [options]", "Wait for a turn, job, admission block, or matching message.", "any timeout host project job session cursor from-start chat all"},
 }
 
 func cliFlags(name string) *flag.FlagSet {
@@ -169,7 +169,7 @@ func printCtlHelp(w io.Writer, op string) {
 		_, _ = fmt.Fprintln(w, "  A new cursor starts at each host's current job state. --from-start replays retained job history for a new cursor.")
 		_, _ = fmt.Fprintln(w, "  Host failures are reported and retried independently until the observation deadline.")
 		_, _ = fmt.Fprintln(w, "  Job events give turn (0 without a completed turn), next (a result command when available),")
-		_, _ = fmt.Fprintln(w, "  and rate_limited (true when a usage or rate limit ended the selected turn).")
+		_, _ = fmt.Fprintln(w, "  and rate_limited (true when a usage or rate limit ended the selected turn). On a rate limit, reset_at is Unix seconds or null.")
 	}
 	if cmd.flags != "" || isThinControl(op) || op == "fork" {
 		_, _ = fmt.Fprintln(w, "Unspecified flags are off or unset unless a default is given.")
@@ -191,7 +191,7 @@ func printCtlHelp(w io.Writer, op string) {
 			_, _ = fmt.Fprintf(w, "  %d admission blocked (JSON with status=queued and queue_reason)\n", exitQueued)
 			_, _ = fmt.Fprintln(w, "  Check stdout JSON status=queued to identify an admission block. A command can also exit 13.")
 			_, _ = fmt.Fprintln(w, "  wait --any delivers at least once. Reuse a cursor and deduplicate retries by event_id.")
-			_, _ = fmt.Fprintln(w, "  Concurrent waits on the same session cursor warn and may repeat events.")
+			_, _ = fmt.Fprintln(w, "  Concurrent waits on the same session cursor share delivery progress.")
 		}
 		_, _ = fmt.Fprintln(w, "  124 observation timeout\n  130 observation canceled")
 		_, _ = fmt.Fprintln(w, "  Command jobs can return the command's exit code.")
@@ -206,6 +206,9 @@ func printCtlHelp(w io.Writer, op string) {
 			failure = "apply failed or had conflicts (even with --allow-conflicts)"
 		}
 		_, _ = fmt.Fprintf(w, "  1 %s\n  9 transport failure\n  44 result unavailable (reason on stderr)\n", failure)
+		if op == "rebase" {
+			_, _ = fmt.Fprintln(w, "  8 child submission failed")
+		}
 		if op == "result" {
 			_, _ = fmt.Fprintln(w, "  12 background download in progress\n  124 observation timeout\n  130 observation canceled")
 		}
@@ -258,7 +261,7 @@ var ctlFlagDescriptions = map[string]string{
 	"sync": "wait for job registration", "tag": "job `TAG` (generated when omitted)",
 	"through": "last turn `TURN` to include (defaults to all turns)",
 	"turn":    "select sealed turn `N` (defaults to latest)", "type": "message `TYPE` (defaults to discussion)",
-	"wait": "wait for completion", "watch": "refresh the listing continuously", "web-search": "enable live web search",
+	"wait": "wait for completion", "brief": "show a compact progress table", "watch": "refresh the listing continuously", "web-search": "enable live web search",
 	"with-history": "include Git history as `HEAD|A..HEAD` (omitted by default, HEAD when given without a value)",
 }
 
@@ -268,6 +271,10 @@ func ctlFlagHelp(op, key string) string {
 		if op == "wait" {
 			return "replay retained turn completions and pending events for a new --any cursor"
 		}
+	case "job":
+		if op == "wait" {
+			return "select `HOST:PROJECT/JOB` (repeatable with --any)"
+		}
 	case "project":
 		switch op {
 		case "wait":
@@ -275,6 +282,8 @@ func ctlFlagHelp(op, key string) string {
 		case "snapshot", "run", "agent":
 			return "select `PROJECT` (otherwise use CX_PROJECT or match DIR to a project member)"
 		}
+	case "path":
+		return "print the absolute path to the collected report"
 	case "log":
 		return "stream the complete command log or the selected agent turn's progress log"
 	case "role":
@@ -298,7 +307,7 @@ func ctlFlagHelp(op, key string) string {
 			return "command runtime `DURATION` (defaults to no deadline)"
 		}
 		if op == "result" {
-			return fmt.Sprintf("limit --wait to `DURATION` (defaults to CXRUN_MONITOR_TIMEOUT or %s)", defaultMonitorTimeout)
+			return fmt.Sprintf("limit result collection and optional waiting to `DURATION` (defaults to CXRUN_MONITOR_TIMEOUT or %s)", defaultMonitorTimeout)
 		}
 		return fmt.Sprintf("observation `DURATION` (defaults to CXRUN_MONITOR_TIMEOUT or %s)", defaultMonitorTimeout)
 	case "wait":

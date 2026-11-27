@@ -156,7 +156,7 @@ func TestHostFactsFingerprint(t *testing.T) {
 	ctx, cancel := fixtureContext(t)
 	defer cancel()
 	f := hostFacts(ctx, dir)
-	for _, key := range strings.Fields("os os_version arch cpu_model cpu_cores memory_total_bytes memory_available_bytes disk_free_bytes load1 cpu_usage_percent engines version_managers") {
+	for key := range strings.FieldsSeq("os os_version arch cpu_model cpu_cores memory_total_bytes memory_available_bytes disk_free_bytes load1 cpu_usage_percent engines version_managers") {
 		if _, ok := f[key]; !ok {
 			t.Fatalf("missing %s", key)
 		}

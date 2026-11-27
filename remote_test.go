@@ -84,13 +84,13 @@ func fixture(t *testing.T, state string) string {
 func TestSayNameIsIdempotent(t *testing.T) {
 	dir := fixture(t, "waiting")
 	t.Setenv("CXRUN_MSG_NAME", "0000000000000000001-0123456789abcdef.msg")
-	if err := control(t.Context(), "say", dir, []string{"hello"}); err != nil {
+	if err := say(t.Context(), dir, "", "", options{}, []string{"hello"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := writeFixtureStatus(dir, status{Job: "j", State: "done", Engine: "codex"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := control(t.Context(), "say", dir, []string{"hello"}); err != nil {
+	if err := say(t.Context(), dir, "", "", options{}, []string{"hello"}); err != nil {
 		t.Fatalf("retry after end: %v", err)
 	}
 	tail, err := inboxTail(dir, stateCursor{})
@@ -102,7 +102,7 @@ func TestSayNameIsIdempotent(t *testing.T) {
 		t.Fatalf("inbox changed: %v %v", records, err)
 	}
 	t.Setenv("CXRUN_MSG_NAME", "bad")
-	if err := control(t.Context(), "say", dir, []string{"x"}); err == nil {
+	if err := say(t.Context(), dir, "", "", options{}, []string{"x"}); err == nil {
 		t.Fatal("bad name accepted")
 	}
 }

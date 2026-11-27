@@ -383,7 +383,7 @@ func (r *runner) trySlot(ctx context.Context, ticket *queueTicket, slots int) (*
 	if !first {
 		return nil, "waiting for earlier FIFO tickets", nil
 	}
-	for i := 0; i < slots; i++ {
+	for i := range slots {
 		slot, err := lockPath(filepath.Join(r.pool(), fmt.Sprintf("slot-%d.lock", i)), os.O_CREATE)
 		if slot != nil || err != nil {
 			return slot, "", err
@@ -478,5 +478,37 @@ func (r *runner) followSlot() (bool, error) {
 		default:
 			return false, nil
 		}
+	}
+}
+
+// Running jobs keep checking the shared cache budget even when no ticket is queued.
+func (r *runner) startCacheMaintenance() func() {
+	clock := timeshim.Or(r.clock)
+	ctx, cancel := context.WithCancel(context.WithValue(r.ctx, clockKey{}, clock))
+	tick := timeshim.NewTicker(clock, diskRecoveryInterval)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer tick.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-tick.C:
+				host, err := readHostConfig(r.root)
+				if err == nil {
+					scan, stop := timeshim.WithTimeout(ctx, clock, transferLimit)
+					err = maintainCaches(scan, r.root, host, false)
+					stop()
+				}
+				if err != nil && ctx.Err() == nil {
+					diagnosticf("cache maintenance: %v\n", err)
+				}
+			}
+		}
+	}()
+	return func() {
+		cancel()
+		<-done
 	}
 }

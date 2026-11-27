@@ -533,6 +533,45 @@ func (r *runner) save() error {
 	return r.stateLog.Rotate(c.Value, r.s, append(checkpoints, completions...)...)
 }
 func (r *runner) active() bool { return r.s.TurnStatus == "inProgress" }
+func statusTime(ctx context.Context) int64 {
+	return timeshim.Or(contextClock(ctx)).Now().Unix()
+}
+
+// statusView adds time-dependent fields only at the CLI output boundary.
+type statusView struct {
+	rateLimitProjection
+	status
+}
+
+func (s status) view(now int64) statusView {
+	return statusView{rateLimitProjection: s.rateLimit(now), status: s}
+}
+
+func (s status) phase(ctx context.Context, dir string, limited bool) string {
+	switch {
+	case s.State == "waiting_input" || s.State == "waiting_approval":
+		return "needs_input"
+	case limited:
+		return "rate_limited"
+	case s.State == "queued":
+		return "queued"
+	case s.State == "waiting":
+		return "idle"
+	case isTerminal(s.State):
+		if work, err := workDir(dir, s); err == nil {
+			if _, _, err := readRestartInputs(ctx, dir, work, s, true); err == nil {
+				return "ended"
+			}
+		}
+		if s.State == "done" {
+			return "completed"
+		}
+		return "failed"
+	default:
+		return "running"
+	}
+}
+
 func (r *runner) deriveState() {
 	if r.s.InputKind == "server_request" || r.s.InputKind == agentAsk {
 		r.s.InputKind = ""

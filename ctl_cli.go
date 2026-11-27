@@ -21,6 +21,7 @@ import (
 )
 
 type ctlOptions struct {
+	waitJobsByHost                                                                  map[string][]string
 	env                                                                             map[string]string
 	project, session, tag, cwd, dir, host                                           string
 	child, through                                                                  string
@@ -32,10 +33,10 @@ type ctlOptions struct {
 	interval                                                                        time.Duration
 	max                                                                             int
 	cleanBase, all, explicitSession, noSession                                      bool
-	full, json, log, watch, any, wait, raw, refresh, fromStart                      bool
+	full, json, log, path, watch, any, wait, raw, refresh, fromStart                bool
 	inplace, interactive, web, hard, network, noNetwork                             bool
 	command, reuse, sync, force, noTools, messages, latest                          bool
-	incremental, allowConflicts                                                     bool
+	incremental, allowConflicts, brief                                              bool
 }
 
 func ctlFlags(op string, o *ctlOptions) *flag.FlagSet {
@@ -49,7 +50,7 @@ func ctlFlags(op string, o *ctlOptions) *flag.FlagSet {
 		"inplace": &o.inplace, "interactive": &o.interactive, "web-search": &o.web,
 		"hard": &o.hard, "network": &o.network, "no-network": &o.noNetwork,
 		"force": &o.force, "sync": &o.sync, "no-tools": &o.noTools,
-		"full": &o.full, "json": &o.json, "log": &o.log, "watch": &o.watch,
+		"brief": &o.brief, "full": &o.full, "json": &o.json, "log": &o.log, "path": &o.path, "watch": &o.watch,
 		"messages": &o.messages, "any": &o.any, "wait": &o.wait, "raw": &o.raw, "from-start": &o.fromStart, "latest": &o.latest,
 	}
 	stringsByName := map[string]*string{
@@ -68,9 +69,23 @@ func ctlFlags(op string, o *ctlOptions) *flag.FlagSet {
 	}
 	const defaultPreviewBytes = 8192
 	o.max = defaultPreviewBytes
-	for _, k := range strings.Fields(cmd.flags) {
+	for k := range strings.FieldsSeq(cmd.flags) {
 		if op == "wait" && k == "project" {
 			f.Func(k, ctlFlagHelp(op, k), func(v string) error { o.projects = append(o.projects, v); return nil })
+			continue
+		}
+		if op == "wait" && k == "job" {
+			f.Func(k, ctlFlagHelp(op, k), func(v string) error {
+				host, id, ok := strings.Cut(v, ":")
+				if !ok || host == "" || validateWaitJob(id) != nil {
+					return fmt.Errorf("expected HOST:PROJECT/JOB, got %q", v)
+				}
+				if o.waitJobsByHost == nil {
+					o.waitJobsByHost = make(map[string][]string)
+				}
+				o.waitJobsByHost[host] = append(o.waitJobsByHost[host], id)
+				return nil
+			})
 			continue
 		}
 		if p := bools[k]; p != nil {
@@ -211,11 +226,16 @@ func parseCtl(op string, args []string) (ctlOptions, error) {
 	if o.fromStart && o.since != "" {
 		return o, errors.New("--from-start and --since are mutually exclusive")
 	}
-	if op == "result" && (o.json && o.log || o.full && (o.json || o.log)) {
-		return o, errors.New("--full, --json and --log are mutually exclusive")
-	}
-	if op == "result" && o.timeout != "" && !o.wait {
-		return o, errors.New("--timeout requires --wait")
+	if op == "result" {
+		var outputModes int
+		for _, enabled := range []bool{o.full, o.json, o.log, o.path} {
+			if enabled {
+				outputModes++
+			}
+		}
+		if outputModes > 1 {
+			return o, errors.New("--full, --json, --log and --path are mutually exclusive")
+		}
 	}
 	if o.max < 0 {
 		return o, errors.New("negative output budget")
@@ -306,7 +326,7 @@ func controller(ctx context.Context, a []string) error {
 	if op == "fork" || op == "resume" {
 		return ctlRestart(ctx, op, o)
 	}
-	if op == "wait" && !o.any && (o.all || o.explicitSession || len(o.hosts) > 0 || len(o.projects) > 0 || o.cursor != "" || len(o.channels) > 0 || o.fromStart) {
+	if op == "wait" && !o.any && (o.all || o.explicitSession || len(o.hosts) > 0 || len(o.projects) > 0 || len(o.waitJobsByHost) > 0 || o.cursor != "" || len(o.channels) > 0 || o.fromStart) {
 		return ctlUsage(op, errors.New("wait filters require --any"))
 	}
 	if op == "wait" && o.any {
@@ -394,7 +414,9 @@ func controller(ctx context.Context, a []string) error {
 		return ctlAdopt(ctx, h, id, o.session)
 	case "clean":
 		return cleanControllerJob(ctx, h, name, id)
-	case "result", "patch", "apply", "rebase":
+	case "rebase":
+		return ctlRebase(ctx, h, name, id, o)
+	case "result", "patch", "apply":
 		return ctlResult(ctx, name, id, op, o)
 	case "setup":
 		return retryTransfer(ctx, func() error { return deployOnce(ctx, hs, name, true) })

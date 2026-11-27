@@ -14,17 +14,22 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/djylb/timeshim"
 )
 
 type diskStatus struct {
-	err     error
-	free    uint64
-	minimum uint64
+	err                 error
+	free                uint64
+	minimum             uint64
+	total               uint64
+	pinnedBytes         uint64
+	cacheScanIncomplete bool
 }
 
 func (h *hostConfig) diskStatus(path string) diskStatus {
 	free, total, err := diskSpace(path)
-	return diskStatus{free: free, minimum: h.minFreeBytes(total), err: err}
+	return diskStatus{free: free, minimum: h.minFreeBytes(total), total: total, err: err}
 }
 
 func (d diskStatus) belowMinimum() bool {
@@ -43,7 +48,8 @@ func (d diskStatus) queueReason() string {
 }
 
 func addDiskStatus(f fields, path string, host *hostConfig) {
-	d := host.diskStatus(path)
+	d := host.diskStatus(diskPath(path))
+	addCacheWarning(f, path, host.cacheMaxBytes(d.total))
 	switch {
 	case d.err != nil:
 		f["disk_warning"] = fmt.Sprintf("disk free space unavailable: %v", d.err)
@@ -53,6 +59,17 @@ func addDiskStatus(f fields, path string, host *hostConfig) {
 			f["disk_warning"] = fmt.Sprintf("disk free space %d bytes below min_free_bytes %d", d.free, d.minimum)
 		}
 	}
+}
+
+func addCacheWarning(f fields, root string, limit uint64) {
+	var stamp cacheScanStamp
+	if err := readJSON(cacheScanPath(root), &stamp); err == nil && stamp.PinnedBytes > limit {
+		f["cache_warning"] = fmt.Sprintf("pinned cache exceeds cache_max_bytes (%d > %d bytes at last scan)", stamp.PinnedBytes, limit)
+	}
+}
+
+func cacheScanPath(root string) string {
+	return filepath.Join(cargoCachePath(root), ".leases", ".last-scan")
 }
 
 func cargoCachePath(root string) string {
@@ -140,6 +157,8 @@ func cargoTargetLease(root, key string) string {
 	return filepath.Join(cargoCachePath(root), ".leases", ".target-"+snapSum([]byte(key)))
 }
 
+const goModuleCacheDir = "go-mod"
+
 var packageCaches = []struct {
 	dir  string
 	keys []string
@@ -149,6 +168,12 @@ var packageCaches = []struct {
 	{dir: "yarn", keys: []string{"YARN_CACHE_FOLDER"}},
 	{dir: "pip", keys: []string{"PIP_CACHE_DIR"}},
 	{dir: "cargo", keys: []string{"CARGO_HOME"}},
+	{dir: "go-build", keys: []string{"GOCACHE"}},
+	{dir: goModuleCacheDir, keys: []string{"GOMODCACHE"}},
+	// The checksum database state lives under GOPATH/pkg/sumdb.
+	{dir: "go-path", keys: []string{"GOPATH"}},
+	{dir: "staticcheck", keys: []string{"STATICCHECK_CACHE"}},
+	{dir: "golangci-lint", keys: []string{"GOLANGCI_LINT_CACHE"}},
 }
 
 // Only manage real directories within the state root.
@@ -179,6 +204,41 @@ func cacheLockPath(root string) (string, error) {
 		}
 	}
 	return filepath.Join(targets, ".leases", ".maintenance"), nil
+}
+
+const jobTempDir = "tmp"
+
+func (r *runner) prepareJobTemp() error {
+	tmp := filepath.Join(r.dir, jobTempDir)
+	if err := ensureCacheDir(tmp); err != nil {
+		return err
+	}
+	r.c.Roots = append(r.c.Roots, tmp)
+	r.c.localEnv = append(r.c.localEnv, "TMPDIR="+tmp, "GOTMPDIR="+tmp)
+	if runtime.GOOS == "windows" {
+		r.c.localEnv = append(r.c.localEnv, "TEMP="+tmp, "TMP="+tmp)
+	}
+	return nil
+}
+
+func removeJobTemp(ctx context.Context, path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if !cacheDirectory(info) {
+		return nil
+	}
+	job, err := os.OpenRoot(path)
+	if err != nil {
+		return err
+	}
+	defer closeBestEffort(job)
+	mount, err := rootedMount(job, ".", cacheMountID)
+	if err != nil {
+		return err
+	}
+	return removeCacheTree(ctx, job, jobTempDir, "", mount, cacheMountID, true)
 }
 
 func (r *runner) prepareCaches() error {
@@ -455,15 +515,16 @@ func maintainReleasedCaches(ctx context.Context, root string, limit time.Duratio
 }
 
 type cacheScanStamp struct {
-	Started  time.Time `json:"started"`
-	Finished time.Time `json:"finished"`
-	Limit    uint64    `json:"limit"`
-	Minimum  uint64    `json:"minimum"`
-	Pressure bool      `json:"pressure"`
+	Started     time.Time `json:"started"`
+	Finished    time.Time `json:"finished"`
+	Limit       uint64    `json:"limit"`
+	Minimum     uint64    `json:"minimum"`
+	PinnedBytes uint64    `json:"pinned_bytes"`
+	Pressure    bool      `json:"pressure"`
 }
 
 func maintainCaches(ctx context.Context, root string, host *hostConfig, afterRun bool) error {
-	return coordinateCacheScan(ctx, root, host.CacheMaxBytes, afterRun,
+	return coordinateCacheScan(ctx, root, host.cacheMaxBytes(host.diskStatus(root).total), afterRun,
 		func() diskStatus { return host.diskStatus(root) }, trimCaches)
 }
 
@@ -473,7 +534,8 @@ func coordinateCacheScan(ctx context.Context, root string, limit uint64, afterRu
 	if err != nil {
 		return err
 	}
-	requested := time.Now()
+	clock := timeshim.Or(contextClock(ctx))
+	requested := clock.Now()
 	for {
 		var guard *os.File
 		if afterRun {
@@ -488,13 +550,13 @@ func coordinateCacheScan(ctx context.Context, root string, limit uint64, afterRu
 		if err != nil || guard == nil {
 			return err
 		}
-		delay, err := scanCaches(ctx, root, filepath.Join(filepath.Dir(path), ".last-scan"),
+		delay, err := scanCaches(ctx, root, cacheScanPath(root),
 			limit, afterRun, requested, probe, trim)
 		closeBestEffort(guard)
 		if err != nil || delay == 0 {
 			return err
 		}
-		if err := pause(ctx, delay); err != nil {
+		if err := timeshim.Sleep(ctx, clock, delay); err != nil {
 			return err
 		}
 	}
@@ -504,18 +566,16 @@ func scanCaches(ctx context.Context, root, stampPath string, limit uint64, after
 	probe func() diskStatus, trim func(context.Context, string, uint64, func() diskStatus) (diskStatus, error)) (time.Duration, error) {
 	disk := probe()
 	pressure := disk.belowMinimum()
-	if !afterRun && !pressure {
-		return 0, nil
-	}
+	clock := timeshim.Or(contextClock(ctx))
 	var stamp cacheScanStamp
 	if err := readJSON(stampPath, &stamp); err != nil && !os.IsNotExist(err) {
 		return 0, err
 	}
 	interval := time.Second
-	if pressure {
+	if pressure || !afterRun {
 		interval = diskRecoveryInterval
 	}
-	elapsed := time.Since(stamp.Finished)
+	elapsed := clock.Now().Sub(stamp.Finished)
 	if stamp.Limit == limit && stamp.Minimum == disk.minimum && stamp.Pressure == pressure {
 		if afterRun && !stamp.Started.Before(requested) {
 			return 0, nil
@@ -527,13 +587,18 @@ func scanCaches(ctx context.Context, root, stampPath string, limit uint64, after
 			return 0, nil
 		}
 	}
-	started := time.Now()
-	_, err := trim(ctx, root, limit, probe)
-	// A canceled claimant can hand the work off to the next ticket. Record
-	// completed attempts even if a cache could not be removed.
+	started := clock.Now()
+	result, err := trim(ctx, root, limit, probe)
+	// A canceled scan hands off to another worker. A completed attempt
+	// throttles the next scan. Keep the previous measurement if this scan
+	// failed or missed part of a cache tree.
 	if ctx.Err() == nil {
+		pinned := stamp.PinnedBytes
+		if err == nil && !result.cacheScanIncomplete {
+			pinned = result.pinnedBytes
+		}
 		err = errors.Join(err, writeJSON(stampPath, cacheScanStamp{
-			Started: started, Finished: time.Now(), Limit: limit, Minimum: disk.minimum, Pressure: pressure,
+			Started: started, Finished: clock.Now(), Limit: limit, Minimum: disk.minimum, Pressure: pressure, PinnedBytes: pinned,
 		}))
 	}
 	return 0, err
@@ -671,10 +736,13 @@ func trimCacheTrees(ctx context.Context, root string, limit uint64, probe func()
 		return diskStatus{}, err
 	}
 	var total uint64
+	var incomplete bool
 	for i := range candidates {
 		row := &candidates[i]
-		if sizeErr := sizeCacheTree(ctx, cache, row, mount, mountID); sizeErr != nil {
-			if errors.Is(sizeErr, errUnsafeCacheTree) || os.IsNotExist(sizeErr) {
+		partial, sizeErr := sizeCacheTree(ctx, cache, row, mount, mountID)
+		incomplete = incomplete || partial
+		if sizeErr != nil {
+			if errors.Is(sizeErr, errUnsafeCacheTree) || errors.Is(sizeErr, fs.ErrNotExist) {
 				row.lease = ""
 				continue
 			}
@@ -687,12 +755,14 @@ func trimCacheTrees(ctx context.Context, root string, limit uint64, probe func()
 	})
 	disk := probe()
 	if total <= limit && !disk.belowMinimum() {
+		disk.cacheScanIncomplete = incomplete
 		return disk, nil
 	}
 	targetsPinned, packagesPinned, err := activeCachePins(root)
 	if err != nil {
 		return disk, err
 	}
+	var pinnedBytes uint64
 	for _, row := range candidates {
 		if total <= limit && !disk.belowMinimum() {
 			break
@@ -705,9 +775,11 @@ func trimCacheTrees(ctx context.Context, root string, limit uint64, probe func()
 		}
 		if target, cargo := strings.CutPrefix(row.path, "cargo-target/"); cargo {
 			if targetsPinned[target] {
+				pinnedBytes += row.bytes
 				continue
 			}
 		} else if packagesPinned {
+			pinnedBytes += row.bytes
 			continue
 		}
 		lease, err := lockPath(row.lease, 0)
@@ -718,9 +790,10 @@ func trimCacheTrees(ctx context.Context, root string, limit uint64, probe func()
 			return disk, err
 		}
 		if lease == nil {
+			pinnedBytes += row.bytes
 			continue
 		}
-		err = removeCacheTree(ctx, cache, filepath.FromSlash(row.path), row.identity, mount, mountID)
+		err = removeCacheTree(ctx, cache, filepath.FromSlash(row.path), row.identity, mount, mountID, row.path == "packages/"+goModuleCacheDir)
 		closeBestEffort(lease)
 		if errors.Is(err, errUnsafeCacheTree) {
 			continue
@@ -733,6 +806,8 @@ func trimCacheTrees(ctx context.Context, root string, limit uint64, probe func()
 			disk = probe()
 		}
 	}
+	disk.pinnedBytes = pinnedBytes
+	disk.cacheScanIncomplete = incomplete
 	return disk, nil
 }
 
@@ -747,21 +822,33 @@ func rootedMount(root *os.Root, name string, mountID func(*os.File) (uint64, err
 	return mountID(f)
 }
 
-func sizeCacheTree(ctx context.Context, cache *os.Root, row *cacheCandidate, mount uint64, mountID func(*os.File) (uint64, error)) error {
+func sizeCacheTree(ctx context.Context, cache *os.Root, row *cacheCandidate, mount uint64, mountID func(*os.File) (uint64, error)) (bool, error) {
 	for dir := filepath.Dir(filepath.FromSlash(row.path)); dir != "."; dir = filepath.Dir(dir) {
 		id, err := rootedMount(cache, dir, mountID)
+		if errors.Is(err, fs.ErrNotExist) {
+			return true, err
+		}
 		if err != nil {
-			return err
+			return false, err
 		}
 		if id != mount {
-			return errUnsafeCacheTree
+			return false, errUnsafeCacheTree
 		}
 	}
-	return fs.WalkDir(cache.FS(), row.path, func(path string, d fs.DirEntry, err error) error {
-		if os.IsNotExist(err) { // An active build can replace files concurrently.
-			return nil
+	var incomplete bool
+	// A build can remove a child between directory enumeration and opening it.
+	skipMissing := func(d fs.DirEntry) error {
+		incomplete = true
+		if d != nil && d.IsDir() {
+			return fs.SkipDir
 		}
+		return nil
+	}
+	err := fs.WalkDir(cache.FS(), row.path, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				return skipMissing(d)
+			}
 			return err
 		}
 		if ctxErr := ctx.Err(); ctxErr != nil {
@@ -771,8 +858,8 @@ func sizeCacheTree(ctx context.Context, cache *os.Root, row *cacheCandidate, mou
 			return nil
 		}
 		info, err := d.Info()
-		if os.IsNotExist(err) {
-			return nil
+		if errors.Is(err, fs.ErrNotExist) {
+			return skipMissing(d)
 		}
 		if err != nil {
 			return err
@@ -782,6 +869,9 @@ func sizeCacheTree(ctx context.Context, cache *os.Root, row *cacheCandidate, mou
 				return errUnsafeCacheTree
 			}
 			id, err := rootedMount(cache, filepath.FromSlash(path), mountID)
+			if errors.Is(err, fs.ErrNotExist) {
+				return skipMissing(d)
+			}
 			if err != nil {
 				return err
 			}
@@ -800,11 +890,12 @@ func sizeCacheTree(ctx context.Context, cache *os.Root, row *cacheCandidate, mou
 		}
 		return nil
 	})
+	return incomplete, err
 }
 
 // Open each directory before enumerating it. A mount introduced after sizing
 // cannot redirect recursive deletion into another filesystem or a bind source.
-func removeCacheTree(ctx context.Context, parent *os.Root, name, expected string, mount uint64, mountID func(*os.File) (uint64, error)) error {
+func removeCacheTree(ctx context.Context, parent *os.Root, name, expected string, mount uint64, mountID func(*os.File) (uint64, error), writable bool) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -823,13 +914,17 @@ func removeCacheTree(ctx context.Context, parent *os.Root, name, expected string
 		if err != nil {
 			return err
 		}
-		err = emptyCacheTree(ctx, dir, expected, mount, mountID)
+		err = emptyCacheTree(ctx, dir, expected, mount, mountID, writable)
 		closeBestEffort(dir)
 		if err != nil {
 			return err
 		}
 	} else if expected != "" {
 		return errUnsafeCacheTree
+	} else if writable && runtime.GOOS == "windows" && info.Mode().IsRegular() && info.Mode().Perm()&0200 == 0 {
+		if err := parent.Chmod(name, info.Mode().Perm()|0200); err != nil {
+			return err
+		}
 	}
 	if err := parent.Remove(name); err != nil && !os.IsNotExist(err) {
 		return err
@@ -837,7 +932,7 @@ func removeCacheTree(ctx context.Context, parent *os.Root, name, expected string
 	return nil
 }
 
-func emptyCacheTree(ctx context.Context, dir *os.Root, expected string, mount uint64, mountID func(*os.File) (uint64, error)) error {
+func emptyCacheTree(ctx context.Context, dir *os.Root, expected string, mount uint64, mountID func(*os.File) (uint64, error), writable bool) error {
 	f, err := dir.Open(".")
 	if err != nil {
 		return err
@@ -859,6 +954,17 @@ func emptyCacheTree(ctx context.Context, dir *os.Root, expected string, mount ui
 			return errUnsafeCacheTree
 		}
 	}
+	if writable {
+		info, err := f.Stat()
+		if err != nil {
+			return err
+		}
+		if info.Mode().Perm()&0200 == 0 {
+			if err := dir.Chmod(".", info.Mode().Perm()|0200); err != nil {
+				return err
+			}
+		}
+	}
 	entries, err := f.ReadDir(-1)
 	if err != nil {
 		return err
@@ -867,12 +973,12 @@ func emptyCacheTree(ctx context.Context, dir *os.Root, expected string, mount ui
 		if expected != "" && entry.Name() == cacheIdentityFile {
 			continue
 		}
-		if err := removeCacheTree(ctx, dir, entry.Name(), "", mount, mountID); err != nil {
+		if err := removeCacheTree(ctx, dir, entry.Name(), "", mount, mountID, writable); err != nil {
 			return err
 		}
 	}
 	if expected != "" {
-		return removeCacheTree(ctx, dir, cacheIdentityFile, "", mount, mountID)
+		return removeCacheTree(ctx, dir, cacheIdentityFile, "", mount, mountID, writable)
 	}
 	return nil
 }

@@ -82,8 +82,8 @@ func (b workspaceBinding) lock(ctx context.Context, root string, jobs ...string)
 	slices.Sort(ids)
 	var locks []*os.File
 	unlock := func() {
-		for i := len(locks) - 1; i >= 0; i-- {
-			closeBestEffort(locks[i])
+		for _, lock := range slices.Backward(locks) {
+			closeBestEffort(lock)
 		}
 		locks = nil
 	}

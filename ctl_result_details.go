@@ -169,6 +169,38 @@ type resultOutput struct {
 	Turn          int64              `json:"turn"`
 }
 
+func resultReportPath(dir string) (string, error) {
+	return filepath.Abs(filepath.Join(dir, "last.md"))
+}
+
+func checkResultReport(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return errors.New("result report is not a regular file")
+	}
+	return nil
+}
+
+func cachedResultReport(dest string, target observedResult) (string, error) {
+	for _, dir := range []string{dest, resultVariant(dest, true)} {
+		if err := validateResultTurn(dir, target); os.IsNotExist(err) {
+			continue
+		} else if err != nil {
+			return "", err
+		}
+		if err := checkResultReport(filepath.Join(dir, "last.md")); os.IsNotExist(err) {
+			continue
+		} else if err != nil {
+			return "", err
+		}
+		return dir, nil
+	}
+	return "", nil
+}
+
 func displayResultDetails(out io.Writer, dir, id string, logOnly bool) error {
 	manifest := filepath.Join(dir, "result.json")
 	var m turnResult
@@ -200,6 +232,10 @@ func displayResultDetails(out io.Writer, dir, id string, logOnly bool) error {
 		_, err = io.Copy(out, log)
 		return err
 	}
+	report, err := resultReportPath(dir)
+	if err != nil {
+		return err
+	}
 	artifacts := make([]SnapshotArtifact, 0, len(m.Artifacts))
 	for _, row := range m.Artifacts {
 		row.Path = filepath.Join(dir, row.Path)
@@ -207,6 +243,6 @@ func displayResultDetails(out io.Writer, dir, id string, logOnly bool) error {
 	}
 	return json.NewEncoder(out).Encode(resultOutput{
 		Job: id, Engine: m.Engine, Status: m.Status, ExitCode: m.ExitCode, Turn: m.Turn,
-		ReportPath: filepath.Join(dir, "last.md"), LogPath: logPath, PatchManifest: manifest, Artifacts: artifacts,
+		ReportPath: report, LogPath: logPath, PatchManifest: manifest, Artifacts: artifacts,
 	})
 }

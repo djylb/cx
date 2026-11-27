@@ -14,6 +14,7 @@ import (
 )
 
 type queuedJob struct {
+	Rebase  string `json:",omitempty"`
 	Request jobSubmission
 	Origin  submissionOrigin
 }
@@ -76,7 +77,7 @@ func deployJob(ctx context.Context, h endpoint, q queuedJob, report func(string,
 		return e
 	}
 	var r reply
-	if h.SSH != "" {
+	if h.SSH != "" || q.Rebase != "" {
 		if e = sendTask(ctx, h, req, data, func(n int64) { report("packet", n) }); e != nil {
 			return e
 		}
@@ -212,8 +213,7 @@ func submissionWorker(ctx context.Context, host, id string) (err error) {
 		code := 0
 		if err != nil {
 			code = 1
-			var exit ctlExit
-			if errors.As(err, &exit) {
+			if exit, ok := errors.AsType[ctlExit](err); ok {
 				code = int(exit)
 			}
 			s.State = "submit_failed"

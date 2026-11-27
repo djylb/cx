@@ -12,6 +12,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/djylb/timeshim"
 )
 
 type submissionOrigin struct {
@@ -312,8 +314,8 @@ func installPlans(plans []applyPlan, record func() error) (err error) {
 	var undo []func() error
 	defer func() {
 		if err != nil {
-			for i := len(undo) - 1; i >= 0; i-- {
-				err = errors.Join(err, undo[i]())
+			for _, u := range slices.Backward(undo) {
+				err = errors.Join(err, u())
 			}
 		}
 	}()
@@ -409,7 +411,7 @@ func mergeApplyTrees(g snapGit, ancestor, ours, theirs string) (tree string, sta
 	return entries[0], stages, nil
 }
 
-func applyTurn(ctx context.Context, dir, patchDir, id, host string, since int64, o ctlOptions, m turnResult) error {
+func applyTurn(ctx context.Context, dir, patchDir, id, host, runID string, since int64, o ctlOptions, m turnResult) error {
 	origin, store, manifest, e := applyOrigin(dir)
 	if e != nil {
 		return e
@@ -426,6 +428,7 @@ func applyTurn(ctx context.Context, dir, patchDir, id, host string, since int64,
 	var plans []applyPlan
 	var conflicts []string
 	var failures error
+	allowConflicts := o.allowConflicts && (o.repo != "" || len(m.Repositories) == 1)
 	count := 0
 	for i, row := range m.Repositories {
 		if o.repo != "" && o.repo != row.Path && o.repo != row.RepoID {
@@ -460,7 +463,7 @@ func applyTurn(ctx context.Context, dir, patchDir, id, host string, since int64,
 				return e
 			}
 		}
-		plan, planErr := planApply(ctx, store, src, patch, temp, row, *base, since, o.allowConflicts)
+		plan, planErr := planApply(ctx, store, src, patch, temp, row, *base, since, allowConflicts)
 		if planErr != nil {
 			failures = errors.Join(failures, fmt.Errorf("%s: %w", row.Path, planErr))
 			continue
@@ -483,11 +486,10 @@ func applyTurn(ctx context.Context, dir, patchDir, id, host string, since int64,
 	if failures != nil {
 		diagnosticf("%v\n", failures)
 	}
-	if failures != nil || len(conflicts) > 0 && !o.allowConflicts {
+	if failures != nil || len(conflicts) > 0 && !allowConflicts {
 		return ctlExit(1)
 	}
-	p, _, _ := strings.Cut(id, "/")
-	project, e := outputProject(p)
+	project, e := outputProject(applyLogProject(id))
 	if e != nil {
 		return e
 	}
@@ -507,7 +509,7 @@ func applyTurn(ctx context.Context, dir, patchDir, id, host string, since int64,
 			if plan.base != "" {
 				base = plan.base
 			}
-			entry := fields{"job": id, "host": host, "base": base, "turn": m.Turn, "repo": plan.repo, "source": plan.src, "patch": plan.patch, "applied_at": time.Now().UTC().Format(time.RFC3339Nano)}
+			entry := fields{"job": id, "host": host, "run_id": runID, "base": base, "turn": m.Turn, "repo": plan.repo, "source": plan.src, "patch": plan.patch, "applied_at": timeshim.Or(contextClock(ctx)).Now().UTC().Format(time.RFC3339Nano)}
 			if since > 0 {
 				entry["since_turn"] = since
 			}
@@ -551,7 +553,20 @@ func applyTurn(ctx context.Context, dir, patchDir, id, host string, since int64,
 	}
 	return nil
 }
+func applyLogProject(id string) string {
+	project, _, _ := strings.Cut(id, "/")
+	return project
+}
+
 func outputProject(p string) (string, error) {
+	dir, err := projectOutputPath(p)
+	if err != nil {
+		return "", err
+	}
+	return dir, os.MkdirAll(dir, 0700)
+}
+
+func projectOutputPath(p string) (string, error) {
 	base := os.Getenv("CX_HOME")
 	if base == "" {
 		d, e := os.UserCacheDir()
@@ -560,11 +575,7 @@ func outputProject(p string) (string, error) {
 		}
 		base = filepath.Join(d, "cx")
 	}
-	dir, e := jobPath(filepath.Join(base, "out"), p)
-	if e != nil {
-		return "", e
-	}
-	return dir, os.MkdirAll(dir, 0700)
+	return jobPath(filepath.Join(base, "out"), p)
 }
 
 func applyOrigin(dir string) (submissionOrigin, string, Manifest, error) {

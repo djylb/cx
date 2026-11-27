@@ -70,7 +70,11 @@ func TestWaitTracksWithdrawnInboxSequence(t *testing.T) {
 	dir := fixture(t, "waiting")
 	r := runner{dir: dir}
 	startFixtureWriter(t, &r)
-	if err := publishMessage(t.Context(), dir, "target", inboxMessage{Text: "queued"}); err != nil {
+	identity, _, _, err := captureJobIdentity(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := publishMessage(t.Context(), dir, "target", inboxMessage{Text: "queued"}, identity); err != nil {
 		t.Fatal(err)
 	}
 	observer, err := openJobObservation(dir, stateCursor{}, "")

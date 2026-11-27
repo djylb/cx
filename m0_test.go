@@ -158,7 +158,7 @@ func TestProgressCursorAndEventSequence(t *testing.T) {
 		t.Fatal(err)
 	}
 	prev = 0
-	for _, l := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+	for l := range strings.SplitSeq(strings.TrimSpace(string(b)), "\n") {
 		var e struct{ Seq uint64 }
 		if err = json.Unmarshal([]byte(l), &e); err != nil || e.Seq <= prev {
 			t.Fatal(l, err)

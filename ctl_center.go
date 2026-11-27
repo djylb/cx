@@ -88,8 +88,7 @@ func freezeCompilerSource(ctx context.Context) (SnapshotID, Manifest, error) {
 			bc.GOOS = platform
 			bc.CgoEnabled = false
 			pkg, err := bc.ImportDir(path, build.ImportComment)
-			var noGo *build.NoGoError
-			if errors.As(err, &noGo) {
+			if _, ok := errors.AsType[*build.NoGoError](err); ok {
 				continue
 			}
 			if err != nil {
@@ -381,8 +380,7 @@ func rsyncStage(ctx context.Context, h endpoint, src, stage string) error {
 		c := exec.CommandContext(ctx, "rsync", "--partial", "--checksum", "--no-whole-file", "--timeout="+strconv.Itoa(max(1, int(idle.Seconds()))), "-e", strings.Join(parts, " "), "--", src, h.SSH+":"+stage)
 		c.Stderr = os.Stderr
 		err := c.Run()
-		var ex *exec.ExitError
-		if errors.As(err, &ex) {
+		if ex, ok := errors.AsType[*exec.ExitError](err); ok {
 			switch ex.ExitCode() {
 			case 10, 12, 30, 35, 255:
 				return fmt.Errorf("%w: rsync %v", ctlExit(9), err)

@@ -72,7 +72,7 @@ func TestMuxRunnerCarriesStateAcrossDaemon(t *testing.T) {
 	}
 	ctx, cancel := fixtureContext(t)
 	defer cancel()
-	if err = launchMuxRunner(ctx, root, exe, root, root, []string{"host"}, nil, "fixture", "token", func() {}); err != nil {
+	if err = launchMuxRunner(ctx, root, exe, root, root, []string{"host"}, nil, "fixture", "token", func() {}, os.Stdout); err != nil {
 		t.Fatal(err)
 	}
 	attempts, err := os.ReadDir(filepath.Join(root, ".cx-launches"))
@@ -100,7 +100,7 @@ func TestRunnerHandoffReportsOwnerBusyWithoutAcceptingOldStatus(t *testing.T) {
 	}
 	ctx, cancel := fixtureContext(t)
 	defer cancel()
-	if err := awaitRunner(ctx, dir, "same-run", "requested-worker", 0, nil, rejection); !errors.Is(err, errJobOwnerBusy) {
+	if err := awaitRunner(ctx, dir, "same-run", "requested-worker", 0, nil, rejection, os.Stdout); !errors.Is(err, errJobOwnerBusy) {
 		t.Fatalf("runner handoff = %v", err)
 	}
 }

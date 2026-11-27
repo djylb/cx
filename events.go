@@ -214,6 +214,7 @@ func (r *runner) publishTurnReport(id string, report []byte) error {
 }
 
 type turnCompletion struct {
+	ResetAt *int64 `json:"reset_at,omitempty"`
 	Outcome string `json:"outcome"`
 	observedResult
 	RateLimited bool `json:"rate_limited,omitempty"`
@@ -230,6 +231,7 @@ func completedTurn(s status) turnCompletion {
 		Outcome:        outcome,
 		observedResult: observedResult{RunID: s.RunID, Number: s.Finished, TurnID: s.LastCompleted},
 		RateLimited:    s.CompletedRateLimited,
+		ResetAt:        s.CompletedResetAt,
 	}
 }
 
@@ -445,13 +447,18 @@ func (r *runner) finish(t turn) error {
 	}
 	r.s.CompletedStatus = t.Status
 	r.s.CompletedRateLimited = t.Error != nil && t.Error.rateLimited()
+	now := timeshim.Or(r.clock).Now()
+	r.s.CompletedResetAt = nil
+	if r.s.CompletedRateLimited {
+		_, r.s.CompletedResetAt = r.s.windowResets(now.Unix())
+	}
 	r.s.InputKind = ""
 	line, _, _ := strings.Cut(r.lastText, "\n")
 	if r.c.Interactive && t.Status == "completed" && reportStatus(line) == "QUESTION" {
 		r.s.InputKind = "next_turn"
 	}
 	r.deriveState()
-	r.idleSince = timeshim.Or(r.clock).Now()
+	r.idleSince = now
 	info := t.ID + " " + t.Status
 	if t.Error != nil {
 		info += " " + r.c.secret.text(t.Error.Message)
@@ -510,7 +517,7 @@ func (r *runner) notify(m message) error {
 	case "thread/tokenUsage/updated":
 		r.s.Usage = e.TokenUsage
 	case "account/rateLimits/updated":
-		r.s.update(e.RateLimits, time.Now().Unix())
+		r.s.update(e.RateLimits)
 	case "error":
 		if e.Error != nil {
 			retry := e.Retry != nil && *e.Retry
@@ -548,7 +555,7 @@ func (r *runner) notify(m message) error {
 		var files []string
 		var oldFile string
 		added, removed, gitFiles := 0, 0, 0
-		for _, l := range strings.Split(e.Diff, "\n") {
+		for l := range strings.SplitSeq(e.Diff, "\n") {
 			switch {
 			case strings.HasPrefix(l, "diff --git "):
 				gitFiles++
@@ -772,24 +779,30 @@ func (r *runner) sendInput(input any, id string, steer bool) error {
 		}
 		return r.writeProgress("turn/steer", id+" → "+r.s.Turn)
 	}
-	if err := r.acquireSlot(); err != nil {
-		return err
-	}
 	sb := fields{"type": "readOnly", "networkAccess": r.c.Network}
 	switch r.c.Sandbox {
 	case "workspace-write":
 		sb["type"] = "workspaceWrite"
-		sb["writableRoots"] = append([]string{r.c.Dir}, r.c.Roots...)
+		roots, err := snapshotMemberRoots(r.root, r.c.Dir)
+		if err != nil {
+			return err
+		}
+		if len(roots) == 0 {
+			roots = []string{r.c.Dir}
+		}
+		sb["writableRoots"] = append(roots, r.c.Roots...)
 	case dangerFullAccess:
 		sb = fields{"type": "dangerFullAccess"}
+	}
+	if err := r.acquireSlot(); err != nil {
+		return err
 	}
 	p["sandboxPolicy"] = sb
 
 	p["approvalPolicy"] = appServerApprovalPolicy
 	var result struct{ Turn turn }
 	if err := r.call("turn/start", p, &result); err != nil {
-		var rejection *rpcError
-		if errors.As(err, &rejection) {
+		if _, ok := errors.AsType[*rpcError](err); ok {
 			r.releaseSlot()
 		}
 		return err

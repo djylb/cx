@@ -23,10 +23,7 @@ func TestCommandResultDetails(t *testing.T) {
 	cliOutput(t, 37, nil, f.cx, "exec", "local", "--tag", "binary", "--cwd", work, "--wait", "--",
 		"sh", "-c", "cat artifacts/payload.bin; exit 37")
 
-	if stdout := cliOutput(t, 12, nil, f.cx, "result", job, "--log"); len(stdout) != 0 {
-		t.Fatalf("collection wrote to stdout: %q", stdout)
-	}
-	if stdout := cliOutput(t, 0, nil, f.cx, "result", job, "--log", "--wait", "--max-bytes", "1"); !bytes.Equal(stdout, payload) {
+	if stdout := cliOutput(t, 0, nil, f.cx, "result", job, "--log", "--max-bytes", "1"); !bytes.Equal(stdout, payload) {
 		t.Fatalf("result log changed: got %d bytes, want %d", len(stdout), len(payload))
 	}
 	var result resultOutput
@@ -140,33 +137,12 @@ func TestResultOutputClarity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	details := resultVariant(dest, true)
-	lock, err := lockPath(details+".worker", os.O_CREATE)
-	if err != nil || lock == nil {
-		t.Fatal(lock, err)
-	}
-	defer closeBestEffort(lock)
-	if err := os.WriteFile(details+".part", []byte("123"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	checkCollecting := func(total string) {
-		t.Helper()
-		out, diag := cliStreams(t, 12, nil, f.cx, "result", job, "--json")
-		want := `{"bytes":3,"job":"p/report","status":"collecting","total":` + total + `,"turn":1}` + "\n"
-		if string(out) != want || !strings.Contains(diag, "collecting turn=1 bytes=3/") {
-			t.Fatalf("collecting JSON: stdout=%q stderr=%q", out, diag)
-		}
-	}
-	checkCollecting("null")
-	if err := writeJSON(details+".total", 10); err != nil {
-		t.Fatal(err)
-	}
-	checkCollecting("10")
-	if out, diag := cliStreams(t, 12, nil, f.cx, "result", job, "--log"); len(out) != 0 || !strings.Contains(diag, "collecting turn=1 bytes=3/10") {
-		t.Fatalf("collecting log: stdout=%q stderr=%q", out, diag)
-	}
-	out, diag := cliStreams(t, 0, nil, f.cx, "result", job, "--wait")
 	reportPath := filepath.Join(dest, "last.md")
+	out, diag := cliStreams(t, 0, nil, f.cx, "result", job, "--path")
+	if string(out) != reportPath+"\n" || diag != "" {
+		t.Fatalf("uncached report path: stdout=%q stderr=%q", out, diag)
+	}
+	out, diag = cliStreams(t, 0, nil, f.cx, "result", job, "--timeout", "1m")
 	if string(out) != reportPath+"\nSTATUS: DONE\nSummary.\n" ||
 		diag != "cx: summary shown; full report: "+reportPath+" (use --full)\n" {
 		t.Fatalf("summary: stdout=%q stderr=%q", out, diag)
@@ -175,13 +151,29 @@ func TestResultOutputClarity(t *testing.T) {
 	if !bytes.Contains(out, []byte(report)) || strings.Contains(diag, "summary shown") {
 		t.Fatalf("full report: stdout=%q stderr=%q", out, diag)
 	}
-	for _, suffix := range []string{".part", ".total"} {
-		if err := os.Remove(details + suffix); err != nil {
-			t.Fatal(err)
-		}
+	out, diag = cliStreams(t, 0, nil, f.cx, "result", job, "--turn", "1", "--path")
+	if _, err := os.Stat(resultVariant(dest, true)); !os.IsNotExist(err) {
+		t.Fatalf("--path created a detailed cache: %v", err)
 	}
-	out, diag = cliStreams(t, 0, nil, f.cx, "result", job, "--json", "--wait")
-	if !json.Valid(out) || strings.Contains(diag, "summary shown") {
-		t.Fatalf("report JSON: stdout=%q stderr=%q", out, diag)
+	var result resultOutput
+	data := cliOutput(t, 0, nil, f.cx, "result", job, "--json")
+	if err := json.Unmarshal(data, &result); err != nil {
+		t.Fatal(err, string(data))
+	}
+	if string(out) != reportPath+"\n" || !filepath.IsAbs(result.ReportPath) || diag != "" {
+		t.Fatalf("report path: stdout=%q stderr=%q JSON=%s", out, diag, data)
+	}
+	if b, err := os.ReadFile(result.ReportPath); err != nil || string(b) != report {
+		t.Fatalf("report at %s: %q, %v", result.ReportPath, b, err)
+	}
+	if err := os.Rename(dest, dest+".saved"); err != nil {
+		t.Fatal(err)
+	}
+	out, diag = cliStreams(t, 0, nil, f.cx, "result", job, "--path")
+	if string(out) != result.ReportPath+"\n" || diag != "" {
+		t.Fatalf("cached detailed report path: stdout=%q stderr=%q", out, diag)
+	}
+	for _, flag := range []string{"--full", "--json", "--log"} {
+		cliOutput(t, 2, nil, f.cx, "result", job, "--path", flag)
 	}
 }

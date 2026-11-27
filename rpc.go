@@ -146,8 +146,7 @@ func (r *runner) finishRPC(id string, env envelope, parseErr error) (receipt rec
 	if parseErr != nil {
 		receipt.AgentReply = nil
 		receipt.Status = "error"
-		var remote *rpcError
-		if errors.As(parseErr, &remote) {
+		if remote, ok := errors.AsType[*rpcError](parseErr); ok {
 			receipt.Error = remote
 		} else {
 			receipt.Error = &rpcError{Code: -32000, Message: parseErr.Error()}
@@ -297,6 +296,7 @@ func (r *runner) clearCurrentTurn() {
 	r.s.LastCompleted = ""
 	r.s.CompletedStatus = ""
 	r.s.CompletedRateLimited = false
+	r.s.CompletedResetAt = nil
 	r.s.TurnStatus = ""
 	r.s.InputKind = ""
 	r.s.turnSummary = turnSummary{}

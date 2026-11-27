@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 )
 
@@ -197,8 +198,8 @@ func syncFileTree(root string, syncDir, syncPath func(string) error) error {
 	if err != nil {
 		return err
 	}
-	for i := len(directories) - 1; i >= 0; i-- {
-		if err := syncDir(directories[i]); err != nil {
+	for _, directorie := range slices.Backward(directories) {
+		if err := syncDir(directorie); err != nil {
 			return err
 		}
 	}

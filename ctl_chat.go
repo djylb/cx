@@ -377,7 +377,7 @@ func channelNode(ctx context.Context, raw string) error {
 			if e != nil {
 				return e
 			}
-			for _, line := range strings.Split(b, "\n") {
+			for line := range strings.SplitSeq(b, "\n") {
 				var row channelRow
 				if e = json.Unmarshal([]byte(line), &row); e != nil {
 					return e

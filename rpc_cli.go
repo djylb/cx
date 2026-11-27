@@ -113,7 +113,7 @@ var aliases = map[string]string{
 	"history read":   "thread/read",
 }
 
-func (o *options) dispatch(ctx context.Context, dir, op string, args []string) (bool, error) {
+func (o *options) dispatch(ctx context.Context, dir, op string, args []string, expected *jobIdentity) (bool, error) {
 	if op == "events" || op == "diff" || op == "plan" {
 		return true, o.events(dir, op)
 	}
@@ -123,6 +123,9 @@ func (o *options) dispatch(ctx context.Context, dir, op string, args []string) (
 	identity, s, _, err := captureJobIdentity(dir)
 	if err != nil {
 		return true, err
+	}
+	if expected != nil && identity != *expected {
+		return true, errJobReplaced
 	}
 	if op == "requests" {
 		if s.Approvals == nil {
@@ -462,42 +465,5 @@ func (o *options) events(dir, op string) error {
 	if op != "events" {
 		return json.NewEncoder(os.Stdout).Encode(fields{"observed": last != nil, "event": last})
 	}
-	return nil
-}
-
-func structuredSay(dir string, o options, args []string) error {
-	text := ""
-	if len(args) > 1 {
-		return errors.New("expected at most one text argument")
-	}
-	if len(args) == 1 {
-		text = args[0]
-		if strings.HasPrefix(text, "@") {
-			var err error
-			text, err = readInputText(text[1:])
-			if err != nil {
-				return err
-			}
-		}
-	}
-	input, err := o.inputs(text)
-	if err != nil {
-		return err
-	}
-	var nonce [8]byte
-	if _, err = rand.Read(nonce[:]); err != nil {
-		return err
-	}
-	name := fmt.Sprintf("%019d-%x.input.msg", time.Now().UnixNano(), nonce)
-	if v := os.Getenv("CXRUN_MSG_NAME"); v != "" {
-		if !msgName.MatchString(v) {
-			return errors.New("invalid CXRUN_MSG_NAME")
-		}
-		name = strings.TrimSuffix(v, ".msg") + ".input.msg"
-	}
-	if err = publishMessage(context.Background(), dir, name, inboxMessage{Input: input}); err != nil {
-		return err
-	}
-	fmt.Println(name)
 	return nil
 }

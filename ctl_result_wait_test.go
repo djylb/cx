@@ -2,12 +2,18 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/djylb/timeshim"
 )
 
 func TestResultWaitPinsTurn(t *testing.T) {
@@ -124,6 +130,7 @@ func TestResultWaitTimeoutAndUnavailableDiagnostics(t *testing.T) {
 	}
 	t.Setenv("CXRUN_MONITOR_TIMEOUT", "250ms")
 	cliOutput(t, 124, nil, f.cx, "result", "--wait", "--turn", "3", "p/busy")
+	t.Setenv("CXRUN_MONITOR_TIMEOUT", "")
 	if out, diag := cliStreams(t, 44, nil, f.cx, "result", "--full", "p/busy"); len(out) != 0 || !strings.Contains(diag, "turn 2 not sealed yet") {
 		t.Fatalf("unsealed current turn: stdout=%q stderr=%q", out, diag)
 	}
@@ -131,7 +138,7 @@ func TestResultWaitTimeoutAndUnavailableDiagnostics(t *testing.T) {
 	if err := r.save(); err != nil {
 		t.Fatal(err)
 	}
-	if out, diag := cliStreams(t, 44, nil, f.cx, "result", "--wait", "--full", "p/busy"); len(out) != 0 || !strings.Contains(diag, "turn 1 report missing") {
+	if out, diag := cliStreams(t, 44, nil, f.cx, "result", "--full", "p/busy"); len(out) != 0 || !strings.Contains(diag, "turn 1 report missing") {
 		t.Fatalf("missing report: stdout=%q stderr=%q", out, diag)
 	}
 	r.s.State = "done"
@@ -163,9 +170,11 @@ func TestResultWaitBoundsSealing(t *testing.T) {
 		t.Fatalf("hold result lock: %v, %v", lock, err)
 	}
 	defer closeBestEffort(lock)
-	if out := cliOutput(t, 124, nil, f.cx, "result", "--wait", "--full", "p/sealing", "--timeout", "250ms"); len(out) != 0 {
-		t.Fatalf("seal timeout wrote stdout=%q", out)
+	dest, err := resultDest("local", "p/sealing", s.RunID, "1")
+	if err != nil {
+		t.Fatal(err)
 	}
+	expireResultOperation(t, dest+".part", 44, "--wait", "--full", "local:p/sealing")
 	if err = lock.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -192,5 +201,157 @@ func TestResultSealsInPlaceTurnBeforeNodeContinuation(t *testing.T) {
 	}
 	if err := <-done; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestResultDownloadDeadline(t *testing.T) {
+	f := newControllerFixture(t)
+	entered := filepath.Join(f.home, "download-started")
+	setupPrefetchSSH(t, f, `
+case "$request" in
+  *'"status"'*)
+    printf '%s\n' '{"run_id":"run","completed_turns":1,"state":"done","last_completed_turn_id":"first","last_completed_status":"completed"}'
+    ;;
+  *'"result-download"'*)
+    touch `+shellQuote(entered)+`
+    exec sleep 60
+    ;;
+  *) exit 2 ;;
+esac
+`)
+	expireResultOperation(t, entered, 44, "remote:p/result-deadline")
+}
+
+func TestResultStatusDeadlineWithoutWait(t *testing.T) {
+	f := newControllerFixture(t)
+	entered := filepath.Join(f.home, "status-started")
+	setupPrefetchSSH(t, f, `
+case "$request" in
+  *'"status"'*)
+    touch `+shellQuote(entered)+`
+    exec sleep 60
+    ;;
+  *) exit 2 ;;
+esac
+`)
+	expireResultOperation(t, entered, 124, "remote:p/result-status")
+}
+
+func expireResultOperation(t *testing.T, started string, want ctlExit, args ...string) {
+	t.Helper()
+	ctx, cancel := fixtureContext(t)
+	defer cancel()
+	const limit = time.Minute
+	clock := timeshim.NewFake(time.Now())
+	done := make(chan error, 1)
+	startCtx, stopWaitingForStart := context.WithCancel(ctx)
+	defer stopWaitingForStart()
+	go func() {
+		defer stopWaitingForStart()
+		args = append([]string{"result", "--timeout", limit.String()}, args...)
+		done <- dispatch(clockContext(ctx, clock), args)
+	}()
+	if err := awaitFixtureFile(startCtx, started); err != nil {
+		select {
+		case resultErr := <-done:
+			t.Fatalf("result returned before starting the operation: %v", resultErr)
+		default:
+			t.Fatal(err)
+		}
+	}
+	clock.Advance(limit)
+	select {
+	case err := <-done:
+		if !errors.Is(err, want) || want == 44 && !strings.Contains(err.Error(), "context deadline exceeded") {
+			t.Fatalf("result timeout = %v, want exit %d", err, want)
+		}
+	case <-ctx.Done():
+		t.Fatal("operation ignored the result deadline", ctx.Err())
+	}
+}
+
+func TestResultCollectionLimit(t *testing.T) {
+	for _, explicit := range []bool{false, true} {
+		name := "default"
+		if explicit {
+			name = "override"
+		}
+		t.Run(name, func(t *testing.T) {
+			f := newControllerFixture(t)
+			t.Setenv("CXRUN_MONITOR_TIMEOUT", "24h")
+			t.Setenv("CX_TRANSFER_IDLE", "86400")
+			entered := filepath.Join(f.home, "download-started")
+			setupPrefetchSSH(t, f, `
+case "$request" in
+  *'"status"'*)
+    printf '%s\n' '{"run_id":"run","completed_turns":1,"state":"done","last_completed_turn_id":"first"}'
+    ;;
+  *'"result-download"'*)
+    touch `+shellQuote(entered)+`
+    exec sleep 60
+    ;;
+  *) exit 2 ;;
+esac
+`)
+			ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+			defer cancel()
+			start := time.Now()
+			clock := timeshim.NewFake(start)
+			args := []string{"result", "remote:p/result-limit"}
+			limit := collectLimit
+			if explicit {
+				limit = 2 * collectLimit
+				args = append(args, "--timeout", limit.String())
+			}
+			done := make(chan error, 1)
+			runCtx, stop := context.WithCancel(context.WithoutCancel(ctx))
+			finished := make(chan struct{})
+			defer func() {
+				stop()
+				<-finished
+			}()
+			startCtx, stopWaiting := context.WithCancel(ctx)
+			defer stopWaiting()
+			go func() {
+				defer close(finished)
+				defer stopWaiting()
+				done <- controller(clockContext(runCtx, clock), args)
+			}()
+			if err := awaitFixtureFile(startCtx, entered); err != nil {
+				select {
+				case resultErr := <-done:
+					t.Fatalf("result returned before starting download: %v", resultErr)
+				default:
+					t.Fatal(err)
+				}
+			}
+			deadlines := clock.Deadlines()
+			if !slices.Contains(deadlines, start.Add(limit)) {
+				t.Errorf("deadlines = %v, want collection deadline %v", deadlines, start.Add(limit))
+			}
+			if explicit {
+				requests, err := os.ReadFile(filepath.Join(f.home, "requests"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				lines := strings.Split(strings.TrimSpace(string(requests)), "\n")
+				var request invocation
+				if err := json.Unmarshal([]byte(lines[len(lines)-1]), &request); err != nil {
+					t.Fatal(err)
+				}
+				if request.Budget <= collectLimit {
+					t.Errorf("wire budget = %v, want more than default %v", request.Budget, collectLimit)
+				}
+			}
+			clock.Advance(limit)
+			select {
+			case err := <-done:
+				if !errors.Is(err, ctlExit(44)) || !strings.Contains(err.Error(), "deadline exceeded") {
+					t.Fatalf("collection timeout = %v, want exit 44 with deadline reason", err)
+				}
+			case <-ctx.Done():
+				t.Fatal("collection ignored its deadline", ctx.Err())
+			}
+		})
 	}
 }

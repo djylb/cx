@@ -12,11 +12,9 @@ type rateLimitWindow struct {
 }
 
 type rateLimitStatus struct {
-	ResetAt     *int64           `json:"reset_at,omitempty"`
-	Primary     *rateLimitWindow `json:"primary,omitempty"`
-	Secondary   *rateLimitWindow `json:"secondary,omitempty"`
-	LimitID     string           `json:"limit_id,omitempty"`
-	RateLimited bool             `json:"rate_limited"`
+	Primary   *rateLimitWindow `json:"primary,omitempty"`
+	Secondary *rateLimitWindow `json:"secondary,omitempty"`
+	LimitID   string           `json:"limit_id,omitempty"`
 }
 
 type rateLimitReading struct {
@@ -27,13 +25,11 @@ type rateLimitReading struct {
 // A rate limit snapshot is sparse. Null windows do not
 // invalidate recent readings, but windows from different meters cannot mix.
 type rateLimitSnapshot struct {
-	Primary, Secondary   *rateLimitReading
-	SpendControlReached  *bool
-	LimitID              string
-	RateLimitReachedType string
+	Primary, Secondary *rateLimitReading
+	LimitID            string
 }
 
-func (s *rateLimitStatus) update(snapshot rateLimitSnapshot, now int64) {
+func (s *rateLimitStatus) update(snapshot rateLimitSnapshot) {
 	if snapshot.LimitID != "" && snapshot.LimitID != s.LimitID {
 		if s.LimitID != "" {
 			*s = rateLimitStatus{}
@@ -46,35 +42,44 @@ func (s *rateLimitStatus) update(snapshot rateLimitSnapshot, now int64) {
 	if snapshot.Secondary != nil {
 		s.Secondary = &rateLimitWindow{UsedPercent: snapshot.Secondary.UsedPercent, ResetAt: snapshot.Secondary.ResetsAt}
 	}
-	if snapshot.Primary == nil && snapshot.Secondary == nil && snapshot.RateLimitReachedType == "" && snapshot.SpendControlReached == nil {
-		return
-	}
-	var next, blockedUntil *int64
-	var exhausted, unknownReset bool
-	for _, window := range []*rateLimitWindow{s.Primary, s.Secondary} {
-		if window == nil || (window.ResetAt != nil && *window.ResetAt <= now) {
+}
+
+type rateLimitProjection struct {
+	ResetAt     *int64 `json:"reset_at,omitempty"`
+	RateLimited bool   `json:"rate_limited"`
+}
+
+type rateLimitView struct {
+	rateLimitProjection
+	rateLimitStatus
+}
+
+func (s *rateLimitStatus) windowResets(now int64) (next, blockedUntil *int64) {
+	for _, window := range [2]*rateLimitWindow{s.Primary, s.Secondary} {
+		if window == nil || window.ResetAt == nil || *window.ResetAt <= now {
 			continue
 		}
-		if window.ResetAt != nil && (next == nil || *window.ResetAt < *next) {
+		if next == nil || *window.ResetAt < *next {
 			next = window.ResetAt
 		}
-		if window.UsedPercent >= 100 {
-			exhausted = true
-			if window.ResetAt == nil {
-				unknownReset = true
-			} else if blockedUntil == nil || *window.ResetAt > *blockedUntil {
-				blockedUntil = window.ResetAt
-			}
+		if window.UsedPercent >= 100 && (blockedUntil == nil || *window.ResetAt > *blockedUntil) {
+			blockedUntil = window.ResetAt
 		}
 	}
-	s.RateLimited = exhausted || snapshot.RateLimitReachedType != "" || (snapshot.SpendControlReached != nil && *snapshot.SpendControlReached)
-	s.ResetAt = next
-	if exhausted {
-		s.ResetAt = blockedUntil
-		if unknownReset {
-			s.ResetAt = nil
-		}
+	return next, blockedUntil
+}
+
+func (s status) rateLimit(now int64) rateLimitProjection {
+	next, blockedUntil := s.windowResets(now)
+	view := rateLimitProjection{ResetAt: next, RateLimited: s.CompletedRateLimited || blockedUntil != nil}
+	if blockedUntil != nil {
+		view.ResetAt = blockedUntil
 	}
+	return view
+}
+
+func (s status) rateLimitView(now int64) rateLimitView {
+	return rateLimitView{rateLimitProjection: s.rateLimit(now), rateLimitStatus: s.rateLimitStatus}
 }
 
 func (e turnError) rateLimited() bool {
@@ -105,6 +110,5 @@ func (r *runner) noteRateLimit(turnID, source string, retry bool, failure *turnE
 	if failure == nil || !failure.rateLimited() {
 		return nil
 	}
-	r.s.RateLimited = true
 	return r.localEvent("turn/rate_limited", fmt.Sprintf("turn=%s source=%s retry=%t %s", turnID, source, retry, brief(r.c.secret.text(failure.Message))))
 }

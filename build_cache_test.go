@@ -13,6 +13,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/djylb/timeshim"
 )
 
 func TestCargoCacheKeyFromSource(t *testing.T) {
@@ -238,7 +240,7 @@ func TestCacheMaintenanceCoalescesAcrossQueueTickets(t *testing.T) {
 		return probe(), nil
 	}
 	go func() {
-		done <- coordinateCacheScan(h.ctx, h.root, policy.CacheMaxBytes, false, probe, trim)
+		done <- coordinateCacheScan(h.ctx, h.root, policy.cacheMaxBytes(0), false, probe, trim)
 	}()
 	defer func() {
 		select {
@@ -273,7 +275,7 @@ func TestCacheMaintenanceCoalescesAcrossQueueTickets(t *testing.T) {
 		t.Fatal(err)
 	}
 	for range 3 {
-		if err := coordinateCacheScan(h.ctx, h.root, policy.CacheMaxBytes, false, probe, trim); err != nil {
+		if err := coordinateCacheScan(h.ctx, h.root, policy.cacheMaxBytes(0), false, probe, trim); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -360,7 +362,8 @@ func assertBackgroundCacheUse(t *testing.T, dropTracking bool) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	policy.CacheMaxBytes = 1
+	limit := uint64(1)
+	policy.CacheMaxBytes = &limit
 	if err := writeJSON(filepath.Join(h.root, hostConfigName), policy); err != nil {
 		t.Fatal(err)
 	}
@@ -436,5 +439,215 @@ func assertBackgroundCacheUse(t *testing.T, dropTracking bool) {
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
 			t.Fatalf("released cache %s was not evicted: %v", path, err)
 		}
+	}
+}
+
+func TestHealthyDiskPeriodicScanReclaimsUnleasedCache(t *testing.T) {
+	root := t.TempDir()
+	guard, err := lockCaches(t.Context(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeBestEffort(guard)
+	// Model the reported overage with a 20-byte budget and 48-byte footprint.
+	const limit = 20
+	for key, size := range map[string]int{"pinned": 30, "idle": 18} {
+		prepareCacheFixture(t, root, "p", key)
+		if err := os.WriteFile(filepath.Join(cargoCachePath(root), "p", key, "data"), make([]byte, size), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pinned, err := shareCache(cargoTargetLease(root, "p/pinned"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeBestEffort(pinned)
+	probe := func() diskStatus { return diskStatus{free: 100, minimum: 10} }
+	clock := timeshim.NewFake(time.Unix(1000, 0))
+	ctx := clockContext(t.Context(), clock)
+	if err := coordinateCacheScan(ctx, root, limit, false, probe, trimCaches); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(cargoCachePath(root), "p", "idle")); !os.IsNotExist(err) {
+		t.Errorf("idle target should have been reclaimed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(cargoCachePath(root), "p", "pinned", "data")); err != nil {
+		t.Errorf("pinned target should survive: %v", err)
+	}
+	f := fields{}
+	addCacheWarning(f, root, limit)
+	if got := f["cache_warning"]; got != "pinned cache exceeds cache_max_bytes (30 > 20 bytes at last scan)" {
+		t.Errorf("unexpected warning for pinned cache over budget: %v", got)
+	}
+	closeBestEffort(pinned)
+	if err := coordinateCacheScan(ctx, root, limit, false, probe, trimCaches); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(cargoCachePath(root), "p", "pinned")
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("scan should have been coalesced: %v", err)
+	}
+	clock.Advance(diskRecoveryInterval)
+	if err := coordinateCacheScan(ctx, root, limit, false, probe, trimCaches); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("later scan should evict the released target: %v", err)
+	}
+	clear(f)
+	addCacheWarning(f, root, limit)
+	if f["cache_warning"] != nil {
+		t.Fatalf("warning should clear after the next scan: %v", f)
+	}
+}
+
+func TestGoModuleCacheEvictionRestoresWritePermission(t *testing.T) {
+	root := t.TempDir()
+	guard, err := lockCaches(t.Context(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeBestEffort(guard)
+	rel := filepath.Join("packages", goModuleCacheDir)
+	if err := prepareCacheEntry(root, rel); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := shareCache(filepath.Join(packageCachePath(root), ".lease"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "cache", rel)
+	module := makeReadOnlyCacheFixture(t, path)
+	probe := func() diskStatus { return diskStatus{} }
+	disk, err := trimCaches(t.Context(), root, 0, probe)
+	closeBestEffort(lease)
+	if err != nil || disk.pinnedBytes == 0 {
+		t.Fatalf("leased module cache: %+v, %v", disk, err)
+	}
+	if _, err := os.Stat(module); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := trimCaches(t.Context(), root, 0, probe); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("read-only module cache should have been reclaimed: %v", err)
+	}
+}
+
+func makeReadOnlyCacheFixture(t *testing.T, root string) string {
+	t.Helper()
+	dir := filepath.Join(root, "module@v1.0.0")
+	file := filepath.Join(dir, "go.mod")
+	t.Cleanup(func() {
+		if _, err := os.Stat(file); err == nil {
+			_ = os.Chmod(file, 0600)
+		}
+		if _, err := os.Stat(dir); err == nil {
+			_ = os.Chmod(dir, 0700)
+		}
+	})
+	if err := os.Mkdir(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(file, []byte("module example.test/module\n"), 0400); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0500); err != nil {
+		t.Fatal(err)
+	}
+	return file
+}
+
+func TestCacheBudgetDefaultAndExplicitZero(t *testing.T) {
+	host := &hostConfig{}
+	for _, tc := range []struct{ total, want uint64 }{
+		{100_000_000_000, 10_000_000_000},
+		{1_000_000_000_000, 50_000_000_000},
+		{0, 50_000_000_000},
+	} {
+		if got := host.cacheMaxBytes(tc.total); got != tc.want {
+			t.Errorf("volume %d: budget %d, want %d", tc.total, got, tc.want)
+		}
+	}
+	var limit uint64
+	host.CacheMaxBytes = &limit
+	if got := host.cacheMaxBytes(100_000_000_000); got != limit {
+		t.Errorf("explicit zero budget resolved to %d", got)
+	}
+}
+
+func TestCacheScanKeepsMeasuredBytesWhenSubdirectoryDisappears(t *testing.T) {
+	root := t.TempDir()
+	guard, err := lockCaches(t.Context(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeBestEffort(guard)
+	prepareCacheFixture(t, root, "p", "pinned")
+	prepareCacheFixture(t, root, "p", "idle")
+	idle := filepath.Join(cargoCachePath(root), "p", "idle")
+	if err := os.WriteFile(filepath.Join(idle, "data"), []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	base := filepath.Join(cargoCachePath(root), "p", "pinned")
+	for _, name := range []string{"a-before", "z-after"} {
+		if err := os.WriteFile(filepath.Join(base, name), make([]byte, 6), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Mkdir(filepath.Join(base, "m-vanished"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	pinned, err := shareCache(cargoTargetLease(root, "p/pinned"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeBestEffort(pinned)
+
+	const limit = 10
+	probe := func() diskStatus { return diskStatus{free: 100, minimum: 10} }
+	clock := timeshim.NewFake(time.Unix(1000, 0))
+	ctx := clockContext(t.Context(), clock)
+	if err := writeJSON(cacheScanPath(root), cacheScanStamp{PinnedBytes: 30}); err != nil {
+		t.Fatal(err)
+	}
+	faults := 0
+	trim := func(ctx context.Context, root string, limit uint64, probe func() diskStatus) (diskStatus, error) {
+		return trimCacheTrees(ctx, root, limit, probe, func(f *os.File) (uint64, error) {
+			if filepath.Base(f.Name()) == "m-vanished" {
+				faults++
+				return 0, os.ErrNotExist
+			}
+			return 1, nil
+		})
+	}
+	if err := coordinateCacheScan(ctx, root, limit, false, probe, trim); err != nil {
+		t.Fatal(err)
+	}
+	if faults != 1 {
+		t.Fatalf("expected one missing subdirectory during sizing, got %d", faults)
+	}
+	if _, err := os.Stat(idle); !os.IsNotExist(err) {
+		t.Errorf("measured siblings should put the cache over budget and trigger eviction: %v", err)
+	}
+	f := fields{}
+	addCacheWarning(f, root, limit)
+	if got := f["cache_warning"]; got != "pinned cache exceeds cache_max_bytes (30 > 10 bytes at last scan)" {
+		t.Errorf("partial scan should preserve the previous warning, got %v", got)
+	}
+
+	if err := os.Remove(filepath.Join(base, "m-vanished")); err != nil {
+		t.Fatal(err)
+	}
+	closeBestEffort(pinned)
+	clock.Advance(diskRecoveryInterval)
+	if err := coordinateCacheScan(ctx, root, limit, false, probe, trimCaches); err != nil {
+		t.Fatal(err)
+	}
+	clear(f)
+	addCacheWarning(f, root, limit)
+	if f["cache_warning"] != nil {
+		t.Fatalf("complete scan should clear the warning after eviction: %v", f)
 	}
 }

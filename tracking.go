@@ -118,7 +118,11 @@ func (r *runner) reclaim() error {
 		pid   int
 		start uint64
 	}
+	// Escalation is driven by when each signal was sent, never by how often
+	// the loop runs: a slow inventory scan must not skip the forced signal.
+	const termGrace, killGrace = 10 * time.Second, 10 * time.Second
 	sent := map[identity]time.Time{}
+	killed := map[identity]time.Time{}
 	deadline := time.Now().Add(30 * time.Second)
 	if err := reclaimTrackedJob(r.c.RunID); err != nil {
 		logErr = errors.Join(logErr, err, note(err.Error()))
@@ -136,16 +140,26 @@ func (r *runner) reclaim() error {
 			}
 			active++
 			key := identity{p.PID, p.Start}
-			since, already := sent[key]
-			force := runtime.GOOS == "windows" || (already && time.Since(since) >= 10*time.Second)
-			if time.Now().After(deadline) || (already && time.Since(since) > 11*time.Second) {
+			now := time.Now()
+			if now.After(deadline.Add(killGrace)) {
 				return errors.Join(logErr, fmt.Errorf("pid %d still present during reap; retry", p.PID))
 			}
+			if killedAt, ok := killed[key]; ok {
+				if now.Sub(killedAt) > killGrace {
+					return errors.Join(logErr, fmt.Errorf("pid %d still present during reap; retry", p.PID))
+				}
+				continue
+			}
+			termAt, already := sent[key]
+			force := runtime.GOOS == "windows" || now.After(deadline) || (already && now.Sub(termAt) >= termGrace)
 			if already && !force {
 				continue
 			}
 			if !already {
-				sent[key] = time.Now()
+				sent[key] = now
+			}
+			if force {
+				killed[key] = now
 			}
 			err := signalMember(p, force, r.c.RunID)
 			logErr = errors.Join(logErr, note(fmt.Sprintf("pid=%d force=%t result=%v", p.PID, force, err)))

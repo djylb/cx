@@ -8,15 +8,19 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/djylb/timeshim"
 )
 
 type hostReply struct {
-	e    error
-	name string
-	r    reply
+	e         error
+	name      string
+	sampledAt time.Time
+	r         reply
 }
 
 func listingJobID(row fields) string {
@@ -89,6 +93,61 @@ func mergeSubmissionRows(ctx context.Context, host, filter string, o ctlOptions,
 	return rows, nil
 }
 
+type lsSnapshot struct {
+	AsOf time.Time `json:"as_of"`
+	Jobs []fields  `json:"jobs"`
+}
+
+func lsCachePath(host string) (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	path, err := jobPath(filepath.Join(home, ".cache", "cx", "ls"), host)
+	if err != nil {
+		return "", err
+	}
+	return path + ".json", nil
+}
+
+var errInvalidLSSnapshot = errors.New("invalid listing snapshot")
+
+func loadLSSnapshot(path string) (lsSnapshot, error) {
+	var snapshot lsSnapshot
+	data, err := readSharedFile(path)
+	if err != nil {
+		return snapshot, err
+	}
+	if err := decodeRows(data, &snapshot); err != nil {
+		return snapshot, fmt.Errorf("%w: %w", errInvalidLSSnapshot, err)
+	}
+	if snapshot.AsOf.IsZero() || snapshot.Jobs == nil || slices.ContainsFunc(snapshot.Jobs, func(row fields) bool { return row == nil }) {
+		return snapshot, errInvalidLSSnapshot
+	}
+	return snapshot, nil
+}
+
+func saveLSSnapshot(ctx context.Context, path string, snapshot lsSnapshot) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return err
+	}
+	lock, err := lockUntil(ctx, path+".lock")
+	if err != nil {
+		return err
+	}
+	defer closeBestEffort(lock)
+	current, err := loadLSSnapshot(path)
+	switch {
+	case err == nil:
+		if !snapshot.AsOf.After(current.AsOf) {
+			return nil
+		}
+	case !errors.Is(err, os.ErrNotExist) && !errors.Is(err, errInvalidLSSnapshot):
+		return err
+	}
+	return writeJSON(path, snapshot)
+}
+
 func displayHosts(ctx context.Context, hs endpoints, op string, o ctlOptions) error {
 	names := hs.names()
 	filter := ""
@@ -133,11 +192,11 @@ func displayHosts(ctx context.Context, hs endpoints, op string, o ctlOptions) er
 				}
 				args := []string{"doctor"}
 				if op != "doctor" {
-					node := op
+					args = []string{op, o.project, o.session}
 					if op == "ls" {
-						node = "rows"
+						// Fetch a complete snapshot so it can serve any offline filter.
+						args = []string{"rows", "", ""}
 					}
-					args = []string{node, o.project, o.session}
 					if op == "overview" {
 						args = append(args, chatProject)
 					}
@@ -151,7 +210,11 @@ func displayHosts(ctx context.Context, hs endpoints, op string, o ctlOptions) er
 						r.code = 0
 					}
 				}
-				ch <- hostReply{name: name, r: r, e: e}
+				v := hostReply{name: name, r: r, e: e}
+				if op == "ls" && e == nil && r.code == 0 {
+					v.sampledAt = timeshim.Or(contextClock(ctx)).Now().UTC()
+				}
+				ch <- v
 			}()
 		}
 		results := map[string]hostReply{}
@@ -164,6 +227,7 @@ func displayHosts(ctx context.Context, hs endpoints, op string, o ctlOptions) er
 		enc := json.NewEncoder(&output)
 		failed := false
 		current := map[string]string{}
+		appliedByProject := map[string]map[appliedJob]map[string]int64{}
 		for _, name := range names {
 			v := results[name]
 			nodeFailed := v.e != nil || v.r.code != 0
@@ -173,7 +237,6 @@ func displayHosts(ctx context.Context, hs endpoints, op string, o ctlOptions) er
 				if op != "ls" {
 					continue
 				}
-				diagnosticf("%v %v\n", name, reports[name]["error"])
 			}
 			if op != "ls" {
 				var obj fields
@@ -203,9 +266,45 @@ func displayHosts(ctx context.Context, hs endpoints, op string, o ctlOptions) er
 				continue
 			}
 			var rows []fields
-			if !nodeFailed {
+			var asOf string
+			path, cacheErr := lsCachePath(name)
+			if nodeFailed {
+				if cacheErr == nil {
+					var snapshot lsSnapshot
+					snapshot, cacheErr = loadLSSnapshot(path)
+					if cacheErr == nil {
+						rows = snapshot.Jobs
+						asOf = snapshot.AsOf.Format(time.RFC3339Nano)
+					}
+				}
+				if asOf != "" {
+					diagnosticf("%s: unreachable (last successful observation: %s; %v)\n", name, asOf, reports[name]["error"])
+				} else {
+					diagnosticf("%s: unreachable (%v)\n", name, reports[name]["error"])
+				}
+			} else {
 				if e := decodeRows(v.r.data, &rows); e != nil {
 					return e
+				}
+				if cacheErr == nil {
+					cacheErr = saveLSSnapshot(ctx, path, lsSnapshot{
+						AsOf: v.sampledAt,
+						Jobs: rows,
+					})
+				}
+			}
+			if cacheErr != nil && (!nodeFailed || !errors.Is(cacheErr, os.ErrNotExist)) {
+				diagnosticf("%s: ls cache: %v\n", name, cacheErr)
+			}
+			rows = slices.DeleteFunc(rows, func(row fields) bool {
+				return (o.project != "" && row["project"] != o.project) ||
+					(o.session != "" && row["session"] != o.session)
+			})
+			if asOf != "" {
+				for _, row := range rows {
+					row["stale"] = true
+					row["as_of"] = asOf
+					row["host"] = name
 				}
 			}
 			rows, e := mergeSubmissionRows(ctx, name, filter, o, rows)
@@ -222,11 +321,27 @@ func displayHosts(ctx context.Context, hs endpoints, op string, o ctlOptions) er
 				if o.role != "" && role != o.role {
 					continue
 				}
+				project, _ := row["project"].(string)
+				runID, _ := row["run_id"].(string)
+				delete(row, "run_id")
+				if project != "" {
+					applied, loaded := appliedByProject[project]
+					if !loaded {
+						applied, e = readAppliedTurns(project)
+						if e != nil {
+							diagnosticf("%s: apply log: %v\n", project, e)
+						}
+						appliedByProject[project] = applied
+					}
+					if turns := applied[appliedJob{Host: name, Job: id, RunID: runID}]; runID != "" && len(turns) != 0 {
+						row["applied_turn"] = turns
+					}
+				}
 				delete(row, "role")
 				priv := row["privileged"]
 				delete(row, "privileged")
 				if o.watch {
-					fp, _ := json.Marshal([]any{row, role, priv})
+					fp, _ := json.Marshal([]any{row, role, priv, runID})
 					current[key] = string(fp)
 					if prev[key] == current[key] {
 						continue
@@ -238,34 +353,17 @@ func displayHosts(ctx context.Context, hs endpoints, op string, o ctlOptions) er
 						return e
 					}
 				} else {
-					if header {
-						output.WriteString("JOB\tHOST\tROLE\tSTATUS\tTURNS\tPLAN\tFILES\tFAILED COMMAND\tRATE LIMIT\tTOKENS\tCONTEXT %\tPROFILE\n")
-						header = false
-					}
 					state := fmt.Sprint(row["status"])
-					if state == "waiting_input" {
-						state += " awaiting reply"
+					if row["cache_warning"] != nil {
+						state += " (pinned cache over budget)"
 					}
 					if priv == true {
 						state += " privileged"
 					}
-					var failure any
-					if v, ok := row["failed_command"].(map[string]any); ok {
-						failure = fmt.Sprintf("%v (%v)", v["command"], v["exit_code"])
+					if row["stale"] == true {
+						state += " (unreachable, last successful observation: " + asOf + ")"
 					}
-					rate, _ := json.Marshal(row["rate_limit"])
-					values := []any{id, name, role, state, row["completed_turns"], row["plan_step"], row["changed_files"], failure, string(rate), row["tokens"], row["context_percent"], row["profile"]}
-					for i, v := range values {
-						if i > 0 {
-							output.WriteByte('\t')
-						}
-						if v == nil {
-							output.WriteByte('-')
-						} else {
-							output.WriteString(strings.Join(strings.Fields(fmt.Sprint(v)), " "))
-						}
-					}
-					output.WriteByte('\n')
+					renderLSRow(&output, &header, o.brief, id, name, role, state, row)
 				}
 			}
 		}
@@ -289,7 +387,7 @@ func displayHosts(ctx context.Context, hs endpoints, op string, o ctlOptions) er
 						return e
 					}
 				} else {
-					_, _ = fmt.Fprintf(&output, "%s\t%s\t-\tremoved\n", id, name)
+					renderLSRow(&output, &header, o.brief, id, name, nil, "removed", nil)
 				}
 			}
 		}
@@ -346,6 +444,55 @@ func displayHosts(ctx context.Context, hs endpoints, op string, o ctlOptions) er
 	}
 	return ctx.Err()
 }
+func renderLSRow(output *bytes.Buffer, header *bool, brief bool, id, name string, role any, state string, row fields) {
+	var failure any
+	if v, ok := row["failed_command"].(map[string]any); ok {
+		failure = fmt.Sprintf("%v (%v)", v["command"], v["exit_code"])
+	}
+	var rate any
+	if row["rate_limit"] != nil {
+		b, _ := json.Marshal(row["rate_limit"])
+		rate = string(b)
+	}
+	columns := []struct {
+		value any
+		name  string
+		brief bool
+	}{
+		{id, "JOB", true},
+		{name, "HOST", true},
+		{role, "ROLE", false},
+		{state, "STATUS", true},
+		{row["phase"], "PHASE", true},
+		{row["completed_turns"], "TURNS", true},
+		{appliedTurnColumn(row), appliedTurnHeading, true},
+		{row["plan_step"], "PLAN", true},
+		{row["changed_files"], "FILES", false},
+		{failure, "FAILED COMMAND", false},
+		{rate, "RATE LIMIT", true},
+		{row["tokens"], "TOKENS", false},
+		{row["context_percent"], "CONTEXT %", false},
+		{row["profile"], "PROFILE", false},
+	}
+	var headings, values []string
+	for _, column := range columns {
+		if brief && !column.brief {
+			continue
+		}
+		headings = append(headings, column.name)
+		value := "-"
+		if column.value != nil {
+			value = strings.Join(strings.Fields(fmt.Sprint(column.value)), " ")
+		}
+		values = append(values, value)
+	}
+	if *header {
+		output.WriteString(strings.Join(headings, "\t") + "\n")
+		*header = false
+	}
+	output.WriteString(strings.Join(values, "\t") + "\n")
+}
+
 func nest(reports map[string]fields, names []string) {
 	rows := map[string]fields{}
 	hosts := map[string]string{}

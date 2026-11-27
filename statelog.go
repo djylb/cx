@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -545,8 +546,8 @@ func latestStateKind(dir, kind string) (stateRecord, stateCursor, error) {
 			return stateRecord{}, stateCursor{}, err
 		}
 		var reclaimed bool
-		for i := len(segments) - 1; i >= 0; i-- {
-			r, c, err := latestFrame(segmentPath(dir, segments[i]), segments[i], kind)
+		for _, segment := range slices.Backward(segments) {
+			r, c, err := latestFrame(segmentPath(dir, segment), segment, kind)
 			if os.IsNotExist(err) {
 				reclaimed = true
 				continue

@@ -110,6 +110,8 @@ type status struct {
 	LaunchID        string     `json:"launch_id,omitempty"`
 	Mux             *muxWindow `json:"mux_window,omitempty"`
 
+	CompletedResetAt *int64 `json:"last_completed_reset_at,omitempty"`
+
 	rateLimitStatus
 	turnSummary
 	Usage     json.RawMessage `json:"token_usage"`
@@ -261,18 +263,23 @@ func reapDetachedJobs(root, project, job string) error {
 	}
 	for _, entry := range entries {
 		path := filepath.Join(trash, entry.Name())
+		if entry.IsDir() {
+			if tempErr := removeJobTemp(context.Background(), path); tempErr != nil && !os.IsNotExist(tempErr) {
+				err = errors.Join(err, cleanupError(tempErr, filepath.Join(path, jobTempDir)))
+				continue
+			}
+		}
 		err = errors.Join(err, cleanupError(os.RemoveAll(path), path))
 	}
 	return err
 }
 
-func printStatus(dir string) error {
-	record, _, err := jobStatusRecord(dir)
+func printStatus(ctx context.Context, dir string) error {
+	s, _, err := loadJobStatus(dir)
 	if err != nil {
 		return err
 	}
-	_, err = os.Stdout.Write(append(record.Value, '\n'))
-	return err
+	return json.NewEncoder(os.Stdout).Encode(s.view(statusTime(ctx)))
 }
 
 // The caller holds the registry lock. The first status record publishes the job.
@@ -675,7 +682,10 @@ func runNodeWithRegistration(ctx context.Context, args []string, directSubmit bo
 			return err
 		}
 	}
-	if handled, dispatchErr := opts.dispatch(ctx, dir, op, pos); handled {
+	if op == "say" {
+		return say(ctx, dir, "", "", opts, pos)
+	}
+	if handled, dispatchErr := opts.dispatch(ctx, dir, op, pos, nil); handled {
 		return dispatchErr
 	}
 	if limit > 0 {
@@ -721,9 +731,6 @@ func runNodeWithRegistration(ctx context.Context, args []string, directSubmit bo
 		}
 		if isMarker(op) {
 			return publishMarker(dir, op, marker, fs.Args())
-		}
-		if op == "say" && (opts.input != "" || len(opts.images) > 0) {
-			return structuredSay(dir, opts, fs.Args())
 		}
 		return control(ctx, op, dir, fs.Args())
 	}
@@ -830,7 +837,7 @@ func runNodeWithRegistration(ctx context.Context, args []string, directSubmit bo
 					return err
 				}
 			}
-			return printStatus(dir)
+			return printStatus(ctx, dir)
 		} else if !errors.Is(err, errNotRegistered) {
 			return err
 		}
@@ -991,7 +998,7 @@ func runNodeWithRegistration(ctx context.Context, args []string, directSubmit bo
 				}
 				return recordLaunchFailure(ctx, dir, c, startErr)
 			}
-			return awaitRunner(ctx, dir, c.RunID, "", 0, done, "")
+			return awaitRunner(ctx, dir, c.RunID, "", 0, done, "", os.Stdout)
 		}
 	}
 
@@ -1071,7 +1078,7 @@ func runNodeWithRegistration(ctx context.Context, args []string, directSubmit bo
 	}
 	if !owned {
 		if op == "resume" && launchID == "" {
-			return printStatus(dir)
+			return printStatus(ctx, dir)
 		}
 		return errJobOwnerBusy
 	}
@@ -1121,7 +1128,7 @@ func runNodeWithRegistration(ctx context.Context, args []string, directSubmit bo
 			return err
 		}
 		if terminalClose {
-			return r.releaseClosedWorkspace()
+			return errors.Join(removeJobTemp(ctx, r.dir), r.releaseClosedWorkspace())
 		}
 		// Reacquire locks in registry -> owner order and pin the terminal
 		// cursor that was actually reclaimed.
@@ -1215,6 +1222,9 @@ func runNodeWithRegistration(ctx context.Context, args []string, directSubmit bo
 		}
 	}
 	if err = r.loadCredentials(); err == nil {
+		err = r.prepareJobTemp()
+	}
+	if err == nil {
 		err = r.prepareCaches()
 	}
 	if err != nil {
@@ -1222,6 +1232,8 @@ func runNodeWithRegistration(ctx context.Context, args []string, directSubmit bo
 	}
 	maintainCacheOnExit = true
 	defer r.releaseCaches()
+	stopMaintenance := r.startCacheMaintenance()
+	defer stopMaintenance()
 	return r.c.driver().run(&r)
 }
 func main() { mainContext(context.Background()) }
@@ -1233,10 +1245,8 @@ func mainContext(parent context.Context) {
 	ctx, stop := signal.NotifyContext(parent, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if err := dispatch(ctx, os.Args[1:]); err != nil {
-		var code ctlExit
-		if errors.As(err, &code) {
-			var reason resultUnavailable
-			if errors.As(err, &reason) {
+		if code, ok := errors.AsType[ctlExit](err); ok {
+			if reason, ok := errors.AsType[resultUnavailable](err); ok {
 				diagnosticf("cx: %s\n", reason)
 			}
 			os.Exit(int(code))
@@ -1256,8 +1266,7 @@ func mainContext(parent context.Context) {
 			diagnosticf("cxrun: %v\n", err)
 			os.Exit(9)
 		}
-		var result stateFailure
-		if errors.As(err, &result) {
+		if result, ok := errors.AsType[stateFailure](err); ok {
 			os.Exit(terminalCodes[string(result)])
 		}
 		if errors.Is(err, errDrained) {

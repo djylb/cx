@@ -104,10 +104,8 @@ func (h *testRuns) awaitRecord(id string, match func(stateRecord) bool) {
 		if err != nil {
 			h.t.Fatal(err)
 		}
-		for _, row := range rows {
-			if match(row) {
-				return
-			}
+		if slices.ContainsFunc(rows, match) {
+			return
 		}
 		if err := pause(h.ctx, 10*time.Millisecond); err != nil {
 			h.t.Fatal(err)

@@ -10,7 +10,7 @@ import (
 )
 
 func snapPortablePath(s string) bool {
-	for _, name := range strings.Split(s, "/") {
+	for name := range strings.SplitSeq(s, "/") {
 		if name == "" || strings.ContainsAny(name, "<>:\"\\|?*") || strings.TrimRight(name, " .") != name || deviceName.MatchString(name) || strings.ContainsFunc(name, func(r rune) bool { return r < 32 }) {
 			return false
 		}

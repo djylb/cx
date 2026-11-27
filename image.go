@@ -8,6 +8,7 @@ import (
 	_ "image/jpeg"
 	_ "image/png"
 	"net/http"
+	"slices"
 	"strings"
 )
 
@@ -31,10 +32,8 @@ var imageMediaTypes = []string{"image/png", "image/jpeg", "image/gif", "image/we
 // sniffImage reports the media type of image data from its content, not its name.
 func sniffImage(data []byte) (string, error) {
 	media := http.DetectContentType(data)
-	for _, t := range imageMediaTypes {
-		if media == t {
-			return media, nil
-		}
+	if slices.Contains(imageMediaTypes, media) {
+		return media, nil
 	}
 	return "", fmt.Errorf("unsupported image format %s (supported: png, jpeg, gif, webp)", media)
 }

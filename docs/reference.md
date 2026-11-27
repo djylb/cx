@@ -24,7 +24,7 @@ Review the execution host's `host.json` with `cx host HOST`. Update an individua
 | `slots.system` | System category limit, default 1. Unspecified custom categories use the platform default. |
 | `load_cmd` | Optional admission check for all categories. It runs under `sh` on Unix or `cmd.exe` on Windows. Exit 0 allows admission. |
 | `min_free_bytes` | Free space required on the state volume. Default is the larger of 20 GB and 5% of the volume. Set 0 to disable the free-space threshold. |
-| `cache_max_bytes` | Budget for reclaimable cx-managed build and package caches. Default 50 GB. |
+| `cache_max_bytes` | Budget for cx-managed build and package caches. Defaults to the smaller of 50 GB and 10% of the state volume. Set an explicit byte count to override it. |
 | `env_file` | Private UTF-8 environment file for jobs. Use `KEY=VALUE`; blank lines and full-line comments are allowed. `${NAME}` expands to an earlier value in the file or the runner's environment (for example `PATH=C:\tools\bin;${PATH}`); everything else is literal. The last assignment for a key wins, and a job's own `--env` overrides it. |
 | `default_profile`, `profiles` | Default account name for new jobs and the map of named accounts. `run`, `agent`, and `exec` accept `--profile NAME`; continuation and resume keep the recorded profile. Fork inherits it by default. |
 | `profiles.<name>.engine_homes` | Maps `codex` to its `CODEX_HOME` directory and `claude` to its `CLAUDE_CONFIG_DIR` directory. |
@@ -38,11 +38,13 @@ Use `cx hosts [HOST]` or `cx node facts` for host facts. `engines.<name>` report
 
 Put repositories that a job needs to mount together in the same project. `cx project init NAME --repo DIR [DIR ...]` writes their primary checkouts to `~/.config/cx/projects/NAME.toml`. Use `cx project show NAME` to inspect the configuration.
 
-`cx run`, `cx agent`, and `cx snapshot` accept `--project NAME`. Without an explicit selection, cx uses `CX_PROJECT` or matches the source Git repository to a project. When the source belongs to a multi-repository project, cx snapshots all its members relative to their common parent. The source repository root becomes the job working directory, so sibling repositories are available at paths such as `../library`. A source outside the selected project uses its ordinary snapshot layout. Go workspace discovery also runs and adds any additional repositories.
+`cx run`, `cx agent`, and `cx snapshot` accept `--project NAME`. Without an explicit selection, cx uses `CX_PROJECT` or matches the source Git repository to a project. When the source belongs to a multi-repository project, cx snapshots all its members relative to their common parent. The source repository root becomes the job working directory, so sibling repositories are available at paths such as `../library`. With `workspace-write`, the job can edit every snapshot member. A source outside the selected project uses its ordinary snapshot layout. Go workspace discovery also runs and adds any additional repositories.
 
 For local inputs such as an ignored build configuration, add `include = [".cargo/config.toml"]` to the appropriate `[[repositories]]` entry. At initialization, repeat `--include REPO:PATH` for each path or glob. `REPO` can be a checkout path or a unique repository directory name. Quote globs to pass them to cx and use paths relative to the repository root with `/` separators. Each entry must match a file. cx reports missing entries and stops the snapshot. Matched files travel with the snapshot and are excluded from collected patches. Keep credentials out of `include`.
 
-Results group patches by repository. Use `cx patch JOB --full --repo PATH` to inspect one repository's patch and `cx apply JOB --repo PATH` to apply it. `PATH` is relative to the snapshot's common parent.
+Use `cx patch JOB` to inspect all changed repositories and `cx apply JOB` to apply their changes together. Add `--repo PATH` to select one repository. `PATH` is relative to the snapshot's common parent. Run `cx ls` on the controller that ran `apply` to see the latest applied turn per repository.
+
+Run `cx rebase JOB TEXT` from the submitting controller to dispatch a follow-up against a fresh snapshot. For an active turn, cx queues the request until the turn is sealed and prints the controller log path. A new request for that turn replaces the pending text until cx claims a child job. After the claim, repeat the command with `--turn N` to retrieve the same child ID or retry a failed submission. The child receives the sealed report and patches under `$CX_CONTEXT/rebase/`.
 
 ## Node state
 
@@ -55,13 +57,20 @@ The default state root is `~/.local/share/cx/state` on Unix and `%LOCALAPPDATA%\
 | `PROJECT/JOB/state/NNNNNN.jsonl` | Numbered append-only job state segments, including configuration, status, and receipts. cx can rotate these segments. |
 | `PROJECT/JOB/inbox/NNNNNN.jsonl`, `PROJECT/JOB/outbox/NNNNNN.jsonl` | Numbered message and control streams. |
 | `PROJECT/JOB/turns/`, `PROJECT/JOB/blobs/` | Immutable turn reports and referenced agent content when present. |
+| `PROJECT/JOB/tmp/` | Job-private temporary directory, removed on close or clean. |
 | `PROJECT/JOB/progress.log`, `events.jsonl`, `output.log` | Progress, structured events, and merged command output. `output.log` applies to command jobs. |
 | `.work/PROJECT/JOB/` | Private snapshot workspace, with its own `state/` and `blobs/` for checkout metadata. |
 | `snapshot/`, `cache/` | Snapshot store and shared build and package caches. |
 
 cx shares Cargo build output at `cache/cargo-target/PROJECT/REPO` for jobs in the same project and source repository, and uses a job's own target directory when it supplies `--env CARGO_TARGET_DIR=PATH`.
 
-Use cx to query and manage state. For direct access on an execution host, use `cx node status --job PROJECT/JOB`, `cx node list`, or `cx node wait --job PROJECT/JOB --timeout 20s`. Node `list` and `wait --any` accept project and session filters. Controller `cx result` returns collected report, log, and artifact paths. A collected agent report is named `last.md` in the result archive.
+cx provides shared, writable defaults for `GOCACHE`, `GOMODCACHE`, `GOPATH`, `STATICCHECK_CACHE`, and `GOLANGCI_LINT_CACHE` under `cache/packages/`. Use `--env KEY=PATH` to select a different directory for a job. cx checks the cache budget and free-space threshold while jobs run and reclaims unused entries in least-recently-used order. Look for `cache_warning` in `cx hosts` and `cx ls --json` when leased caches alone exceeded the budget at the last scan.
+
+Use cx to query and manage state. For direct access on an execution host, use `cx node status --job PROJECT/JOB`, `cx node list`, or `cx node wait --job PROJECT/JOB --timeout 20s`. Node `list` and `wait --any` accept project and session filters. Run `cx result JOB` on the controller to collect the sealed turn and preview its report. Use `--path` to print the absolute path to the local report, `--json` for metadata and artifact paths, or `--log` to stream the log. Use `--wait` to wait for the selected turn to seal. The overall result deadline defaults to `CXRUN_MONITOR_TIMEOUT` or 24 hours. Each collected turn is also subject to `CX_COLLECT_LIMIT` (30 minutes by default). `--timeout DURATION` sets the overall deadline and overrides the per-turn collection limit. Observation deadlines exit 124, and collection failures, including download deadlines, exit 44. `--path` can reuse either cached archive and fetches the standard archive on a cache miss.
+
+## List jobs
+
+`cx ls` shows job status for the current session. Use `--all` for all sessions or `--session ID` to select one. When a host is unreachable, cx uses its last successful listing from `~/.cache/cx/ls/<host>.json` and shows the snapshot time. With `--json`, cached job rows include `host`, `stale: true`, and `as_of` in UTC. A one-shot listing exits with code 1 if any host query fails, even when cached rows are available.
 
 ## Engine capabilities
 
@@ -100,15 +109,18 @@ Admission checks the host's disk threshold, load check, and available slots. A q
 
 ```sh
 cx wait --any --host local --host worker --project alpha --project beta --timeout 2m
+cx wait --any --job local:alpha/build --job worker:alpha/test --timeout 2m
 ```
 
-`cx wait --any` prints one JSON event. It watches the current session across configured hosts and projects. Repeat `--host` or `--project` to select a union. Set `--session NAME` to select a session explicitly or `--all` to watch every session. If cx cannot determine the current session, it exits 2 and asks for an explicit session or scope.
+`cx wait --any` prints one JSON event. It watches the current session across configured hosts and projects. Repeat `--host`, `--project`, or `--job HOST:PROJECT/JOB` to select multiple values. Jobs must match every filter supplied. Set `--session NAME` to select a session explicitly or `--all` to watch every session. If cx cannot determine the current session, it exits 2 and asks for an explicit session or scope.
 
 cx selects the first nonempty value among `CX_SESSION`, `CLAUDE_CODE_HOST_SESSION_ID`, `CLAUDE_CODE_SESSION_ID`, `CODEX_THREAD_ID`, and `OPENCODE_SESSION_ID`, in that order. This detects Claude Code, Codex (including desktop when it exports `CODEX_THREAD_ID`), and OpenCode. Set `CX_SESSION` when your tool does not export a recognized variable. When creating a job, use `--session NAME` to override detection or `--no-session` to explicitly leave it ungrouped. With neither flag and no detected session, submission exits 2. Inside an agent or command job, cx clears inherited session identifiers and sets `CX_SESSION` to the job's own `HOST:PROJECT/JOB`. A child submission therefore belongs to that job's session.
 
-Use `cx adopt JOB [--session NAME]` to move an existing job into the given session or, by default, the current session. `wait --any`, `ls`, and `overview` use the new session after adoption. Cursors keep acknowledgements already recorded for the same job and run.
+Use `cx ls --brief` for a compact progress table or add `--json` for machine-readable rows. For registered jobs, `phase` summarizes progress as `running`, `idle`, `needs_input`, `rate_limited`, `ended`, `completed`, `failed`, or `queued`. An `ended` job has a saved agent thread and an available workspace. A `completed` job finished with status `done` and cannot be resumed by `say`. Check `rate_limit.reset_at` for the known reset time in Unix seconds. Use `cx say JOB TEXT` to send a message, including to an ended agent job with a saved thread.
 
-A new named cursor (default `default`) records each host's current job state on first successful contact. The node form, `cx node wait --any --since-file PATH`, records its initial state in the supplied file. Both save the baseline even when no event arrives before the deadline. For a new cursor, use `--from-start` to replay retained turn completions and pending events. An existing cursor resumes from its saved position. Use a separate cursor for each independent filter set. Multiple processes using the same session cursor can wait concurrently and print a warning. Delivery is at least once, so deduplicate retries by `event_id`.
+Use `cx adopt JOB [--session NAME]` to move an existing job into the given session or, by default, the current session. `wait --any`, `ls`, and `overview` use the new session after adoption. Cursors keep acknowledgements already recorded for the same job.
+
+A named cursor (default `default`) shares a session baseline across host, project, and job filters. Before polling for events, the controller attempts to initialize each configured host with all jobs in scope. Each host's first successful baseline sets its own starting position, even if the host has no jobs yet. Unreachable hosts initialize on a later successful contact. The node form, `cx node wait --any --since-file PATH`, saves the same session-wide baseline for a single host. Baselines persist even if no event arrives. Use `--from-start` when initializing to replay retained events, or choose a different `--cursor NAME` for independent delivery. Use `event_id` to make downstream handling idempotent.
 
 Job events include these fields.
 
@@ -117,6 +129,7 @@ Job events include these fields.
 | `turn` | Number of the completed turn associated with this event, or `0` when the event has no completed turn. |
 | `next` | Suggested command such as `cx result worker:alpha/check --turn 2`, or an empty string when the event has no result. |
 | `rate_limited` | Boolean set when a usage or rate limit ended the selected turn. The existing outcome and exit code still describe the turn result. |
+| `reset_at` | Blocking quota window reset recorded when the turn completed, in Unix seconds, or `null` when unknown or inapplicable. |
 
 When a host disconnects, cx reports the outage on stderr and backs off independently while it watches the other hosts. A previously initialized host resumes from its saved position when it reconnects. The command exits 124 when its deadline expires without an event, with a stderr message if every selected host is unavailable. `--chat CHANNEL` includes channel messages for the selected projects (or the current project when no project is specified).
 

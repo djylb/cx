@@ -2,11 +2,11 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 )
 
 func TestApplySealedTurns(t *testing.T) {
@@ -16,7 +16,7 @@ func TestApplySealedTurns(t *testing.T) {
 	t.Setenv("FIXMODE", "sealed-patches")
 	t.Setenv("CX_POLICY_DIR", f.home)
 	t.Setenv("CX_CONTEXT_DIR", t.TempDir())
-	t.Setenv("FIXPROMPT", "Fixture\n"+strings.TrimRight(jobToolsNote, "\n")+"\n\ntask")
+	t.Setenv("FIXPROMPT", "Fixture\n"+jobToolsNote+strings.TrimRight(sandboxNote, "\n")+"\n\ntask")
 	if err := os.WriteFile(filepath.Join(f.home, "preamble.md"), []byte("Fixture"), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -47,22 +47,8 @@ func TestApplySealedTurns(t *testing.T) {
 	const id = "local:p/rounds"
 	cliOutput(t, 0, nil, f.cx, "run", "local", src, "rounds", prompt, "--sync", "--idle-exit", "2m")
 	defer cliOutput(t, 0, nil, f.cx, "close", id)
-	cliOutput(t, 0, nil, f.cx, "wait", id, "--timeout", "2m")
+	cliOutput(t, 0, nil, f.cx, "result", id, "--wait", "--turn", "1", "--timeout", "2m")
 	sealed := filepath.Join(root, ".work", "p", "rounds", "result", "turn-1")
-	ctx, cancel := fixtureContext(t)
-	defer cancel()
-	for {
-		ok, err := fileExists(filepath.Join(sealed, "result.json"))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if ok {
-			break
-		}
-		if err = pause(ctx, 10*time.Millisecond); err != nil {
-			t.Fatal("execution node did not seal turn 1 before collection")
-		}
-	}
 
 	patch := cliOutput(t, 0, nil, f.cx, "patch", id, "--turn", "1", "--full")
 	first := cliOutput(t, 0, nil, f.cx, "patch", id, "--turn", "1", "--full", "--incremental")
@@ -74,7 +60,7 @@ func TestApplySealedTurns(t *testing.T) {
 	before := read(".git/index")
 	// Use the low-level node entry that bypasses the controller's say preflight.
 	cliOutput(t, 0, nil, f.cx, "node", "say", "--job", "p/rounds", "second round")
-	cliOutput(t, 0, nil, f.cx, "wait", id, "--timeout", "2m")
+	cliOutput(t, 0, nil, f.cx, "result", id, "--wait", "--turn", "2", "--timeout", "2m")
 	second := cliOutput(t, 0, nil, f.cx, "patch", id, "--turn", "2", "--incremental", "--full")
 	for _, want := range []string{"-round 1\n+round 2\n", "-round 1\n+base\n", "+++ b/new"} {
 		if !bytes.Contains(second, []byte(want)) {
@@ -117,6 +103,14 @@ func TestApplySealedTurns(t *testing.T) {
 		t.Fatal("second turn left conflicts")
 	}
 
+	listing := cliOutput(t, 0, nil, f.cx, "ls", id, "--json")
+	var applied struct {
+		Turns map[string]int64 `json:"applied_turn"`
+	}
+	if err := json.Unmarshal(listing, &applied); err != nil || applied.Turns[filepath.Base(src)] != 2 {
+		t.Fatalf("applied turn from actual apply log: %s (%v)", listing, err)
+	}
+
 	if err := os.Rename(sealed, sealed+".fixture-backup"); err != nil {
 		t.Fatal(err)
 	}
@@ -124,5 +118,41 @@ func TestApplySealedTurns(t *testing.T) {
 	_, diag := cliStreams(t, 44, nil, f.cx, "patch", id, "--turn", "2", "--incremental")
 	if !strings.Contains(diag, "Sealed turn 1 is unavailable") {
 		t.Fatalf("missing prior turn diagnostic: %s", diag)
+	}
+}
+
+func TestListAppliedTurns(t *testing.T) {
+	f := newControllerFixture(t)
+	dir := filepath.Join(f.home, "state", "p", "applied")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeFixtureStatus(dir, status{Job: "applied", RunID: "current", Project: "p", State: "done", Session: "fixture"}); err != nil {
+		t.Fatal(err)
+	}
+	project, err := outputProject("p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := `{"host":"local","job":"p/applied","run_id":"previous","repo":"app","turn":5}
+{"host":"local","job":"p/applied","run_id":"current","repo":"app","turn":3}
+{"host":"local","job":"p/applied","run_id":"current","repo":"lib","turn":2}
+{"host":"local","job":"p/applied","run_id":"current","repo":"app","turn":1}
+{"host":"another","job":"p/applied","run_id":"current","repo":"app","turn":9}
+{"host":"local","job":"p/another","run_id":"other-job","repo":"app","turn":8}
+`
+	if err = os.WriteFile(filepath.Join(project, "apply-log.jsonl"), []byte(log), 0600); err != nil {
+		t.Fatal(err)
+	}
+	table := cliOutput(t, 0, nil, f.cx, "ls", "local:p/applied")
+	if !bytes.Contains(table, []byte("APPLIED TURN")) || !bytes.Contains(table, []byte("app=3,lib=2")) {
+		t.Fatalf("applied turns missing from table: %s", table)
+	}
+	out := cliOutput(t, 0, nil, f.cx, "ls", "local:p/applied", "--json")
+	var row struct {
+		Applied map[string]int64 `json:"applied_turn"`
+	}
+	if err := json.Unmarshal(out, &row); err != nil || len(row.Applied) != 2 || row.Applied["app"] != 3 || row.Applied["lib"] != 2 {
+		t.Fatalf("invalid applied turns: %s (%v)", out, err)
 	}
 }

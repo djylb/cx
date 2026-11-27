@@ -73,7 +73,7 @@ func (p hostProfile) accountEnv(root string) []string {
 	return env
 }
 
-var envRef = regexp.MustCompile(`\$\{[A-Za-z_][A-Za-z0-9_]*\}`)
+var envRef = regexp.MustCompile(`\$\{[A-Za-z_][A-Za-z0-9_]*}`)
 
 func parseEnvFile(data string) (map[string]string, error) {
 	env := map[string]string{}

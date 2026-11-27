@@ -59,7 +59,7 @@ func mirror(ctx context.Context, hs endpoints, o ctlOptions) error {
 		return e
 	}
 	root := src
-	for range strings.Split(m.Main, "/") {
+	for range strings.SplitSeq(m.Main, "/") {
 		root = filepath.Dir(root)
 	}
 	refs := map[string]string{}
@@ -124,79 +124,49 @@ func mirrorRefs(ctx context.Context, sid, data string) error {
 	}
 	return nil
 }
-func rebaseTurn(ctx context.Context, dir, host, id, text, session string, m turnResult) error {
-	if strings.TrimSpace(text) == "" {
-		return errors.New("rebase requires follow-up text")
+func submitRebase(ctx context.Context, host, dest, id string, req rebaseRequest) error {
+	dir, err := submissionDir(host, req.Child)
+	if err != nil {
+		return err
 	}
-	origin, _, _, e := applyOrigin(dir)
-	if e != nil {
-		return e
-	}
-	if origin.Command || origin.Snapshot == "" {
-		return errors.New("rebase requires a snapshot agent job")
-	}
-	p, j, ok := strings.Cut(id, "/")
-	if !ok {
-		return errors.New("rebase requires a project job")
-	}
-	hs, e := loadEndpoints()
-	if e != nil {
-		return e
-	}
-	h, e := hs.get(host)
-	if e != nil {
-		return e
-	}
-	lock, e := lockUntil(ctx, filepath.Join(filepath.Dir(dir), ".rebase.lock"))
-	if e != nil {
-		return e
-	}
-	defer closeBestEffort(lock)
-	var child string
-	for n := 1; ; n++ {
-		suffix := fmt.Sprintf("-r%d", n)
-		child = p + "/" + j[:min(len(j), 96-len(suffix))] + suffix
-		queued, queueErr := submissionDir(host, child)
-		if queueErr != nil {
-			return queueErr
+	generation := filepath.Base(filepath.Dir(filepath.Dir(dest)))
+	key := id + "/" + generation + "/" + filepath.Base(dest)
+	var queued queuedJob
+	err = readJSON(filepath.Join(dir, "input.json"), &queued)
+	if err == nil {
+		if queued.Rebase != key {
+			return errors.New("rebase child name is bound to another submission")
 		}
-		if _, queueErr = os.Stat(filepath.Join(queued, "input.json")); queueErr == nil {
-			continue
-		} else if !os.IsNotExist(queueErr) {
-			return queueErr
+		done, err := rebaseSubmitted(host, req.Child)
+		if err != nil || done {
+			return err
 		}
-		r, queueErr := h.call(ctx, 15*time.Second, "status", "--job", child)
-		if queueErr != nil {
-			return queueErr
-		}
-		if r.code == 11 {
-			break
-		}
-		if r.code != 0 {
-			return r.output()
-		}
+		return queueJob(ctx, queued, true)
 	}
-	prompt, e := os.CreateTemp("", "cx-rebase-")
-	if e != nil {
-		return e
+	if !os.IsNotExist(err) {
+		return err
+	}
+	origin, _, _, err := applyOrigin(dest)
+	if err != nil {
+		return err
+	}
+	attachments, err := rebaseAttachments(dest)
+	if err != nil {
+		return err
+	}
+	prompt, err := os.CreateTemp("", "cx-rebase-")
+	if err != nil {
+		return err
 	}
 	defer removeBestEffort(prompt.Name())
-	var conflicts []string
-	if e = readJSON(dir+".conflicts.json", &conflicts); e != nil && !os.IsNotExist(e) {
-		_ = prompt.Close()
-		return e
-	}
-	_, e = fmt.Fprintln(prompt, text+"\n")
-	if e == nil {
-		e = json.NewEncoder(prompt).Encode(fields{"result_manifest": filepath.Join(dir, "result.json"), "conflicts": conflicts})
-	}
-	if e = errors.Join(e, prompt.Close()); e != nil {
-		return e
+	_, err = fmt.Fprintf(prompt, "%s\n\nRead the previous turn's result manifest at $CX_CONTEXT/rebase/result.json. The report is last.md, and patch and artifact paths are relative to the manifest directory. See conflicts.json there if present.\n", req.Text)
+	if err = errors.Join(err, prompt.Close()); err != nil {
+		return err
 	}
 	options := slices.DeleteFunc(slices.Clone(origin.JobOptions), func(v string) bool { return v == "--job-tools" })
-	opts, e := parseCtl("run", append([]string{host, origin.Source, child, prompt.Name()}, options...))
-	if e != nil {
-		return e
+	opts, err := parseCtl("run", append([]string{host, origin.Source, req.Child, prompt.Name()}, options...))
+	if err != nil {
+		return err
 	}
 	opts.noNetwork = !slices.Contains(origin.JobOptions, "--network")
 	opts.noTools = !slices.Contains(origin.JobOptions, "--job-tools")
@@ -204,24 +174,49 @@ func rebaseTurn(ctx context.Context, dir, host, id, text, session string, m turn
 	opts.cleanBase = origin.CleanBase
 	opts.role = origin.Role
 	opts.parent = origin.Parent
-	opts.session = session
-	opts.explicitSession = session != ""
-	opts.noSession = session == ""
-	if e = ctlSubmit(ctx, hs, "run", opts); e != nil {
-		return e
+	opts.session = req.Session
+	opts.explicitSession = req.Session != ""
+	opts.noSession = req.Session == ""
+	opts.sync = true
+	hs, err := loadEndpoints()
+	if err != nil {
+		return err
 	}
-	queued, e := submissionDir(host, child)
-	if e != nil {
-		return e
+	return ctlSubmitWithRebase(ctx, hs, "run", opts, rebaseInput{key: key, files: attachments})
+}
+
+func rebaseAttachments(dir string) (map[string][]byte, error) {
+	var result turnResult
+	manifest, err := os.ReadFile(filepath.Join(dir, "result.json"))
+	if err != nil {
+		return nil, err
 	}
-	var q queuedJob
-	if e = readJSON(filepath.Join(queued, "input.json"), &q); e != nil {
-		return e
+	if err = json.Unmarshal(manifest, &result); err != nil {
+		return nil, err
 	}
-	path := filepath.Join(filepath.Dir(filepath.Dir(dir)), "rebases.json")
-	var rows []fields
-	if e = readJSON(path, &rows); e != nil && !os.IsNotExist(e) {
-		return e
+	files := []string{"last.md"}
+	for _, repo := range result.Repositories {
+		files = append(files, repo.Patch)
 	}
-	return writeJSON(path, append(rows, fields{"job": child, "turn": fmt.Sprintf("turn-%d", m.Turn), "snapshot": q.Request.Snapshot}))
+	for _, artifact := range result.Artifacts {
+		files = append(files, artifact.Path)
+	}
+	attachments := map[string][]byte{"rebase/result.json": manifest}
+	for _, name := range files {
+		if !snapPath(name) {
+			return nil, fmt.Errorf("invalid rebase result path %q", name)
+		}
+		data, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			return nil, err
+		}
+		attachments["rebase/"+name] = data
+	}
+	data, err := os.ReadFile(dir + ".conflicts.json")
+	if err == nil {
+		attachments["rebase/conflicts.json"] = data
+	} else if !os.IsNotExist(err) {
+		return nil, err
+	}
+	return attachments, nil
 }

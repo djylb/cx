@@ -146,15 +146,15 @@ func TestClaudeUsageAndRateLimits(t *testing.T) {
 	}
 
 	reset := int64(4102444800)
-	var s rateLimitStatus
-	s.update(claudeRateLimit{Status: "rejected", Type: "five_hour", ResetsAt: &reset}.snapshot(), 0)
-	if !s.RateLimited || s.ResetAt == nil || *s.ResetAt != reset || s.LimitID != "claude" {
+	var s status
+	s.update(claudeRateLimit{Status: "rejected", ResetsAt: &reset}.snapshot())
+	if rate := s.rateLimit(0); !rate.RateLimited || rate.ResetAt == nil || *rate.ResetAt != reset || s.LimitID != "claude" {
 		t.Fatalf("%+v", s)
 	}
 	util := 0.42
-	s = rateLimitStatus{}
-	s.update(claudeRateLimit{Status: "allowed", Utilization: &util, ResetsAt: &reset}.snapshot(), 0)
-	if s.RateLimited || s.Primary == nil || s.Primary.UsedPercent != 42 {
+	s = status{}
+	s.update(claudeRateLimit{Status: "allowed", Utilization: &util, ResetsAt: &reset}.snapshot())
+	if s.rateLimit(0).RateLimited || s.Primary == nil || s.Primary.UsedPercent != 42 {
 		t.Fatalf("%+v", s)
 	}
 }

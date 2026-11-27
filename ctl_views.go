@@ -7,15 +7,74 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 )
+
+type appliedJob struct {
+	Host, Job string
+	RunID     string `json:"run_id"`
+}
+
+func readAppliedTurns(project string) (map[appliedJob]map[string]int64, error) {
+	dir, err := projectOutputPath(project)
+	if err != nil {
+		return nil, err
+	}
+	log, err := openJobFile(filepath.Join(dir, "apply-log.jsonl"), jobFileRead)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer closeBestEffort(log)
+	turns := map[appliedJob]map[string]int64{}
+	dec := json.NewDecoder(bufio.NewReader(log))
+	for {
+		var entry struct {
+			appliedJob
+			Repo string
+			Turn int64
+		}
+		if err = dec.Decode(&entry); errors.Is(err, io.EOF) {
+			return turns, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		key := entry.appliedJob
+		if turns[key] == nil {
+			turns[key] = map[string]int64{}
+		}
+		byRepo := turns[key]
+		if previous, ok := byRepo[entry.Repo]; !ok || entry.Turn > previous {
+			byRepo[entry.Repo] = entry.Turn
+		}
+	}
+}
+
+const appliedTurnHeading = "APPLIED TURN"
+
+func appliedTurnColumn(row fields) any {
+	turns, _ := row["applied_turn"].(map[string]int64)
+	if len(turns) == 0 {
+		return nil
+	}
+	values := make([]string, 0, len(turns))
+	for _, repo := range slices.Sorted(maps.Keys(turns)) {
+		values = append(values, repo+"="+strconv.FormatInt(turns[repo], 10))
+	}
+	return strings.Join(values, ",")
+}
 
 func usage(f fields, raw json.RawMessage) {
 	var u struct {
@@ -44,11 +103,13 @@ func workDir(dir string, s status) (string, error) {
 }
 func nodeRows(ctx context.Context, root, p, session string, chatProject string) error {
 	overview := chatProject != ""
+	now := statusTime(ctx)
 	rows := make([]fields, 0) // Encode an empty list as [].
 	var rate any
 	var latest string
 	e := scanJobs(ctx, root, p, session, func(s status) (bool, error) {
-		b, e := json.Marshal(briefStatus(s))
+		dir := filepath.Join(root, s.Project, s.Job)
+		b, e := json.Marshal(briefStatus(ctx, dir, s, now))
 		if e != nil {
 			return false, e
 		}
@@ -60,7 +121,7 @@ func nodeRows(ctx context.Context, root, p, session string, chatProject string) 
 		if len(s.Usage) > 0 && string(s.Usage) != "null" {
 			r["token_usage"] = s.Usage
 		}
-		work, e := workDir(filepath.Join(root, s.Project, s.Job), s)
+		work, e := workDir(dir, s)
 		if e != nil {
 			return false, e
 		}
@@ -86,10 +147,11 @@ func nodeRows(ctx context.Context, root, p, session string, chatProject string) 
 			stamp := s.LastEvent.UTC().Format("20060102150405.000000000")
 			if stamp >= latest {
 				latest = stamp
-				rate = s.rateLimitStatus
+				rate = s.rateLimitView(now)
 			}
 		} else {
 			r["privileged"] = s.Privileged || meta.Privileged
+			r["run_id"] = s.RunID
 		}
 		rows = append(rows, r)
 		return false, nil
@@ -97,15 +159,24 @@ func nodeRows(ctx context.Context, root, p, session string, chatProject string) 
 	if e != nil {
 		return e
 	}
+	h, e := readHostConfig(root)
 	if !overview {
+		if e == nil && len(rows) > 0 {
+			f := fields{}
+			addCacheWarning(f, root, h.cacheMaxBytes(h.diskStatus(diskPath(root)).total))
+			if warning := f["cache_warning"]; warning != nil {
+				for _, row := range rows {
+					row["cache_warning"] = warning
+				}
+			}
+		}
 		return json.NewEncoder(os.Stdout).Encode(rows)
 	}
-	f := hostFacts(ctx, root)
-	h, e := readHostConfig(root)
 	if e != nil {
 		return e
 	}
-	addDiskStatus(f, diskPath(root), h)
+	f := hostFacts(ctx, root)
+	addDiskStatus(f, root, h)
 	slots := fields{}
 	for k, capacity := range h.Slots {
 		r := runner{root: root}
@@ -362,7 +433,7 @@ func chatTips(ctx context.Context, base, p string) (map[string]int64, error) {
 	if e != nil {
 		return nil, e
 	}
-	for _, line := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+	for line := range strings.SplitSeq(strings.TrimSpace(string(b)), "\n") {
 		if line == "" {
 			continue
 		}

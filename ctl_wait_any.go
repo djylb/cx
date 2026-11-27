@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -55,28 +57,77 @@ func waitRPC(ctx context.Context, h endpoint, limit time.Duration, op string, re
 	return r, nil
 }
 
+func initializeJobWaitCursor(ctx context.Context, h endpoint, file string, req waitPollRequest) error {
+	req.Cursor, req.Projects, req.Jobs = nil, nil, nil
+	r, err := waitRPC(ctx, h, req.Limit, "wait-poll", req)
+	if err != nil {
+		return err
+	}
+	if r.code == 124 {
+		return waitUnavailable{errObserveTimeout}
+	}
+	var result waitPollResponse
+	if err := json.Unmarshal(r.data, &result); err != nil {
+		return waitUnavailable{err}
+	}
+	if result.Row != nil {
+		return waitUnavailable{errors.New("unexpected event during cursor initialization")}
+	}
+	if len(result.Cursor) == 0 {
+		return waitUnavailable{errors.New("missing job cursor")}
+	}
+	if _, err := decodeWaitBaseline(result.Cursor); err != nil {
+		return waitUnavailable{err}
+	}
+	// Even an empty cursor records that this host reached its initialization
+	// boundary. Only subsequent jobs and events are eligible for delivery.
+	_, _, err = updateWaitCursor(ctx, file, nil, result.Cursor, nil)
+	return err
+}
+
+func initializeWaitHosts(ctx context.Context, hs endpoints, dir string, req waitPollRequest) error {
+	names := slices.Sorted(maps.Keys(hs))
+	results := make([]error, len(names))
+	var workers sync.WaitGroup
+	for i, name := range names {
+		workers.Go(func() {
+			file := filepath.Join(dir, name+".json")
+			saved, err := readWaitCursorFile(file)
+			if err == nil && saved == nil {
+				err = initializeJobWaitCursor(ctx, hs[name], file, req)
+			}
+			results[i] = err
+		})
+	}
+	workers.Wait()
+	for i, err := range results {
+		if err == nil {
+			continue
+		}
+		if _, ok := errors.AsType[waitUnavailable](err); !ok {
+			return err
+		}
+		diagnosticf("cx wait --any: %s cursor initialization unavailable: %s\n", names[i], brief(err.Error()))
+	}
+	return nil
+}
+
 func jobWaitPoll(h endpoint, name, file string, req waitPollRequest) func(context.Context) (waitDelivery, error) {
 	return func(ctx context.Context) (waitDelivery, error) {
 		before, err := readWaitCursorFile(file)
 		if err != nil {
 			return waitDelivery{}, err
 		}
-		req.Cursor = nil
-		if before != nil {
-			req.Cursor, err = decodeWaitBaseline(before)
-			if err != nil {
-				return waitDelivery{}, fmt.Errorf("%s: %w", name, err)
-			}
+		if before == nil {
+			return waitDelivery{}, initializeJobWaitCursor(ctx, h, file, req)
+		}
+		req.Cursor, err = decodeWaitBaseline(before)
+		if err != nil {
+			return waitDelivery{}, fmt.Errorf("%s: %w", name, err)
 		}
 		r, err := waitRPC(ctx, h, req.Limit, "wait-poll", req)
-		if err != nil {
+		if err != nil || r.code == 124 {
 			return waitDelivery{}, err
-		}
-		if r.code == 124 {
-			if before == nil {
-				return waitDelivery{}, waitUnavailable{errObserveTimeout}
-			}
-			return waitDelivery{}, nil
 		}
 		var result waitPollResponse
 		if err = json.Unmarshal(r.data, &result); err != nil {
@@ -85,22 +136,32 @@ func jobWaitPoll(h endpoint, name, file string, req waitPollRequest) func(contex
 		if len(result.Cursor) == 0 {
 			return waitDelivery{}, waitUnavailable{errors.New("missing job cursor")}
 		}
-		if _, err = decodeWaitBaseline(result.Cursor); err != nil {
+		next, err := decodeWaitBaseline(result.Cursor)
+		if err != nil {
 			return waitDelivery{}, waitUnavailable{err}
-		}
-		if before == nil {
-			if result.Row != nil {
-				return waitDelivery{}, waitUnavailable{errors.New("unexpected event during cursor initialization")}
-			}
-			_, _, err = updateWaitCursor(ctx, file, nil, result.Cursor, nil)
-			return waitDelivery{}, err
 		}
 		if result.Row == nil {
 			return waitDelivery{}, waitUnavailable{errors.New("missing job event")}
 		}
+		id := waitJobID(result.Row.Project, result.Row.Job)
+		position, ok := next[id]
+		if !ok || result.Row.EventID == "" {
+			return waitDelivery{}, waitUnavailable{errors.New("missing job event position or identity")}
+		}
+		last := req.Cursor[id]
+		position.EventID = result.Row.EventID
+		next[id] = position
+		cursor, err := json.Marshal(next)
+		if err != nil {
+			return waitDelivery{}, err
+		}
+		if last.DirKey == position.DirKey && last.EventID == position.EventID {
+			_, _, err = updateWaitCursor(ctx, file, before, cursor, nil)
+			return waitDelivery{}, err
+		}
 		result.Row.Host = name
 		result.Row.setNext(name)
-		return waitDelivery{row: result.Row, before: before, cursor: result.Cursor, code: result.Row.Code}, nil
+		return waitDelivery{row: result.Row, before: before, cursor: cursor, code: result.Row.Code}, nil
 	}
 }
 
@@ -156,8 +217,7 @@ func (s *waitSource) watch(ctx context.Context, warn func(string, ...any)) (wait
 			}
 			continue
 		}
-		var unavailable waitUnavailable
-		if !errors.As(err, &unavailable) {
+		if _, ok := errors.AsType[waitUnavailable](err); !ok {
 			return waitDelivery{}, err
 		}
 		s.available.Store(false)
@@ -246,6 +306,11 @@ func ctlWaitAny(ctx context.Context, hs endpoints, o ctlOptions) error {
 	if len(o.pos) != 0 {
 		return errors.New("wait --any takes no job")
 	}
+	for host := range o.waitJobsByHost {
+		if _, err := hs.get(host); err != nil {
+			return ctlUsage("wait", err)
+		}
+	}
 	limit, err := observation(o.timeout)
 	if err != nil {
 		return err
@@ -284,8 +349,12 @@ func ctlWaitAny(ctx context.Context, hs endpoints, o ctlOptions) error {
 		if hostErr != nil {
 			return hostErr
 		}
+		jobs := o.waitJobsByHost[name]
+		if len(o.waitJobsByHost) > 0 && len(jobs) == 0 {
+			continue
+		}
 		file := filepath.Join(dir, name+".json")
-		req := waitPollRequest{Projects: o.projects, Session: o.session, Limit: waitPollInterval, FromStart: o.fromStart}
+		req := waitPollRequest{Projects: o.projects, Jobs: jobs, Session: o.session, Limit: waitPollInterval, FromStart: o.fromStart}
 		sources = append(sources, &waitSource{poll: jobWaitPoll(h, name, file, req), file: file, label: name, jobHost: true})
 	}
 	if len(o.channels) > 0 {
@@ -319,6 +388,10 @@ func ctlWaitAny(ctx context.Context, hs endpoints, o ctlOptions) error {
 				sources = append(sources, &waitSource{poll: chatWaitPoll(h, file, channel, q), file: file, label: p + "/#" + key})
 			}
 		}
+	}
+	req := waitPollRequest{Session: o.session, Limit: waitPollInterval, FromStart: o.fromStart}
+	if err := initializeWaitHosts(ctx, hs, dir, req); err != nil && ctx.Err() == nil {
+		return err
 	}
 	return waitForAny(ctx, sources, os.Stdout, diagnosticf)
 }

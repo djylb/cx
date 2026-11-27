@@ -67,7 +67,7 @@ df -Pk "$HOME" | awk 'NR==2{printf "disk_free_bytes\t%.0f\n",$4*1024}'
 		engineRows[e.name] = fields{"path": nil, "login_status": nil}
 	}
 	f["engines"] = engineRows
-	for _, line := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+	for line := range strings.SplitSeq(strings.TrimSpace(string(b)), "\n") {
 		if name, rest, ok := strings.Cut(strings.TrimPrefix(line, "engine\t"), "\t"); ok && strings.HasPrefix(line, "engine\t") {
 			path, login, _ := strings.Cut(rest, "\t")
 			engineRows[name] = fields{"path": stringOrNil(path), "login_status": stringOrNil(login)}

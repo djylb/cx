@@ -97,8 +97,7 @@ func (e engineSpec) loginState(out []byte, exitErr error) any {
 	case exitErr == nil:
 		return "logged_out"
 	}
-	var exit *exec.ExitError
-	if errors.As(exitErr, &exit) {
+	if _, ok := errors.AsType[*exec.ExitError](exitErr); ok {
 		return "logged_out"
 	}
 	return nil

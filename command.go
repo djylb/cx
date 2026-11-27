@@ -54,10 +54,7 @@ func (r *runner) publishOutputTail() error {
 	if err != nil {
 		return err
 	}
-	size := fi.Size()
-	if size > outputTailBytes {
-		size = outputTailBytes
-	}
+	size := min(fi.Size(), outputTailBytes)
 	b, err := io.ReadAll(io.NewSectionReader(f, fi.Size()-size, size))
 	if err != nil {
 		return err

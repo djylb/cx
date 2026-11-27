@@ -96,10 +96,11 @@ func TestWaitAnyConsumers(t *testing.T) {
 	}
 
 	first.RunID, first.State, first.CompletedStatus = "replacement", "waiting", "completed"
+	first.Finished++
 	if err := writeFixtureStatus(dir, first); err != nil {
 		t.Fatal(err)
 	}
-	check(call(a, "p", "s"), waitReport{Project: "p", Job: "work", State: "waiting", Outcome: "completed", Finished: 1, Code: 0})
+	check(call(a, "p", "s"), waitReport{Project: "p", Job: "work", State: "waiting", Outcome: "completed", Finished: 2, Code: 0})
 }
 
 func TestScaleStatusFromAppServer(t *testing.T) {
@@ -110,9 +111,10 @@ func TestScaleStatusFromAppServer(t *testing.T) {
 	if err := json.Unmarshal(s.Usage, &usage); err != nil || usage.Total.TotalTokens != 42 {
 		t.Fatal(string(s.Usage), err)
 	}
+	rate := s.rateLimit(statusTime(h.ctx))
 	if s.CompletedStatus != "failed" || s.PlanStep != "run checks" || s.ChangedFiles != 2 ||
 		s.FailedCommand == nil || *s.FailedCommand != (failedCommand{"test fixture", 17}) ||
-		!s.RateLimited || s.ResetAt == nil || *s.ResetAt != 4102444800 ||
+		!rate.RateLimited || rate.ResetAt == nil || *rate.ResetAt != 4102444800 ||
 		s.Primary == nil || s.Primary.UsedPercent != 64 || s.Secondary == nil || s.Secondary.UsedPercent != 0 ||
 		s.LastEvent.IsZero() {
 		t.Fatalf("unexpected status %+v", s)
@@ -122,13 +124,13 @@ func TestScaleStatusFromAppServer(t *testing.T) {
 	if err := json.Unmarshal([]byte(line), &brief); err != nil {
 		t.Fatal(line, err)
 	}
-	keys := []string{"project", "job", "session", "status", "turn_id", "completed_turns", "plan_step", "changed_files", "failed_command", "last_event_time", "rate_limit"}
+	keys := []string{"project", "job", "session", "status", "phase", "turn_id", "completed_turns", "plan_step", "changed_files", "failed_command", "last_event_time", "rate_limit"}
 	for _, key := range keys {
 		if brief[key] == nil {
 			t.Fatalf("missing %s in %s", key, line)
 		}
 	}
-	var rates rateLimitStatus
+	var rates rateLimitView
 	if err := json.Unmarshal(brief["rate_limit"], &rates); err != nil || !rates.RateLimited ||
 		rates.Primary == nil || rates.Primary.UsedPercent != 64 || len(brief) != len(keys) {
 		t.Fatal(line, err)

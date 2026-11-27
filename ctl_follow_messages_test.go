@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
@@ -34,9 +35,7 @@ func TestTailMessages(t *testing.T) {
 		t.Helper()
 		seq := offset + 1
 		record := fields{"seq": seq, "method": method, "params": params}
-		for k, v := range meta {
-			record[k] = v
-		}
+		maps.Copy(record, meta)
 		data, err := json.Marshal(record)
 		if err != nil {
 			t.Fatal(err)

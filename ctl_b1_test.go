@@ -115,6 +115,9 @@ func cliStreams(t *testing.T, code int, stdin []byte, exe string, args ...string
 	t.Helper()
 	ctx, cancel := fixtureContext(t)
 	defer cancel()
+	if exe == "python3" {
+		exe = pythonExe
+	}
 	cmd := exec.CommandContext(ctx, exe, args...)
 	cmd.Stdin = bytes.NewReader(stdin)
 	var diag bytes.Buffer
@@ -356,7 +359,7 @@ func TestB1ReleaseFallback(t *testing.T) {
 		t.Fatal("failed release published", e)
 	}
 	release.SHA256[key] = fmt.Sprintf("%x", sha256.Sum256([]byte("release")))
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		if _, e := cacheArtifact(ctx, version, plat, release); e != nil {
 			t.Fatal(e)
 		}

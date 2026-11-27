@@ -20,6 +20,18 @@ import (
 )
 
 // The subprocess fixture exercises real pipes, files and locks. It needs no model account.
+// pythonExe is the real python3 interpreter for reference comparisons, or
+// "python3" when none could be resolved.
+var pythonExe = "python3"
+
+func resolvePython() string {
+	out, err := exec.Command("python3", "-c", "import sys; print(sys.executable)").Output()
+	if path := strings.TrimSpace(string(out)); err == nil && filepath.IsAbs(path) {
+		return path
+	}
+	return "python3"
+}
+
 func TestMain(m *testing.M) {
 	if os.Getenv("GORACE") == "" {
 		_ = os.Setenv("GORACE", "atexit_sleep_ms=0")
@@ -34,6 +46,9 @@ func TestMain(m *testing.M) {
 		_ = os.Setenv("CX_TEST_CONFIG", dir)
 		_ = os.Setenv("XDG_CONFIG_HOME", dir)
 	}
+	// Resolve the real interpreter while HOME is still the caller's: version
+	// manager shims read their configuration from HOME, which fixtures replace.
+	pythonExe = resolvePython()
 	// Tests that exercise the disk watermark set min_free_bytes explicitly.
 	defaultMinFreeBytes, defaultMinFreeDivisor = 0, 0
 	trackFixtureWorkerStarts()
@@ -93,7 +108,7 @@ func trackFixtureWorkerStarts() {
 		}
 		defer closeBestEffort(lease)
 		// Hold the lease from spawn, including when the CLI can return
-		// before the worker's first instruction (such as fetch-turn).
+		// before the worker's first instruction.
 		cmd.ExtraFiles = append(cmd.ExtraFiles, lease)
 		return start(cmd)
 	}
@@ -556,7 +571,7 @@ func TestRunnerConversation(t *testing.T) {
 	until(func(s status) bool { return s.Turn == "first" })
 	check(run(ctx, []string{"start", "--job", "job", "--prompt-file", "missing"}))
 	check(run(ctx, []string{"resume", "--job", "job"}))
-	check(control(ctx, "say", dir, []string{"add three"}))
+	check(say(ctx, dir, "", "", options{}, []string{"add three"}))
 	approvalFile := func(which, id string) {
 		t.Helper()
 		until(func(s status) bool {
@@ -582,7 +597,7 @@ func TestRunnerConversation(t *testing.T) {
 	if string(b) != "STATUS: DONE\nthree files" {
 		t.Fatal(string(b))
 	}
-	check(control(ctx, "say", dir, []string{"second round"}))
+	check(say(ctx, dir, "", "", options{}, []string{"second round"}))
 	until(func(s status) bool { return s.Turn == "second" && s.State == "running" })
 	check(run(ctx, []string{"interrupt", "--job", "job"}))
 	until(func(s status) bool { return s.CompletedStatus == "interrupted" })
@@ -657,7 +672,7 @@ func TestConcurrentRegistrationAndInterruptedDelivery(t *testing.T) {
 			t.Fatal(recordErr)
 		}
 		record.ID = name
-		record, recordErr = appendInbox(t.Context(), dir, record, nil)
+		record, recordErr = appendInbox(t.Context(), dir, nil, record, nil)
 		if recordErr != nil {
 			t.Fatal(recordErr)
 		}
@@ -672,8 +687,12 @@ func TestConcurrentRegistrationAndInterruptedDelivery(t *testing.T) {
 	if err != nil || in.acks[1].Result != "delivered" || in.acks[2].Result != "uncertain" || len(in.claims) != 0 {
 		t.Fatal(in, err)
 	}
+	identity, _, _, err := captureJobIdentity(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, name := range []string{"ack.msg", "unknown.msg"} {
-		if publishErr := publishMessage(t.Context(), dir, name, inboxMessage{Text: "same"}); publishErr != nil {
+		if publishErr := publishMessage(t.Context(), dir, name, inboxMessage{Text: "same"}, identity); publishErr != nil {
 			t.Fatal(publishErr)
 		}
 	}
@@ -1268,7 +1287,7 @@ func TestFollowupQueueDeadlines(t *testing.T) {
 			}
 			h.await("a", func(s status) bool { return s.State == "queued" })
 			wantState := "timeout"
-			wantErr := error(context.DeadlineExceeded)
+			wantErr := context.DeadlineExceeded
 			if expireQueue {
 				if err := clock.WaitDeadline(h.ctx, clock.Now().Add(queueTimeout)); err != nil {
 					t.Fatal(err)

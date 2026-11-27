@@ -110,7 +110,7 @@ func installNode(ctx context.Context, root, src, dst, digest string) error {
 	return hostSettings(ctx, root, nil, true)
 }
 func upload(ctx context.Context, h endpoint, source, dest string) error {
-	for i := 0; i < 4; i++ {
+	for i := range 4 {
 		if i > 0 {
 			if err := pause(ctx, time.Second<<(i-1)); err != nil {
 				return err

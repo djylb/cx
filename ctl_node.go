@@ -172,7 +172,7 @@ func doctorNode(ctx context.Context, root string) error {
 	host, cfgErr := readHostConfig(root)
 	f["host_json"] = e == nil && cfgErr == nil
 	if cfgErr == nil {
-		addDiskStatus(f, diskPath(root), host)
+		addDiskStatus(f, root, host)
 		credentialDoctor(ctx, root, host, f)
 	}
 	cache := os.Getenv("GOCACHE")
@@ -243,7 +243,7 @@ func nodeControl(ctx context.Context, a []string) error {
 			defer stop()
 			s, err := waitJob(waitCtx, dir, false)
 			if err == nil || errors.As(err, new(stateFailure)) {
-				if e = json.NewEncoder(os.Stdout).Encode(s); e != nil {
+				if e = json.NewEncoder(os.Stdout).Encode(s.view(statusTime(ctx))); e != nil {
 					return e
 				}
 			}
@@ -326,15 +326,20 @@ func nodeControl(ctx context.Context, a []string) error {
 			if err := validateWaitProjects(req.Projects); err != nil {
 				return err
 			}
+			for _, id := range req.Jobs {
+				if err := validateWaitJob(id); err != nil {
+					return err
+				}
+			}
 			callCtx, cancel := timeshim.WithTimeout(ctx, timeshim.Or(contextClock(ctx)), req.Limit)
 			defer cancel()
 			var row *waitReport
 			var err error
 			cursor := req.Cursor
 			if cursor == nil {
-				cursor, err = initialWaitBaseline(callCtx, root, req.Projects, req.Session, req.FromStart)
+				cursor, err = initialWaitBaseline(callCtx, root, req.Session, req.FromStart)
 			} else if err = validateWaitBaseline(cursor); err == nil {
-				row, err = pollWaitAny(callCtx, root, req.Projects, req.Session, cursor)
+				row, err = pollWaitAny(callCtx, root, req.Projects, req.Session, cursor, req.Jobs...)
 			}
 			if err != nil {
 				if errors.Is(callCtx.Err(), context.DeadlineExceeded) {

@@ -150,11 +150,10 @@ func dispatch(ctx context.Context, args []string) error {
 		return nodeCLI(ctx, args)
 	}
 	err := controller(ctx, args)
-	var code ctlExit
 	if err == nil {
 		return nil
 	}
-	if errors.As(err, &code) {
+	if code, ok := errors.AsType[ctlExit](err); ok {
 		if code < 0 || code > 255 {
 			return ctlExit(125)
 		}
@@ -295,19 +294,19 @@ func nodeCLI(ctx context.Context, args []string) error {
 				return cleanNodeJob(ctx, args[1])
 			}
 			return errors.New("invalid clean arguments")
+		case "rebase-worker":
+			return rebaseWorker(ctx, args[1:])
 		case "result-download":
 			return nodeResult(ctx, args[1:])
 		case "observe-result":
 			return nodeObserveResult(ctx, args[1:])
-		case "fetch-turn":
-			return workerFetch(ctx, args[1:])
 		case "start-job":
 			if len(args) == 2 {
 				return startNodeJob(ctx, args[1])
 			}
 			return errors.New("invalid job request")
 		case "restart-job":
-			return restartNode(ctx, args[1:])
+			return restartNode(ctx, args[1:], nil, os.Stdout)
 		case "submit-script":
 			return receiveScript(ctx, args)
 		case "control-action":
@@ -600,8 +599,7 @@ func relayNode(ctx context.Context, args []string) error {
 			diagnosticf("cx: relay to %s: %v\n", dest.SSH, e)
 			return ctlExit(255)
 		}
-		var ex *exec.ExitError
-		if errors.As(e, &ex) {
+		if ex, ok := errors.AsType[*exec.ExitError](e); ok {
 			return ctlExit(ex.ExitCode())
 		}
 		return e

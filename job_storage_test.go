@@ -15,12 +15,11 @@ func TestJobStorageDoesNotReplaceFiles(t *testing.T) {
 	// snapshot storage, and publication/cleanup of whole directories.
 	allowed := map[string]map[string]int{
 		// These records are private cache maintenance metadata outside all job directories.
-		"build_cache.go":  {"prepareCaches": 1, "prepareCacheEntry": 1, "scanCaches": 1, "startCachedCommand": 1},
-		"main.go":         {"atomicWrite": 1, "atomicWriteSync": 1, "writeJSON": 1, "detachCleanJob": 1},
-		"ctl_apply.go":    {"installPlans": 2, "applyTurn": 2},
-		"ctl_baseline.go": {"rebaseTurn": 1},
-		"ctl_center.go":   {"freezeCompilerSource": 2, "compileSnapshot": 1},
-		"ctl_chat.go":     {"ctlChat": 1},
+		"build_cache.go": {"prepareCaches": 1, "prepareCacheEntry": 1, "scanCaches": 1, "startCachedCommand": 1},
+		"main.go":        {"atomicWrite": 1, "atomicWriteSync": 1, "writeJSON": 1, "detachCleanJob": 1},
+		"ctl_apply.go":   {"installPlans": 2, "applyTurn": 2},
+		"ctl_center.go":  {"freezeCompilerSource": 2, "compileSnapshot": 1},
+		"ctl_chat.go":    {"ctlChat": 1},
 		// Controller configuration mirrors, outside every job directory.
 		"ctl_context.go":         {"writeConfigFile": 1, "pushContext": 1},
 		"ctl_deploy.go":          {"configRelease": 1, "rememberPlatformVersion": 1, "cacheArtifact": 1, "cacheNode": 1},
@@ -30,10 +29,11 @@ func TestJobStorageDoesNotReplaceFiles(t *testing.T) {
 		"ctl_install_windows.go": {"replaceBinary": 1},
 		"ctl_journal.go":         {"journalDecision": 1},
 		"ctl_node.go":            {"hostSettings": 1},
-		"ctl_observe.go":         {"ctlWaitAny": 1},
+		"ctl_observe.go":         {"ctlWaitAny": 1, "saveLSSnapshot": 1}, // Controller-local ls cache, replaced whole.
 		"ctl_project.go":         {"ctlProject": 1},
 		"ctl_queue.go":           {"deployJob": 1, "submissionWorker": 3},
-		"ctl_result.go":          {"sealTurn": 1, "unpackTurn": 1, "workerFetch": 1, "publishResultMarker": 1, "forgetResult": 1, "Write": 1},
+		"ctl_rebase.go":          {"ctlRebase": 2, "recordRebaseFailure": 1, "dispatchRebase": 1, "claimRebase": 1}, // Controller-local pending rebase requests, replaced whole.
+		"ctl_result.go":          {"sealTurn": 1, "unpackTurn": 1, "publishResultMarker": 1, "forgetResult": 1, "Write": 1},
 		"ctl_route.go":           {"rememberRoute": 1},
 		"ctl_transfer.go":        {"receiveTask": 1},
 		"snap_publish.go":        {"snapPrerequisites": 1, "snapArchive": 1, "Publish": 1},
@@ -43,7 +43,7 @@ func TestJobStorageDoesNotReplaceFiles(t *testing.T) {
 	// function variable, must belong to one of these non-job scopes.
 	rawAllowed := map[string]map[string]int{
 		"ctl_apply.go":       {"planApply": 4, "installPlans": 2, "applyTurn": 1},
-		"ctl_baseline.go":    {"rebaseTurn": 1},
+		"ctl_baseline.go":    {"submitRebase": 1, "rebaseAttachments": 3}, // Controller-local sealed results and prompt file.
 		"ctl_center.go":      {"freezeCompilerSource": 2},
 		"ctl_cli.go":         {"preview": 1},
 		"ctl_deploy.go":      {"cacheArtifact": 1, "writeStream": 1, "copyFile": 1, "moduleDir": 1},
@@ -52,7 +52,7 @@ func TestJobStorageDoesNotReplaceFiles(t *testing.T) {
 		"ctl_queue.go":       {"queueJob": 1},
 		"ctl_setup.go":       {"receive": 1, "fileHash": 1, "installNode": 2, "upload": 1},
 		"ctl_ssh.go":         {"current": 1, "next": 1},
-		"ctl_submit.go":      {"controllerPolicy": 1, "ctlSubmit": 1, "submitBatch": 1},
+		"ctl_submit.go":      {"controllerPolicy": 1, "ctlSubmitWithRebase": 1, "submitBatch": 1},
 		"facts.go":           {"osVersion": 1, "platformFacts": 3, "fingerprint": 1},
 		"main.go":            {"atomicWriteSync": 2},
 		"snap_freeze.go":     {"snapStage": 1, "snapCapture": 1},

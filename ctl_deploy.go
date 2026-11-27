@@ -49,7 +49,7 @@ func platform(s string) (string, error) {
 			osName = v
 		}
 	}
-	for _, v := range strings.Fields(s) {
+	for v := range strings.FieldsSeq(s) {
 		switch v {
 		case "arm64", "aarch64":
 			arch = "arm64"

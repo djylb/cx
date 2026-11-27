@@ -11,13 +11,17 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/djylb/timeshim"
 )
 
 type waitCursor struct {
+	DirKey       string   `json:"dir_key"`
+	EventID      string   `json:"event_id,omitempty"`
 	StateCursor  string   `json:"state_cursor"`
 	OutboxCursor string   `json:"outbox_cursor,omitempty"`
 	Question     string   `json:"question,omitempty"`
@@ -33,6 +37,7 @@ type waitCursor struct {
 }
 
 type waitReport struct {
+	ResetAt     *int64 `json:"reset_at"`
 	Host        string `json:"host,omitempty"`
 	Project     string `json:"project"`
 	Job         string `json:"job"`
@@ -53,6 +58,7 @@ type waitPollRequest struct {
 	Cursor    map[string]waitCursor
 	Session   string
 	Projects  []string
+	Jobs      []string
 	Limit     time.Duration
 	FromStart bool
 }
@@ -109,6 +115,14 @@ func validateWaitProjects(projects []string) error {
 		}
 	}
 	return nil
+}
+
+func validateWaitJob(id string) error {
+	if !strings.Contains(id, "/") {
+		return fmt.Errorf("expected PROJECT/JOB, got %q", id)
+	}
+	_, err := jobDir("", id)
+	return err
 }
 
 func readWaitCursorFile(path string) ([]byte, error) {
@@ -186,9 +200,20 @@ func (r *waitReport) setNext(host string) {
 	}
 }
 
-func initialWaitBaseline(ctx context.Context, root string, projects []string, session string, fromStart bool) (map[string]waitCursor, error) {
+func initialWaitBaseline(ctx context.Context, root, session string, fromStart bool) (map[string]waitCursor, error) {
+	for ctx.Err() == nil {
+		baseline, err := seedWaitBaseline(ctx, root, session, fromStart)
+		if !errors.Is(err, errJobReplaced) {
+			return baseline, err
+		}
+		// A replacement during the scan invalidates the initial snapshot.
+	}
+	return nil, ctx.Err()
+}
+
+func seedWaitBaseline(ctx context.Context, root, session string, fromStart bool) (map[string]waitCursor, error) {
 	baseline := make(map[string]waitCursor)
-	err := walkJobDirs(ctx, root, projects, func(dir, project, job string) (bool, bool, error) {
+	err := walkJobDirs(ctx, root, nil, func(dir, project, job string) (bool, bool, error) {
 		observer, err := openJobObservation(dir, stateCursor{}, "")
 		if err != nil {
 			return false, false, err
@@ -198,15 +223,15 @@ func initialWaitBaseline(ctx context.Context, root string, projects []string, se
 		if s.State == "" {
 			return false, false, nil
 		}
-		if len(projects) > 0 && project == "" || session != "" && s.Session != session {
+		if session != "" && s.Session != session {
 			return true, false, nil
 		}
 		id := waitJobID(project, job)
 		if fromStart {
-			baseline[id] = waitCursor{RunID: s.RunID, StateCursor: (stateCursor{}).String()}
+			baseline[id] = waitCursor{DirKey: observer.identity.key, RunID: s.RunID, StateCursor: (stateCursor{}).String()}
 			return true, false, nil
 		}
-		if err = observer.poll(ctx); errors.Is(err, os.ErrNotExist) || errors.Is(err, errJobReplaced) {
+		if err = observer.poll(ctx); errors.Is(err, os.ErrNotExist) {
 			return false, false, nil
 		} else if err != nil {
 			return true, false, err
@@ -215,7 +240,7 @@ func initialWaitBaseline(ctx context.Context, root string, projects []string, se
 		if session != "" && s.Session != session {
 			return true, false, nil
 		}
-		cursor := waitCursor{RunID: s.RunID, StateCursor: observer.cursor.String(), Finished: s.Finished, QueueGeneration: s.QueueGeneration}
+		cursor := waitCursor{DirKey: observer.identity.key, RunID: s.RunID, StateCursor: observer.cursor.String(), Finished: s.Finished, QueueGeneration: s.QueueGeneration}
 		if s.State == "waiting_input" {
 			cursor.Question = questionKey(s)
 		}
@@ -243,9 +268,7 @@ func initialWaitBaseline(ctx context.Context, root string, projects []string, se
 			}
 			cursor.OutboxCursor = tail.Cursor().String()
 		}
-		if err = observer.identity.checkDir(dir); errors.Is(err, errJobReplaced) || errors.Is(err, os.ErrNotExist) {
-			return true, false, nil
-		} else if err != nil {
+		if err = observer.identity.checkDir(dir); err != nil {
 			return true, false, err
 		}
 		baseline[id] = cursor
@@ -271,7 +294,7 @@ func waitAny(ctx context.Context, root string, projects []string, session, since
 		row.setNext("local")
 		return json.NewEncoder(out).Encode(row)
 	}
-	baseline, saved, err := loadWaitBaseline(ctx, root, projects, session, sinceFile, fromStart)
+	baseline, saved, err := loadWaitBaseline(ctx, root, session, sinceFile, fromStart)
 	if err != nil {
 		return err
 	}
@@ -293,7 +316,7 @@ func waitAny(ctx context.Context, root string, projects []string, session, since
 				return err
 			}
 			if !advanced {
-				baseline, saved, err = loadWaitBaseline(ctx, root, projects, session, sinceFile, fromStart)
+				baseline, saved, err = loadWaitBaseline(ctx, root, session, sinceFile, fromStart)
 				if err != nil {
 					return err
 				}
@@ -314,7 +337,7 @@ func waitAny(ctx context.Context, root string, projects []string, session, since
 	}
 }
 
-func loadWaitBaseline(ctx context.Context, root string, projects []string, session, sinceFile string, fromStart bool) (map[string]waitCursor, []byte, error) {
+func loadWaitBaseline(ctx context.Context, root, session, sinceFile string, fromStart bool) (map[string]waitCursor, []byte, error) {
 	var saved []byte
 	if sinceFile != "" {
 		var err error
@@ -324,7 +347,7 @@ func loadWaitBaseline(ctx context.Context, root string, projects []string, sessi
 		}
 	}
 	if saved == nil && (sinceFile != "" || fromStart) {
-		baseline, err := initialWaitBaseline(ctx, root, projects, session, fromStart)
+		baseline, err := initialWaitBaseline(ctx, root, session, fromStart)
 		if err != nil || sinceFile == "" {
 			return baseline, nil, err
 		}
@@ -344,13 +367,13 @@ func loadWaitBaseline(ctx context.Context, root string, projects []string, sessi
 	return baseline, saved, err
 }
 
-func pollWaitAny(ctx context.Context, root string, projects []string, session string, baseline map[string]waitCursor) (*waitReport, error) {
+func pollWaitAny(ctx context.Context, root string, projects []string, session string, baseline map[string]waitCursor, onlyJobs ...string) (*waitReport, error) {
 	tick := timeshim.NewTicker(timeshim.Or(contextClock(ctx)), time.Second)
 	defer tick.Stop()
-	return selectWaitAny(ctx, root, projects, session, baseline, tick.C, nil)
+	return selectWaitAny(ctx, root, projects, session, baseline, tick.C, nil, onlyJobs...)
 }
 
-func selectWaitAny(ctx context.Context, root string, projects []string, session string, baseline map[string]waitCursor, ticks <-chan time.Time, output func(*waitReport) error) (*waitReport, error) {
+func selectWaitAny(ctx context.Context, root string, projects []string, session string, baseline map[string]waitCursor, ticks <-chan time.Time, output func(*waitReport) error, onlyJobs ...string) (*waitReport, error) {
 	// A floor belongs to this observation call. A job that loses the race
 	// to another result must retain its original persisted cursor.
 	type observedJob struct {
@@ -374,6 +397,9 @@ func selectWaitAny(ctx context.Context, root string, projects []string, session 
 		var result *waitReport
 		err := walkJobDirs(ctx, root, projects, func(dir, p, j string) (bool, bool, error) {
 			id := waitJobID(p, j)
+			if len(onlyJobs) > 0 && !slices.Contains(onlyJobs, id) {
+				return false, false, nil
+			}
 			key, err := jobDirectoryKey(dir)
 			if errors.Is(err, os.ErrNotExist) {
 				return false, false, nil
@@ -382,6 +408,9 @@ func selectWaitAny(ctx context.Context, root string, projects []string, session 
 				return false, false, err
 			}
 			before := baseline[id]
+			if before.DirKey != key {
+				before = waitCursor{DirKey: key}
+			}
 			job := jobs[dir]
 			if job != nil && key != job.key {
 				closeBestEffort(job.jobStateObserver)
@@ -402,18 +431,17 @@ func selectWaitAny(ctx context.Context, root string, projects []string, session 
 				if openErr != nil {
 					return false, false, openErr
 				}
+				if observer.identity.key != key {
+					closeBestEffort(observer)
+					return false, false, nil
+				}
 				if baseline != nil {
-					finished := observer.s.Finished
-					if !replacedRun(before.RunID, observer.s.RunID) {
-						if from != nil && *from == observer.tail.Cursor() {
-							finished = before.Finished
-							observer.watchWithdrawals = true
-							observer.deliveredWithdrawals = before.Withdrawals
-						} else {
-							// Without a history position, snapshots written after
-							// the seed may still carry its previous completion.
-							finished = max(finished, before.Finished)
-						}
+					// Snapshots after a seed can still carry earlier completions.
+					finished := max(observer.s.Finished, before.Finished)
+					if !replacedRun(before.RunID, observer.s.RunID) && from != nil && *from == observer.tail.Cursor() {
+						finished = before.Finished
+						observer.watchWithdrawals = true
+						observer.deliveredWithdrawals = before.Withdrawals
 					}
 					observer.floor = &status{RunID: observer.s.RunID, Finished: finished}
 				}
@@ -466,7 +494,9 @@ func selectWaitAny(ctx context.Context, root string, projects []string, session 
 				}
 			}
 			if replacedRun(before.RunID, s.RunID) {
-				before = waitCursor{}
+				// Mail, queue and input acknowledgements belong to the run.
+				// Completion and terminal acknowledgements belong to the job.
+				before = waitCursor{DirKey: key, Finished: before.Finished, Terminal: before.Terminal, EventID: before.EventID}
 			}
 			job.outbox = max(job.outbox, before.OutboxSeq)
 			if job.mail != nil {
@@ -600,6 +630,9 @@ func waitEvent(s status, before waitCursor, anchor, cursor stateCursor, outbox u
 		report.EventID = waitEventID(s.RunID, report.Event, fmt.Sprintf("%d/%s", selected.Number, selected.TurnID))
 		report.Finished, report.Outcome = selected.Number, selected.Outcome
 		report.Turn, report.RateLimited = selected.Number, selected.RateLimited
+		if report.RateLimited {
+			report.ResetAt = selected.ResetAt
+		}
 		report.Code, _ = outcomeResult("", selected.Outcome)
 		return report, next
 	}
@@ -647,16 +680,17 @@ func replacedRun(before, now string) bool {
 var errQuestion = errors.New("waiting for input")
 
 func questionKey(s status) string {
-	key := s.RunID + "/" + s.InputKind + "/" + s.LastCompleted
+	var key strings.Builder
+	key.WriteString(s.RunID + "/" + s.InputKind + "/" + s.LastCompleted)
 	if s.InputKind == "server_request" || s.InputKind == agentAsk {
 		for _, a := range s.Approvals {
 			if inputMethod(a.Method) {
-				key += fmt.Sprintf("/%d/%s/%d", a.Generation, a.ID, a.Requested.UnixNano())
+				_, _ = fmt.Fprintf(&key, "/%d/%s/%d", a.Generation, a.ID, a.Requested.UnixNano())
 				break
 			}
 		}
 	}
-	return fmt.Sprintf("%x", sha256.Sum256([]byte(key)))
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(key.String())))
 }
 func waitEventID(runID, kind, identity string) string {
 	return fmt.Sprintf("%x", sha256.Sum256(fmt.Appendf(nil, "%q/%q/%q", runID, kind, identity)))

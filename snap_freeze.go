@@ -58,8 +58,8 @@ application_default_credentials.json
 `
 
 func snapName(name string) error {
-	for _, c := range strings.Split(strings.ToLower(name), "/") {
-		for _, p := range strings.Split(snapDeny, "\n") {
+	for c := range strings.SplitSeq(strings.ToLower(name), "/") {
+		for p := range strings.SplitSeq(snapDeny, "\n") {
 			if p != "" && !strings.HasPrefix(p, "#") {
 				if ok, _ := path.Match(p, c); ok {
 					return fmt.Errorf("sensitive path: %s", name)
@@ -110,11 +110,11 @@ func snapIncludes(repo string, patterns []string) ([]string, error) {
 				return nil, e
 			}
 			parent := filepath.Join(repo, filepath.FromSlash(path.Dir(name)))
-			real, e := filepath.EvalSymlinks(parent)
+			resolved, e := filepath.EvalSymlinks(parent)
 			if e != nil {
 				return nil, e
 			}
-			if st.IsDir() || real != parent {
+			if st.IsDir() || resolved != parent {
 				continue
 			}
 			files[name], found = true, true
@@ -146,8 +146,14 @@ func snapStage(source, stage snapGit, head, tmp string, isGit bool, include []st
 		for _, v := range snapList(string(entries)) {
 			meta, n, _ := strings.Cut(v, "\t")
 			f := strings.Fields(meta)
-			if len(f) != 3 || f[2] != "0" || f[0] == "160000" {
-				return "", errors.New("unsupported submodule or unresolved index")
+			if len(f) != 3 {
+				return "", fmt.Errorf("%s: invalid Git index entry for %q", source.dir, n)
+			}
+			if f[2] != "0" {
+				return "", fmt.Errorf("%s: unresolved merge in Git index for %q. Resolve the conflict and stage the file, run git merge --abort if merging, or dispatch from another worktree", source.dir, n)
+			}
+			if f[0] == "160000" {
+				return "", fmt.Errorf("%s: snapshot does not support Git submodule %q in the index. Dispatch from another worktree without the submodule", source.dir, n)
 			}
 			modes[n] = f[0]
 			indexed[n] = f[1]
@@ -169,7 +175,7 @@ func snapStage(source, stage snapGit, head, tmp string, isGit bool, include []st
 			for _, v := range snapList(string(b)) {
 				meta, n, _ := strings.Cut(v, "\t")
 				if strings.HasPrefix(meta, "160000 ") {
-					return "", errors.New("submodule in source HEAD")
+					return "", fmt.Errorf("%s: snapshot does not support Git submodule %q in HEAD. Dispatch from another worktree without the submodule", source.dir, n)
 				}
 				tracked[n] = true
 			}
@@ -390,7 +396,7 @@ func snapCapture(ctx context.Context, repo, store, tmp, history string, isGit bo
 			if historyErr != nil {
 				return r, historyErr
 			}
-			for _, s := range strings.Fields(b) {
+			for s := range strings.FieldsSeq(b) {
 				if strings.HasPrefix(s, "-") {
 					r.Shallow = append(r.Shallow, s[1:])
 				}

@@ -1,6 +1,6 @@
 github.com/BurntSushi/toml v1.6.0 h1:dRaEfpa2VI55EwlIW72hMRHdWouJeRF7TPYhI+AUQjk=
 github.com/BurntSushi/toml v1.6.0/go.mod h1:ukJfTF/6rtPPRCnwkur4qwRxa8vTRFBF0uk2lLoLwho=
-github.com/djylb/timeshim v0.0.0-20261126212843-021ae9abf38b h1:ue0+7bPa0k1MeY1ltkVWLr3uXpRk69wAoUi8Xn4PFlk=
-github.com/djylb/timeshim v0.0.0-20261126212843-021ae9abf38b/go.mod h1:btb4BaMuOhpcFZzNgd0ZiXt621fpdKjgi6uClfmtZek=
+github.com/djylb/timeshim v0.0.0-20261127134212-71e1cfe2628d h1:0LKaivbdfJE0XnaaMm7nuvK8Q8YjcRZQYm8LQi2E7Ww=
+github.com/djylb/timeshim v0.0.0-20261127134212-71e1cfe2628d/go.mod h1:btb4BaMuOhpcFZzNgd0ZiXt621fpdKjgi6uClfmtZek=
 golang.org/x/sys v0.50.0 h1:dkKZEFTEKaLr1sjhs0WiKqoi8Jj5nHbS3Njmx1UoMJs=
 golang.org/x/sys v0.50.0/go.mod h1:hNLxWAXmnKAxqDtdwIYC4bM9oQPEecfsnNMuSxOs3og=

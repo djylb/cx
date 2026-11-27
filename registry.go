@@ -107,7 +107,7 @@ func claimKey(root string, c config, s status) error {
 			}
 		}
 		if current.State != "" && (!current.final || (current.State == "done" && current.CompletedStatus == "completed")) {
-			if outputErr := json.NewEncoder(os.Stdout).Encode(current); outputErr != nil {
+			if outputErr := json.NewEncoder(os.Stdout).Encode(current.view(time.Now().Unix())); outputErr != nil {
 				return outputErr
 			}
 			return errDuplicate
@@ -149,8 +149,8 @@ func archivedDedupStatus(dir string, ref receipt) (status, error) {
 	if err != nil {
 		return s, err
 	}
-	for i := len(entries) - 1; i >= 0; i-- {
-		record, _, err := latestFileKind(filepath.Join(archive, entries[i].Name()), "status")
+	for _, entrie := range slices.Backward(entries) {
+		record, _, err := latestFileKind(filepath.Join(archive, entrie.Name()), "status")
 		if err != nil {
 			return s, err
 		}
@@ -277,32 +277,35 @@ func scanJobs(ctx context.Context, root, project, session string, visit func(sta
 
 func listJobs(ctx context.Context, root, project, session string, briefOnly bool) error {
 	out := json.NewEncoder(os.Stdout)
+	now := statusTime(ctx)
 	return scanJobs(ctx, root, project, session, func(s status) (bool, error) {
 		if briefOnly {
-			return false, out.Encode(briefStatus(s))
+			return false, out.Encode(briefStatus(ctx, filepath.Join(root, s.Project, s.Job), s, now))
 		}
 		return false, out.Encode(struct {
-			RateLimit rateLimitStatus `json:"rate_limit"`
-			status
-		}{RateLimit: s.rateLimitStatus, status: s})
+			RateLimit rateLimitView `json:"rate_limit"`
+			statusView
+		}{RateLimit: s.rateLimitView(now), statusView: s.view(now)})
 	})
 }
 
-func briefStatus(s status) any {
+func briefStatus(ctx context.Context, dir string, s status, now int64) any {
+	rate := s.rateLimitView(now)
 	return struct {
-		LastEvent time.Time       `json:"last_event_time"`
-		RateLimit rateLimitStatus `json:"rate_limit"`
-		Project   string          `json:"project"`
-		Job       string          `json:"job"`
-		Session   string          `json:"session"`
-		Profile   string          `json:"profile,omitempty"`
-		State     string          `json:"status"`
-		Turn      string          `json:"turn_id"`
+		LastEvent time.Time     `json:"last_event_time"`
+		RateLimit rateLimitView `json:"rate_limit"`
+		Project   string        `json:"project"`
+		Job       string        `json:"job"`
+		Session   string        `json:"session"`
+		Profile   string        `json:"profile,omitempty"`
+		State     string        `json:"status"`
+		Phase     string        `json:"phase"`
+		Turn      string        `json:"turn_id"`
 		turnSummary
 		Finished int64 `json:"completed_turns"`
 	}{
-		Project: s.Project, Job: s.Job, Session: s.Session, Profile: s.Profile, State: s.State,
+		Project: s.Project, Job: s.Job, Session: s.Session, Profile: s.Profile, State: s.State, Phase: s.phase(ctx, dir, rate.RateLimited),
 		Turn: s.Turn, Finished: s.Finished, LastEvent: s.LastEvent,
-		turnSummary: s.turnSummary, RateLimit: s.rateLimitStatus,
+		turnSummary: s.turnSummary, RateLimit: rate,
 	}
 }

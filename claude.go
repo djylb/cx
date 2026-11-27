@@ -59,7 +59,6 @@ type claudeRateLimit struct {
 	ResetsAt    *int64   `json:"resetsAt"`
 	Utilization *float64 `json:"utilization"`
 	Status      string   `json:"status"`
-	Type        string   `json:"rateLimitType"`
 }
 
 // tokenCounts is the engine-neutral token usage shape stored in status.usage.
@@ -107,10 +106,6 @@ func (l claudeRateLimit) snapshot() rateLimitSnapshot {
 	s := rateLimitSnapshot{LimitID: "claude"}
 	switch {
 	case l.Status == "rejected":
-		s.RateLimitReachedType = l.Type
-		if s.RateLimitReachedType == "" {
-			s.RateLimitReachedType = "rejected"
-		}
 		s.Primary = &rateLimitReading{ResetsAt: l.ResetsAt, UsedPercent: 100}
 	case l.Utilization != nil:
 		pct := *l.Utilization
@@ -250,7 +245,7 @@ func (s *claudeSession) shutdown() error {
 
 // claudeArgs maps the job's sandbox, network, roots, effort and tools onto Claude CLI flags.
 // mcpConfig names the job-tool server configuration, or is empty without job tools.
-func (c *config) claudeArgs(session, mcpConfig string) []string {
+func (c *config) claudeArgs(session, mcpConfig string, memberRoots ...string) []string {
 	args := []string{"-p", "--output-format", "stream-json", "--input-format", "stream-json", "--verbose"}
 	if session != "" {
 		args = append(args, "--resume", session)
@@ -266,7 +261,7 @@ func (c *config) claudeArgs(session, mcpConfig string) []string {
 	if c.Sandbox == "workspace-write" || c.Sandbox == dangerFullAccess {
 		tools = append(tools, "Edit", "Write", "Bash")
 		allowed = append(allowed, "Edit(./**)", "Write(./**)", "Bash")
-		for _, root := range c.Roots {
+		for _, root := range append(memberRoots, c.Roots...) {
 			args = append(args, "--add-dir", root)
 			pattern := "//" + strings.TrimPrefix(filepath.ToSlash(root), "/") + "/**"
 			allowed = append(allowed, "Edit("+pattern+")", "Write("+pattern+")")
@@ -401,6 +396,7 @@ func claudeURLImage(url string) (fields, error) {
 		}
 		return claudeImageBlock("data URL", data)
 	}
+	//goland:noinspection HttpUrlsUsage // Remote image URLs are passed through as given.
 	if strings.HasPrefix(url, "https://") || strings.HasPrefix(url, "http://") {
 		return fields{"type": "image", "source": fields{"type": "url", "url": url}}, nil
 	}
@@ -412,6 +408,13 @@ func (r *runner) startClaude(input any, id string) error {
 	if err != nil {
 		return err
 	}
+	var memberRoots []string
+	if r.c.Sandbox == "workspace-write" || r.c.Sandbox == dangerFullAccess {
+		memberRoots, err = snapshotMemberRoots(r.root, r.c.Dir)
+		if err != nil {
+			return err
+		}
+	}
 	if err = r.acquireSlot(); err != nil {
 		return err
 	}
@@ -421,7 +424,7 @@ func (r *runner) startClaude(input any, id string) error {
 			return err
 		}
 	}
-	cmd := exec.Command("claude", r.c.claudeArgs(r.s.Thread, toolConfig)...)
+	cmd := exec.Command("claude", r.c.claudeArgs(r.s.Thread, toolConfig, memberRoots...)...)
 	cmd.WaitDelay = 2 * time.Second
 	cmd.Env = append(cmd.Environ(), fmt.Sprintf("MCP_TOOL_TIMEOUT=%d", jobToolTimeout.Milliseconds()))
 	cmd.Dir = r.c.Dir
@@ -580,7 +583,7 @@ func (r *runner) consumeClaude(f claudeFrame) error {
 		s.result = &e
 	case "rate_limit_event":
 		if e.RateLimitInfo != nil {
-			r.s.update(e.RateLimitInfo.snapshot(), time.Now().Unix())
+			r.s.update(e.RateLimitInfo.snapshot())
 		}
 	}
 	return nil

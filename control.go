@@ -4,15 +4,12 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
-	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -310,6 +307,13 @@ type waitObservation struct {
 	status
 }
 
+func (o waitObservation) view(now int64) any {
+	return struct {
+		rateLimitProjection
+		waitObservation
+	}{rateLimitProjection: o.rateLimit(now), waitObservation: o}
+}
+
 func waitJob(ctx context.Context, dir string, acknowledge bool) (waitObservation, error) {
 	clock := timeshim.Or(contextClock(ctx))
 	observer, err := openJobObservation(dir, stateCursor{}, "")
@@ -358,7 +362,7 @@ func waitJob(ctx context.Context, dir string, acknowledge bool) (waitObservation
 				observation.NoticeKey = observer.identity.key
 			}
 			fresh, noticeErr := deliverNotice(ctx, dir, observer.identity, observation.EventID, acknowledge, func() error {
-				return json.NewEncoder(os.Stdout).Encode(observation)
+				return json.NewEncoder(os.Stdout).Encode(observation.view(statusTime(ctx)))
 			})
 			if noticeErr != nil {
 				return waitObservation{}, noticeErr
@@ -376,7 +380,7 @@ func waitJob(ctx context.Context, dir string, acknowledge bool) (waitObservation
 			}
 			fresh, claimErr := deliverNotice(ctx, dir, observer.identity, observation.EventID, acknowledge, func() error {
 				if !acknowledge {
-					return json.NewEncoder(os.Stdout).Encode(observation)
+					return json.NewEncoder(os.Stdout).Encode(observation.view(statusTime(ctx)))
 				}
 				_, printErr := fmt.Printf("job=%s status=waiting_input input_kind=%s\n", s.Job, s.InputKind)
 				return printErr
@@ -423,6 +427,8 @@ func waitResult(initial, s status, busy bool, selected *turnCompletion) waitObse
 		s.LastCompleted = ""
 		if s.CompletedStatus == initial.CompletedStatus {
 			s.CompletedStatus = ""
+			s.CompletedRateLimited = false
+			s.CompletedResetAt = nil
 		}
 		return waitObservation{status: s}
 	}
@@ -430,6 +436,8 @@ func waitResult(initial, s status, busy bool, selected *turnCompletion) waitObse
 	if busy && selected != nil {
 		result = selected.observedResult
 		s.LastCompleted, s.CompletedStatus = selected.TurnID, selected.Outcome
+		s.CompletedRateLimited = selected.RateLimited
+		s.CompletedResetAt = selected.ResetAt
 	}
 	observation := waitObservation{status: s}
 	if result.RunID != "" && (result.TurnID != "" || result.Number == 0 && readyResult(s)) {
@@ -463,7 +471,7 @@ func monitorContext(ctx context.Context, limit time.Duration) (context.Context, 
 }
 
 func control(ctx context.Context, op, dir string, args []string) error {
-	if op != "say" && op != "log" && len(args) != 0 {
+	if op != "log" && len(args) != 0 {
 		return fmt.Errorf("%s: unexpected arguments", op)
 	}
 	switch op {
@@ -480,7 +488,7 @@ func control(ctx context.Context, op, dir string, args []string) error {
 		if err != nil {
 			return err
 		}
-		return json.NewEncoder(os.Stdout).Encode(s)
+		return json.NewEncoder(os.Stdout).Encode(s.view(statusTime(ctx)))
 	case "wait", "tail":
 		waitCtx, cancel, err := monitorContext(ctx, 0)
 		if err != nil {
@@ -490,47 +498,10 @@ func control(ctx context.Context, op, dir string, args []string) error {
 		return observe(waitCtx, op, dir)
 	case "log":
 		return logFrom(dir, args)
-	case "say":
 	default:
 		return fmt.Errorf("unknown operation %q", op)
 	}
-
-	var name string
-	var b []byte
-	if len(args) != 1 {
-		return errors.New("say requires text or @file")
-	}
-	if strings.HasPrefix(args[0], "@") {
-		var err error
-		b, err = readSharedFile(args[0][1:])
-		if err != nil {
-			return err
-		}
-	} else {
-		b = []byte(args[0])
-	}
-	if strings.TrimSpace(string(b)) == "" {
-		return errors.New("empty message")
-	}
-	var nonce [8]byte
-	if _, err := rand.Read(nonce[:]); err != nil {
-		return err
-	}
-	name = fmt.Sprintf("%019d-%s.msg", time.Now().UnixNano(), hex.EncodeToString(nonce[:]))
-	if v := os.Getenv("CXRUN_MSG_NAME"); v != "" {
-		if !msgName.MatchString(v) {
-			return errors.New("invalid CXRUN_MSG_NAME")
-		}
-		name = v
-	}
-	if err := publishMessage(ctx, dir, name, inboxMessage{Text: string(b)}); err != nil {
-		return err
-	}
-	fmt.Println(name)
-	return nil
 }
-
-var msgName = regexp.MustCompile(`^[0-9]{19}-[0-9a-f]{16}\.msg$`)
 
 // errDrained: the job reached a terminal state and logFrom printed everything; main maps it to exit code 10.
 var errDrained = errors.New("log drained")

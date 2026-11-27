@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -42,7 +43,7 @@ func osVersion(ctx context.Context) string {
 		return probe(ctx, "cmd", "/d", "/c", "ver")
 	case "linux":
 		if b, err := os.ReadFile("/etc/os-release"); err == nil {
-			for _, line := range strings.Split(string(b), "\n") {
+			for line := range strings.SplitSeq(string(b), "\n") {
 				if v, ok := strings.CutPrefix(line, "PRETTY_NAME="); ok {
 					return strings.Trim(v, "\"")
 				}
@@ -64,7 +65,7 @@ const hostFactsTimeout = 12 * time.Second
 
 func emptyFacts() fields {
 	f := fields{"os": runtime.GOOS, "arch": runtime.GOARCH, "cpu_cores": runtime.NumCPU()}
-	for _, k := range strings.Fields("os_version cpu_model memory_total_bytes memory_available_bytes disk_free_bytes load1 cpu_usage_percent engines version_managers") {
+	for k := range strings.FieldsSeq("os_version cpu_model memory_total_bytes memory_available_bytes disk_free_bytes load1 cpu_usage_percent engines version_managers") {
 		f[k] = nil
 	}
 	return f
@@ -86,9 +87,7 @@ func hostFacts(ctx context.Context, root string) fields {
 	for range probes {
 		select {
 		case values := <-results:
-			for k, v := range values {
-				f[k] = v
-			}
+			maps.Copy(f, values)
 		case <-ctx.Done():
 			return f
 		}
@@ -151,9 +150,7 @@ func platformFacts(ctx context.Context, root string) fields {
 		if b, err := c.Output(); err == nil {
 			var values fields
 			if json.Unmarshal(b, &values) == nil {
-				for k, v := range values {
-					f[k] = v
-				}
+				maps.Copy(f, values)
 			}
 		}
 		return f
@@ -162,7 +159,7 @@ func platformFacts(ctx context.Context, root string) fields {
 	switch runtime.GOOS {
 	case "linux":
 		b, _ := os.ReadFile("/proc/cpuinfo")
-		for _, line := range strings.Split(string(b), "\n") {
+		for line := range strings.SplitSeq(string(b), "\n") {
 			k, v, _ := strings.Cut(line, ":")
 			if strings.TrimSpace(k) == "model name" {
 				f["cpu_model"] = strings.TrimSpace(v)
@@ -170,7 +167,7 @@ func platformFacts(ctx context.Context, root string) fields {
 			}
 		}
 		b, _ = os.ReadFile("/proc/meminfo")
-		for _, line := range strings.Split(string(b), "\n") {
+		for line := range strings.SplitSeq(string(b), "\n") {
 			c := strings.Fields(line)
 			if len(c) != 3 || c[2] != "kB" {
 				continue
@@ -239,7 +236,7 @@ func fingerprint(ctx context.Context, dir string) (string, error) {
 	for _, e := range engines {
 		record(e.name, probe(ctx, append([]string{e.binary}, e.versionArgs...)...))
 	}
-	for _, name := range strings.Fields(".mise.toml mise.toml .tool-versions go.mod rust-toolchain.toml rust-toolchain .python-version .nvmrc .node-version package.json") {
+	for name := range strings.FieldsSeq(".mise.toml mise.toml .tool-versions go.mod rust-toolchain.toml rust-toolchain .python-version .nvmrc .node-version package.json") {
 		path := filepath.Join(dir, name)
 		f, err := os.Open(path)
 		if os.IsNotExist(err) {
@@ -312,7 +309,11 @@ func hostInfoCLI(ctx context.Context, op string, fs *flag.FlagSet, root *string,
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 	if op == "facts" {
-		return json.NewEncoder(os.Stdout).Encode(hostFacts(ctx, *root))
+		f := hostFacts(ctx, *root)
+		if host, err := readHostConfig(*root); err == nil {
+			addDiskStatus(f, *root, host)
+		}
+		return json.NewEncoder(os.Stdout).Encode(f)
 	}
 	type result struct {
 		v   fields

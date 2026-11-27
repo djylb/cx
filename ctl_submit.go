@@ -69,6 +69,15 @@ func loadSnapshot(sid SnapshotID) (Manifest, error) {
 	return m, e
 }
 func ctlSubmit(ctx context.Context, hs endpoints, op string, o ctlOptions) error {
+	return ctlSubmitWithRebase(ctx, hs, op, o, rebaseInput{})
+}
+
+type rebaseInput struct {
+	files map[string][]byte
+	key   string
+}
+
+func ctlSubmitWithRebase(ctx context.Context, hs endpoints, op string, o ctlOptions, rebase rebaseInput) error {
 	if op == "snapshot" {
 		if len(o.pos) != 1 {
 			return errors.New("snapshot requires DIR")
@@ -318,8 +327,19 @@ func ctlSubmit(ctx context.Context, hs endpoints, op string, o ctlOptions) error
 	if e = attachContext(&req, p, o.interactive, o.context); e != nil {
 		return e
 	}
+	for name, data := range rebase.files {
+		if _, exists := req.Context[name]; exists {
+			return fmt.Errorf("submission context already contains %q", name)
+		}
+		req.Context[name] = data
+	}
+
 	if jobTools && req.Preamble != "" {
 		req.Preamble = strings.TrimRight(req.Preamble, "\n") + "\n" + jobToolsNote
+	}
+	// Without a preamble the caller submits its input verbatim.
+	if o.sandbox != dangerFullAccess && req.Preamble != "" {
+		req.Preamble = strings.TrimRight(req.Preamble, "\n") + "\n" + sandboxNote
 	}
 	if !o.inplace {
 		req.Snapshot, e = submitSnapshot(ctx, src, o, def)
@@ -357,14 +377,16 @@ func ctlSubmit(ctx context.Context, hs endpoints, op string, o ctlOptions) error
 	if e = forgetResult(host, id); e != nil {
 		return e
 	}
-	if e = queueJob(ctx, queuedJob{req, origin}, o.sync || o.inplace || op == "agent"); e != nil {
+	if e = queueJob(ctx, queuedJob{Request: req, Origin: origin, Rebase: rebase.key}, o.sync || o.inplace || op == "agent"); e != nil {
 		return e
 	}
 	if op == "agent" {
 		diagnosticf("JOB=%s\n", id)
 		return agentReport(ctx, host, h, id, o.full)
 	}
-	fmt.Println(id)
+	if rebase.key == "" {
+		fmt.Println(id)
+	}
 	return nil
 }
 
@@ -390,7 +412,7 @@ func submitBatch(ctx context.Context, hs endpoints, o ctlOptions) error {
 	var defaultName string
 	definitions := map[string]projectDefinition{}
 	seen := map[string]bool{}
-	for _, line := range strings.Split(strings.TrimSuffix(string(b), "\n"), "\n") {
+	for line := range strings.SplitSeq(strings.TrimSuffix(string(b), "\n"), "\n") {
 		parts := strings.Split(strings.TrimSuffix(line, "\r"), "\t")
 		if len(parts) != 2 {
 			return errors.New("batch rows require TAG and PROMPTFILE")
@@ -530,7 +552,7 @@ func contextLayers(v string) (map[string]bool, error) {
 	if v == "none" {
 		return use, nil
 	}
-	for _, name := range strings.Split(v, ",") {
+	for name := range strings.SplitSeq(v, ",") {
 		switch name {
 		case "shared", "project", "host":
 			use[name] = true
@@ -546,6 +568,9 @@ func contextLayers(v string) (map[string]bool, error) {
 const jobToolsNote = "Job tools: ask (the parent), send (parent, PROJECT/JOB or #CHANNEL; the manager relays channel posts) and inbox. " +
 	"A blocking ask waits only a few minutes. To wait longer for an answer, end the turn with STATUS: QUESTION and the question; the job keeps its state and continues when answered. " +
 	"$CX_CONTEXT is a read-only copy: to add or change shared memory (for example host tools or environment you discovered), send the proposed text to the parent, which decides.\n"
+
+// sandboxNote tells a sandboxed agent how to ask for host privileges.
+const sandboxNote = "If the task needs host privileges the sandbox denies (network namespaces, TUN devices, host process tables, local sockets), do not work around the sandbox: report STATUS: BLOCKED and say it needs --sandbox danger-full-access.\n"
 
 // contextIndex is the context file agents read first when it exists.
 const contextIndex = "MEMORY.md"
@@ -627,8 +652,7 @@ func legacyGate(ctx context.Context, args []string) error {
 	cmd.Stderr = os.Stderr
 	cmd.Stdin = os.Stdin
 	if e = cmd.Run(); e != nil {
-		var ex *exec.ExitError
-		if errors.As(e, &ex) {
+		if ex, ok := errors.AsType[*exec.ExitError](e); ok {
 			return ctlExit(ex.ExitCode())
 		}
 	}
