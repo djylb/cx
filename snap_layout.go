@@ -215,36 +215,59 @@ func snapProjectRepos(ctx context.Context, top string, configured []projectRepos
 	if len(configured) == 0 {
 		return repos, nil
 	}
-	identity, e := projectMemberPath(ctx, top)
+	path, e := projectMemberPath(ctx, top)
 	if e != nil {
 		return nil, e
 	}
-	matched := false
+	repoID, e := projectRepoIdentity(ctx, top)
+	if e != nil {
+		return nil, e
+	}
+	// The submitting worktree stands in for its member: the member with the
+	// same working tree, else the one member sharing its repository.
+	type member struct {
+		def      projectRepository
+		root, id string
+	}
+	var members []member
 	var invalid error
 	for _, repo := range configured {
-		repoID, repoErr := projectMemberPath(ctx, repo.Path)
-		if repoErr != nil {
-			invalid = errors.Join(invalid, fmt.Errorf("project repository %s: %w", repo.Path, repoErr))
+		root, rootErr := projectMemberPath(ctx, repo.Path)
+		var id string
+		if rootErr == nil {
+			id, rootErr = projectRepoIdentity(ctx, repo.Path)
+		}
+		if rootErr != nil {
+			invalid = errors.Join(invalid, fmt.Errorf("project repository %s: %w", repo.Path, rootErr))
 			continue
 		}
-		if repoID == identity {
-			repos[top] = append(repos[top], repo.Include...)
-			matched = true
-			continue
-		}
-		g := snapGit{ctx: ctx, dir: repo.Path}
-		root, repoErr := g.get("rev-parse", "--show-toplevel")
-		if repoErr == nil {
-			root, repoErr = filepath.EvalSymlinks(root)
-		}
-		if repoErr != nil {
-			invalid = errors.Join(invalid, fmt.Errorf("project repository %s: %w", repo.Path, repoErr))
-			continue
-		}
-		repos[root] = append(repos[root], repo.Include...)
+		members = append(members, member{repo, root, id})
 	}
-	if !matched {
+	self := -1
+	for i, m := range members {
+		if m.root == path {
+			self = i
+		}
+	}
+	if self < 0 {
+		for i, m := range members {
+			if m.id == repoID {
+				if self >= 0 {
+					return nil, fmt.Errorf("%s matches several project worktrees of one repository; submit from one of them", top)
+				}
+				self = i
+			}
+		}
+	}
+	if self < 0 {
 		return map[string][]string{top: nil}, nil
+	}
+	for i, m := range members {
+		if i == self {
+			repos[top] = append(repos[top], m.def.Include...)
+			continue
+		}
+		repos[m.root] = append(repos[m.root], m.def.Include...)
 	}
 	return repos, invalid
 }
