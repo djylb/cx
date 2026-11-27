@@ -119,6 +119,11 @@ func ctlForward(ctx context.Context, op string, args []string) error {
 	if e != nil {
 		return e
 	}
+	// A job still being submitted, or whose submission failed, has no node to
+	// forward to: report it the way the other job commands do.
+	if handled, observeErr := observeSubmission(ctx, name, id, op, 0); handled || observeErr != nil {
+		return observeErr
+	}
 	h, e := hs.get(name)
 	if e != nil {
 		return e

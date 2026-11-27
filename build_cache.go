@@ -540,7 +540,7 @@ func coordinateCacheScan(ctx context.Context, root string, limit uint64, afterRu
 		var guard *os.File
 		if afterRun {
 			// A release that occurred during an older scan may have made
-			// previously pinned entries reclaimable. The exited worker can
+			// previously pinned entries reclaimable. The exiting worker can
 			// wait for the next coalesced pass after publishing terminal state.
 			guard, err = transferLock(ctx, path)
 		} else {

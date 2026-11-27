@@ -797,12 +797,15 @@ func runNodeWithRegistration(ctx context.Context, args []string, directSubmit bo
 		}
 	}()
 	var owner *os.File
-	maintainCacheOnExit := false
 	defer func() {
 		if owner != nil {
 			closeBestEffort(owner)
 		}
+	}()
+	maintainCacheOnExit := false
+	defer func() {
 		if maintainCacheOnExit {
+			// Keep job ownership until cache maintenance has closed its handles.
 			limit := transferLimit
 			if workerWindow(ctx) != nil {
 				// Host cache contention must not keep a terminal pane alive.
@@ -1076,18 +1079,21 @@ func runNodeWithRegistration(ctx context.Context, args []string, directSubmit bo
 		}
 	}
 	resumeTerminal := op == "resume" && s.final
-	if !owned && (terminalClose || resumeTerminal) {
+	cleanTerminal := op == "clean" && s.final
+	terminalCursor := cursor
+	if !owned && (terminalClose || resumeTerminal || cleanTerminal) {
 		// The final status is visible before the previous runner releases
 		// ownership. Let its teardown finish without blocking the registry.
-		deadline, cancel := context.WithTimeout(ctx, 5*time.Second)
+		clock := timeshim.Or(contextClock(ctx))
+		deadline, cancel := timeshim.WithTimeout(ctx, clock, 5*time.Second)
 		defer cancel()
 		for !owned {
 			if guard != nil {
 				closeBestEffort(guard)
 				guard = nil
 			}
-			if err = pause(deadline, 20*time.Millisecond); err != nil {
-				return err
+			if err = timeshim.Sleep(deadline, clock, 20*time.Millisecond); err != nil {
+				return fmt.Errorf("waiting for runner teardown (%s): %w", ownerPath, err)
 			}
 			if resumeTerminal {
 				// Resume publishes a new generation under the registry lock.
@@ -1098,7 +1104,7 @@ func runNodeWithRegistration(ctx context.Context, args []string, directSubmit bo
 			}
 			owned, err = tryAcquireJobOwner(deadline, dir, owner)
 			if err != nil {
-				return err
+				return fmt.Errorf("waiting for runner teardown (%s): %w", ownerPath, err)
 			}
 		}
 	}
@@ -1117,6 +1123,9 @@ func runNodeWithRegistration(ctx context.Context, args []string, directSubmit bo
 	}
 	if identityErr := identity.check(dir, s); identityErr != nil {
 		return identityErr
+	}
+	if cleanTerminal && cursor != terminalCursor {
+		return errJobReplaced
 	}
 	if resumeTerminal && !s.final {
 		return errJobOwnerBusy

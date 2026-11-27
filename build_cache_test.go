@@ -383,9 +383,7 @@ func assertBackgroundCacheUse(t *testing.T, dropTracking bool) {
 	h.cli(0, "wait", "--job", "p/bg-cache", "--timeout", "2m")
 	awaitExit := func(p process) {
 		t.Helper()
-		if err := awaitFixtureCondition(h.ctx, func() (bool, error) {
-			return !sameProcess(p.Start, processStart(p.PID)), nil
-		}); err != nil {
+		if err := waitFixtureProcess(h.ctx, p); err != nil {
 			t.Fatalf("process %d did not exit: %v", p.PID, err)
 		}
 	}

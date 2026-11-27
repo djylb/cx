@@ -114,9 +114,6 @@ func TestDedupPublishesNewClaimAfterFailure(t *testing.T) {
 	h.start("successful", dedup, "package-cache-env")
 	h.cli(0, "wait", "--job", "p/successful", "--timeout", "2m")
 	for _, job := range []string{"failed", "successful"} {
-		if waitErr := awaitFixtureOwnerReleased(h.ctx, filepath.Join(h.root, "p", job)); waitErr != nil {
-			t.Fatal(waitErr)
-		}
 		h.cli(0, "clean", "--job", "p/"+job)
 	}
 	dir, second, err := dedupReceipt(h.root, "retry")

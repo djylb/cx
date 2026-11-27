@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"os"
@@ -10,6 +11,12 @@ import (
 	"syscall"
 	"testing"
 )
+
+func waitFixtureProcess(ctx context.Context, p process) error {
+	return awaitFixtureCondition(ctx, func() (bool, error) {
+		return !sameProcess(p.Start, processStart(p.PID)), nil
+	})
+}
 
 func TestDetachedCommandIgnoresHangup(t *testing.T) {
 	h := commands(t)
@@ -79,9 +86,6 @@ func TestDetachedSleepLifecycle(t *testing.T) {
 				h.cli(0, "close", "--job", "p/"+name)
 				h.cli(1, "wait", "--job", "p/"+name)
 			} else {
-				if err := awaitFixtureOwnerReleased(h.ctx, filepath.Join(h.root, "p", name)); err != nil {
-					t.Fatal(err)
-				}
 				h.cli(0, op, "--job", "p/"+name)
 			}
 			if sameProcess(child.Start, processStart(child.PID)) {

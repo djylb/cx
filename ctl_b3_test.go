@@ -628,11 +628,6 @@ func TestB3ReuseCleanAndGate(t *testing.T) {
 	if e := json.Unmarshal(cliOutput(t, 3, nil, f.cx, a...), &hit); e != nil || !hit.Reused || hit.Job != "p/first" {
 		t.Fatal(hit, e)
 	}
-	ctx, cancel := fixtureContext(t)
-	defer cancel()
-	if err := awaitFixtureOwnerReleased(ctx, filepath.Join(os.Getenv("CXRUN_STATE"), "p", "first")); err != nil {
-		t.Fatal(err)
-	}
 	cliOutput(t, 0, nil, f.cx, "clean", "p/first")
 	if _, e := os.Stat(dir); e != nil {
 		t.Fatal(e)

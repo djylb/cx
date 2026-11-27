@@ -480,8 +480,15 @@ func deployOnce(ctx context.Context, hs endpoints, name string, setup bool) erro
 	return r.output()
 }
 
+// buildModuleDir names the cxrun source a release binary was built from, so a
+// -trimpath build can still cross-compile node binaries; set with -ldflags -X.
+var buildModuleDir string
+
 func moduleDir() (string, error) {
 	candidates := []string{".", "cxrun"}
+	if buildModuleDir != "" {
+		candidates = append(candidates, buildModuleDir)
+	}
 	if _, file, _, ok := runtime.Caller(0); ok && filepath.IsAbs(file) {
 		candidates = append(candidates, filepath.Dir(file))
 	}

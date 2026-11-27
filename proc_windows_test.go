@@ -3,12 +3,40 @@
 package main
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"golang.org/x/sys/windows"
 )
+
+func waitFixtureProcess(ctx context.Context, p process) error {
+	if p.PID <= 0 || p.Start == 0 {
+		return fmt.Errorf("missing process identity: %+v", p)
+	}
+	h, err := windows.OpenProcess(windows.SYNCHRONIZE|windows.PROCESS_QUERY_LIMITED_INFORMATION, false, uint32(p.PID))
+	if errors.Is(err, windows.ERROR_INVALID_PARAMETER) {
+		return nil // The original PID is gone.
+	}
+	if err != nil {
+		return err
+	}
+	defer func() { _ = windows.CloseHandle(h) }()
+	start := handleStart(h)
+	if start == 0 {
+		return errors.New("cannot read process creation time")
+	}
+	if start != p.Start {
+		return nil // The PID was reused.
+	}
+	return awaitFixtureCondition(ctx, func() (bool, error) {
+		got, err := windows.WaitForSingleObject(h, 0)
+		return got == windows.WAIT_OBJECT_0, err
+	})
+}
 
 func TestAppServerInOwnedJobObject(t *testing.T) {
 	root, work, _ := runnerFixture(t)

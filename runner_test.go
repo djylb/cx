@@ -96,8 +96,22 @@ func trackFixtureWorkerStarts() {
 	start := startDetachedWorker
 	startDetachedWorker = func(cmd *exec.Cmd) error {
 		path := os.Getenv(fixtureWorkerLock)
-		if path == "" || runtime.GOOS == "windows" {
+		if path == "" {
 			return start(cmd)
+		}
+		if runtime.GOOS == "windows" {
+			if err := start(cmd); err != nil {
+				return err
+			}
+			// Record the identity while cmd still holds the process handle,
+			// before handing control back to the submitter.
+			p := process{PID: cmd.Process.Pid, Start: processStart(cmd.Process.Pid)}
+			err := writeJSON(filepath.Join(path, fmt.Sprintf("%d-%d.json", p.PID, p.Start)), p)
+			if err != nil {
+				_ = cmd.Process.Kill()
+				_ = cmd.Wait()
+			}
+			return err
 		}
 		lease, err := lockFile(path, os.O_CREATE, trySharedLock)
 		if err != nil {
@@ -116,23 +130,46 @@ func trackFixtureWorkerStarts() {
 
 func joinFixtureWorkers(t *testing.T, dir string) {
 	t.Helper()
-	if runtime.GOOS == "windows" {
-		return // ExtraFiles and inherited flock ownership are Unix-only.
-	}
 	path := filepath.Join(dir, "workers.lock")
+	if runtime.GOOS == "windows" {
+		// Windows file locks are not inherited. Track the spawned processes.
+		path = filepath.Join(dir, "workers")
+		if err := os.Mkdir(path, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
 	t.Setenv(fixtureWorkerLock, path)
 	t.Cleanup(func() {
-		// The runner can still maintain caches after publishing terminal
-		// state and releasing owner.lock. Join before TempDir removes state.
 		ctx, cancel := context.WithTimeout(context.Background(), fixtureLimit)
 		defer cancel()
+		if err := waitFixtureWorkers(ctx, path); err != nil {
+			t.Errorf("waiting for detached fixture workers: %v", err)
+		}
+	})
+}
+
+func waitFixtureWorkers(ctx context.Context, path string) error {
+	if runtime.GOOS != "windows" {
 		barrier, err := lockUntil(ctx, path)
 		if err != nil {
-			t.Errorf("waiting for detached fixture workers: %v", err)
-			return
+			return err
 		}
-		closeBestEffort(barrier)
-	})
+		return barrier.Close()
+	}
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		var p process
+		if err := readJSON(filepath.Join(path, entry.Name()), &p); err != nil {
+			return err
+		}
+		if err := waitFixtureProcess(ctx, p); err != nil {
+			return fmt.Errorf("PID %d: %w", p.PID, err)
+		}
+	}
+	return nil
 }
 
 func fixtureServer() error {

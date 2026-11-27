@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -141,10 +142,11 @@ func commands(t *testing.T) *commandHarness {
 	t.Setenv("CXRUN_STATE", root)
 	setTestHost(t, root, map[string]int{"agent": 1, "test": 1}, "")
 	t.Setenv("GORACE", "atexit_sleep_ms=0")
+	work := t.TempDir()
 	joinFixtureWorkers(t, root)
 	ctx, cancel := fixtureContext(t)
 	t.Cleanup(cancel)
-	return &commandHarness{root: root, work: t.TempDir(), exe: exe, ctx: ctx, t: t}
+	return &commandHarness{root: root, work: work, exe: exe, ctx: ctx, t: t}
 }
 
 // running blocks until job owns its slot (start returns before admission, so queue-order tests need this).
@@ -239,9 +241,6 @@ func TestCommandAfterSubmitterExits(t *testing.T) {
 	if out := h.cli(10, "log", "--job", "p/detach"); out != "survived" {
 		t.Fatal(out)
 	}
-	if err := awaitFixtureOwnerReleased(h.ctx, filepath.Join(h.root, "p", "detach")); err != nil {
-		t.Fatal(err)
-	}
 	h.cli(0, "clean", "--job", "p/detach")
 	out := h.cli(7, "start", "--job", "p/dup", "--cmd", "--dedup-key", "receipt", "--", h.exe)
 	var s status
@@ -253,39 +252,46 @@ func TestCommandQuietWatchdog(t *testing.T) {
 	h := commands(t)
 	advance := h.clockJob("quiet")
 	h.start("quiet", []string{"--quiet-timeout", "250ms"}, "silent")
-	if runtime.GOOS == "windows" {
-		// Get the worker's process handle before advancing the watchdog.
-		// Terminal status clears the PID before the final cache scan finishes.
-		pid := h.status("quiet").PID
-		if pid <= 0 {
-			t.Fatalf("invalid watchdog worker PID: %d", pid)
-		}
-		worker, err := os.FindProcess(pid)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer func() {
-			done := make(chan error, 1)
-			go func() {
-				_, err := worker.Wait()
-				_ = worker.Release()
-				done <- err
-			}()
-			select {
-			case err := <-done:
-				if err != nil {
-					t.Errorf("waiting for watchdog worker: %v", err)
-				}
-			case <-h.ctx.Done():
-				t.Errorf("waiting for watchdog worker: %v", h.ctx.Err())
-			}
-		}()
-	}
 	advance(commandPollInterval, 250*time.Millisecond)
 	if out := h.cli(3, "wait", "--job", "p/quiet"); !strings.Contains(out, "status=stalled") {
 		t.Fatal(out)
 	}
 }
+
+func TestCleanWaitsForRunnerTeardown(t *testing.T) {
+	h := commands(t)
+	h.start("teardown", nil, "after-parent")
+	h.running("teardown")
+	path, err := cacheLockPath(h.root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scan, err := transferLock(h.ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeBestEffort(scan)
+	if err = os.WriteFile(filepath.Join(h.work, "parent-gone"), nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	h.cli(0, "wait", "--job", "p/teardown")
+
+	// The job has published its result, but its post-run scan cannot start.
+	err = expireLockWait(t, func(ctx context.Context) error {
+		return cleanNodeJob(ctx, "p/teardown")
+	})
+	if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "waiting for runner teardown") {
+		t.Fatalf("clean while runner is still active: %v", err)
+	}
+	if !h.status("teardown").final {
+		t.Fatal("clean changed the terminal job")
+	}
+	if err := scan.Close(); err != nil {
+		t.Fatal(err)
+	}
+	h.cli(0, "clean-job", "p/teardown")
+}
+
 func TestCloseReapsGrandchildAfterTimeout(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("fixture ignores POSIX TERM")

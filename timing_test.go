@@ -135,16 +135,6 @@ func awaitFixtureFile(ctx context.Context, path string) error {
 	return awaitFixtureCondition(ctx, func() (bool, error) { return fileExists(path) })
 }
 
-func awaitFixtureOwnerReleased(ctx context.Context, dir string) error {
-	return awaitFixtureCondition(ctx, func() (bool, error) {
-		owner, err := lockPath(filepath.Join(dir, "owner.lock"), 0)
-		if err != nil || owner == nil {
-			return false, err
-		}
-		return true, owner.Close()
-	})
-}
-
 func awaitRemovedFixtureFile(ctx context.Context, path string) error {
 	return awaitFixtureCondition(ctx, func() (bool, error) {
 		exists, err := fileExists(path)
@@ -229,7 +219,10 @@ func commandFixtureMain() {
 
 func (h *commandHarness) clockJob(job string) func(time.Duration, time.Duration) {
 	h.t.Helper()
-	dir := h.t.TempDir()
+	dir, err := os.MkdirTemp(h.work, "clock-")
+	if err != nil {
+		h.t.Fatal(err)
+	}
 	h.t.Setenv("CX_TEST_CLOCK_JOB", job)
 	h.t.Setenv("CX_TEST_CLOCK_DIR", dir)
 	return func(after, by time.Duration) {

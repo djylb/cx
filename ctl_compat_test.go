@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 )
@@ -162,5 +163,26 @@ func TestControllerListSubmissionReceipts(t *testing.T) {
 		got["failed"].State != "submit_failed" || got["stopped"].State != "submit_failed" ||
 		got["registered"].State != "done" {
 		t.Fatalf("unexpected submission views: %s", listing)
+	}
+}
+
+// Forwarded job commands report a failed submission instead of staying silent.
+func TestSayReportsFailedSubmission(t *testing.T) {
+	f := newControllerFixture(t)
+	dir, err := submissionDir("local", "p/lost")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	progress := submissionProgress{State: "submit_failed", Host: "local", Project: "p", Job: "lost",
+		Role: "worker", Session: "suite", Reason: "fixture: transport failed"}
+	if err = writeJSON(filepath.Join(dir, "submission.json"), progress); err != nil {
+		t.Fatal(err)
+	}
+	_, diag := cliStreams(t, 8, nil, f.cx, "say", "local:p/lost", "hello")
+	if !strings.Contains(diag, "fixture: transport failed") {
+		t.Fatalf("say diagnostics: %q", diag)
 	}
 }
