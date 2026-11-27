@@ -372,12 +372,9 @@ func restartNode(ctx context.Context, a []string, expected *jobIdentity, out io.
 	argv := []string{"resume", "--job", id}
 	env := map[string]string{"CX_PARENT": host + ":" + id}
 	if prep != nil {
-		var manifest Manifest
-		if err := readJSON(filepath.Join(work, "input", "manifest.json"), &manifest); err != nil {
-			return err
-		}
-		if err := manifest.validate(); err != nil {
-			return err
+		manifest, manifestErr := readCheckoutManifest(work)
+		if manifestErr != nil {
+			return manifestErr
 		}
 		store, err := snapStore()
 		if err != nil {

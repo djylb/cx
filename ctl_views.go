@@ -126,6 +126,7 @@ func nodeRows(ctx context.Context, root, p, session string, chatProject string) 
 			return false, e
 		}
 		var meta struct {
+			Snapshot     SnapshotID
 			Role, Parent string
 			Privileged   bool
 		}
@@ -152,6 +153,19 @@ func nodeRows(ctx context.Context, root, p, session string, chatProject string) 
 		} else {
 			r["privileged"] = s.Privileged || meta.Privileged
 			r["run_id"] = s.RunID
+			if meta.Snapshot != "" {
+				base, baseErr := readJobBaseline(work)
+				if baseErr != nil {
+					return false, baseErr
+				}
+				if base.Snapshot == "" {
+					base.Snapshot = meta.Snapshot
+					if info, statErr := os.Stat(filepath.Join(work, "input", "manifest.json")); statErr == nil {
+						base.Time = info.ModTime().UTC()
+					}
+				}
+				r["baseline"], r["baseline_at"], r["baseline_from_turn"] = base.Snapshot, base.Time, base.FromTurn
+			}
 		}
 		rows = append(rows, r)
 		return false, nil

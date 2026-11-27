@@ -41,3 +41,26 @@ func TestFreezeIndexDiagnostics(t *testing.T) {
 		})
 	}
 }
+
+func TestSnapshotCLINestedGitDiagnostics(t *testing.T) {
+	f := newControllerFixture(t)
+	t.Setenv("LAN_SNAPSHOT_ID", "")
+	t.Setenv("CX_PROJECT", "")
+	root := filepath.Join(f.home, "source")
+	first := filepath.Join(root, "a")
+	second := filepath.Join(root, "z")
+	for _, dir := range []string{first, second} {
+		cliOutput(t, 0, nil, "git", "init", "--quiet", dir)
+	}
+	_, diag := cliStreams(t, 2, nil, f.cx, "snapshot", root)
+	if !strings.Contains(diag, `nested Git metadata: "a/.git"`) || strings.Contains(diag, "z/.git") {
+		t.Fatalf("snapshot diagnostic: %s", diag)
+	}
+	cliOutput(t, 0, nil, f.cx, "project", "init", "mixed", "--repo", first, second)
+	_, diag = cliStreams(t, 2, nil, f.cx, "snapshot", root, "--project", "mixed")
+	for _, want := range []string{"DIR must be a project member repository", first, second} {
+		if !strings.Contains(diag, want) {
+			t.Fatalf("project snapshot diagnostic is missing %q: %s", want, diag)
+		}
+	}
+}

@@ -162,29 +162,43 @@ func updateWaitCursor(ctx context.Context, path string, before, next []byte, out
 	return next, true, nil
 }
 
-// Holding a shared lock registers this observer without excluding its peers.
-// Serialize the exclusive probe and shared acquisition with each other.
-func registerWaitObserver(ctx context.Context, path, label string) (*os.File, error) {
+// Serialize metadata publication, inspection and removal with the lock probe.
+func registerWaitObserver(ctx context.Context, path, label, alternative string) (func(), error) {
 	guard, err := lockUntil(ctx, path+".register")
 	if err != nil {
 		return nil, err
 	}
 	defer closeBestEffort(guard)
-	probe, err := lockPath(path, os.O_CREATE)
+
+	observer, err := lockPath(path, os.O_CREATE)
 	if err != nil {
 		return nil, err
 	}
-	if probe != nil {
-		closeBestEffort(probe)
+	record := path + ".owner"
+	if observer == nil {
+		owner, readErr := readSharedFile(record)
+		if readErr != nil {
+			diagnosticf("cx wait --any: another process is waiting on %s (cannot read observer record: %v). Stop it or %s.\n", label, readErr, alternative)
+		} else {
+			diagnosticf("cx wait --any: another process is waiting on %s (%s). Stop it by PID or %s.\n", label, owner, alternative)
+		}
+		return nil, ctlExit(2)
 	}
-	observer, err := lockFile(path, os.O_CREATE, trySharedLock)
-	if err == nil && observer == nil {
-		return nil, errors.New("could not register wait observer")
+
+	started := timeshim.Or(contextClock(ctx)).Now().UTC()
+	owner := fmt.Appendf(nil, "PID %d, started %s", os.Getpid(), started.Format(time.RFC3339Nano))
+	if err = atomicWrite(record, owner); err != nil {
+		closeBestEffort(observer)
+		return nil, fmt.Errorf("write wait observer for %s: %w", label, err)
 	}
-	if err == nil && probe == nil {
-		diagnosticf("cx wait --any: another process is waiting on %s\n", label)
-	}
-	return observer, err
+	return func() {
+		cleanupGuard, cleanupErr := lockUntil(context.Background(), path+".register")
+		if cleanupErr == nil {
+			defer closeBestEffort(cleanupGuard)
+			_ = os.Remove(record)
+		}
+		closeBestEffort(observer)
+	}, nil
 }
 
 func waitJobID(project, job string) string {
@@ -284,11 +298,12 @@ func waitAny(ctx context.Context, root string, projects []string, session, since
 		}
 	}()
 	if sinceFile != "" {
-		lock, lockErr := registerWaitObserver(ctx, sinceFile+".lock", fmt.Sprintf("cursor file %q", sinceFile))
+		release, lockErr := registerWaitObserver(ctx, sinceFile+".lock", fmt.Sprintf("cursor file %q", sinceFile),
+			"use --since-file PATH for an independent cursor")
 		if lockErr != nil {
 			return lockErr
 		}
-		defer closeBestEffort(lock)
+		defer release()
 	}
 	emit := func(row *waitReport) error {
 		row.setNext("local")

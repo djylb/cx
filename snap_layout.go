@@ -215,14 +215,14 @@ func snapProjectRepos(ctx context.Context, top string, configured []projectRepos
 	if len(configured) == 0 {
 		return repos, nil
 	}
-	identity, e := projectRepoIdentity(ctx, top)
+	identity, e := projectMemberPath(ctx, top)
 	if e != nil {
 		return nil, e
 	}
 	matched := false
 	var invalid error
 	for _, repo := range configured {
-		repoID, repoErr := projectRepoIdentity(ctx, repo.Path)
+		repoID, repoErr := projectMemberPath(ctx, repo.Path)
 		if repoErr != nil {
 			invalid = errors.Join(invalid, fmt.Errorf("project repository %s: %w", repo.Path, repoErr))
 			continue

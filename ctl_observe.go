@@ -334,7 +334,17 @@ func displayHosts(ctx context.Context, hs endpoints, op string, o ctlOptions) er
 						appliedByProject[project] = applied
 					}
 					if turns := applied[appliedJob{Host: name, Job: id, RunID: runID}]; runID != "" && len(turns) != 0 {
-						row["applied_turn"] = turns
+						number, _ := row["baseline_from_turn"].(json.Number)
+						floor, _ := number.Int64()
+						currentTurns := make(map[string]int64)
+						for repo, turn := range turns {
+							if turn >= floor {
+								currentTurns[repo] = turn
+							}
+						}
+						if len(currentTurns) > 0 {
+							row["applied_turn"] = currentTurns
+						}
 					}
 				}
 				delete(row, "role")
@@ -466,6 +476,7 @@ func renderLSRow(output *bytes.Buffer, header *bool, brief bool, id, name string
 		{row["phase"], "PHASE", true},
 		{row["completed_turns"], "TURNS", true},
 		{appliedTurnColumn(row), appliedTurnHeading, true},
+		{baselineColumn(row), "BASELINE", true},
 		{row["plan_step"], "PLAN", true},
 		{row["changed_files"], "FILES", false},
 		{failure, "FAILED COMMAND", false},

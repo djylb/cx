@@ -245,7 +245,7 @@ func (s *claudeSession) shutdown() error {
 
 // claudeArgs maps the job's sandbox, network, roots, effort and tools onto Claude CLI flags.
 // mcpConfig names the job-tool server configuration, or is empty without job tools.
-func (c *config) claudeArgs(session, mcpConfig string, memberRoots ...string) []string {
+func (c *config) claudeArgs(session, mcpConfig string, roots ...string) []string {
 	args := []string{"-p", "--output-format", "stream-json", "--input-format", "stream-json", "--verbose"}
 	if session != "" {
 		args = append(args, "--resume", session)
@@ -260,8 +260,35 @@ func (c *config) claudeArgs(session, mcpConfig string, memberRoots ...string) []
 	allowed := slices.Clone(tools)
 	if c.Sandbox == "workspace-write" || c.Sandbox == dangerFullAccess {
 		tools = append(tools, "Edit", "Write", "Bash")
-		allowed = append(allowed, "Edit(./**)", "Write(./**)", "Bash")
-		for _, root := range append(memberRoots, c.Roots...) {
+		allowed = append(allowed, "Bash")
+	}
+	roots = append(roots, c.Roots...)
+	if len(c.Own) > 0 {
+		// Keep the implicit working-directory grant in the job's scratch space.
+		// File grants go through settings because --add-dir takes directories.
+		edits := make([]string, 0, len(roots))
+		escapeGlob := strings.NewReplacer(`\`, `\\`, "*", `\*`, "?", `\?`, "[", `\[`)
+		for _, root := range roots {
+			info, statErr := os.Stat(root)
+			pattern := "//" + escapeGlob.Replace(strings.TrimPrefix(filepath.ToSlash(root), "/"))
+			if statErr == nil && info.IsDir() {
+				args = append(args, "--add-dir", root)
+				pattern += "/**"
+			}
+			edits = append(edits, "Edit("+pattern+")")
+		}
+		settings, _ := json.Marshal(fields{
+			"permissions": fields{"allow": edits},
+			"sandbox": fields{
+				"enabled": true, "failIfUnavailable": true, "allowUnsandboxedCommands": false,
+				"filesystem": fields{"allowWrite": roots},
+			},
+		})
+		args = append(args, "--setting-sources", "", "--settings", string(settings),
+			"--append-system-prompt", fmt.Sprintf("The snapshot working directory is %q. Use that path to read the snapshot and run project commands.", c.Dir))
+	} else if c.Sandbox == "workspace-write" || c.Sandbox == dangerFullAccess {
+		allowed = append(allowed, "Edit(./**)", "Write(./**)")
+		for _, root := range roots {
 			args = append(args, "--add-dir", root)
 			pattern := "//" + strings.TrimPrefix(filepath.ToSlash(root), "/") + "/**"
 			allowed = append(allowed, "Edit("+pattern+")", "Write("+pattern+")")
@@ -408,15 +435,12 @@ func (r *runner) startClaude(input any, id string) error {
 	if err != nil {
 		return err
 	}
-	var memberRoots []string
+	var roots []string
 	if r.c.Sandbox == "workspace-write" || r.c.Sandbox == dangerFullAccess {
-		memberRoots, err = snapshotMemberRoots(r.root, r.c.Dir)
+		roots, err = r.c.writableMemberRoots(r.root)
 		if err != nil {
 			return err
 		}
-	}
-	if err = r.acquireSlot(); err != nil {
-		return err
 	}
 	var toolConfig string
 	if r.c.JobTools {
@@ -424,10 +448,14 @@ func (r *runner) startClaude(input any, id string) error {
 			return err
 		}
 	}
-	cmd := exec.Command("claude", r.c.claudeArgs(r.s.Thread, toolConfig, memberRoots...)...)
+	cmd := exec.Command("claude", r.c.claudeArgs(r.s.Thread, toolConfig, roots...)...)
 	cmd.WaitDelay = 2 * time.Second
 	cmd.Env = append(cmd.Environ(), fmt.Sprintf("MCP_TOOL_TIMEOUT=%d", jobToolTimeout.Milliseconds()))
 	cmd.Dir = r.c.Dir
+	if len(r.c.Own) > 0 {
+		cmd.Dir = filepath.Join(r.dir, jobTempDir)
+		cmd.Env = append(cmd.Env, "CLAUDE_CODE_TMPDIR="+cmd.Dir)
+	}
 	cmd.Stdin = bytes.NewReader(append(data, '\n'))
 	r.c.mark(cmd, r.dir)
 	log, err := openJobFile(filepath.Join(r.dir, "server.stderr.log"), jobFileAppendCreate)

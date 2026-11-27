@@ -127,11 +127,31 @@ func TestWaitAnyNamedCursorHistoryAndDuplicate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	lease, err := registerWaitObserver(t.Context(), cursor+".lock", "history")
-	if err != nil {
+	observerPath := cursor + ".lock"
+	record := observerPath + ".owner"
+	// An unlocked record can remain after an observer crashes, even when its PID is live.
+	if err = atomicWrite(record, []byte(fmt.Sprintf("PID %d, started stale", os.Getpid()))); err != nil {
 		t.Fatal(err)
 	}
-	defer closeBestEffort(lease)
+	started := time.Date(2026, 11, 28, 1, 2, 3, 0, time.UTC)
+	ctx := clockContext(t.Context(), timeshim.NewFake(started))
+	func() {
+		release, registerErr := registerWaitObserver(ctx, observerPath, "history", "use --cursor NAME")
+		if registerErr != nil {
+			t.Fatal(registerErr)
+		}
+		defer release()
+		out, diag := cliStreams(t, 2, nil, f.cx, "wait", "--any", "--cursor", "history", "--timeout", "20s", "--from-start")
+		if len(out) != 0 || !strings.Contains(diag, "another process is waiting") ||
+			!strings.Contains(diag, fmt.Sprintf("PID %d, started %s", os.Getpid(), started.Format(time.RFC3339))) ||
+			!strings.Contains(diag, "Stop it by PID or use --cursor NAME") {
+			t.Fatalf("cursor conflict: stdout %s, stderr %s", out, diag)
+		}
+		cliOutput(t, 0, nil, f.cx, "wait", "--any", "--cursor", "independent", "--project", "p", "--timeout", "20s", "--from-start")
+	}()
+	if _, statErr := os.Stat(record); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("observer record after release: %v", statErr)
+	}
 	for i, want := range []string{"cx result local:p/job --turn 1", "cx result local:p/job --turn 2", "cx result local:q/job --turn 1"} {
 		args := []string{"wait", "--any", "--project", "p", "--project", "q", "--cursor", "history", "--timeout", "20s"}
 		if i == 0 {
@@ -139,8 +159,7 @@ func TestWaitAnyNamedCursorHistoryAndDuplicate(t *testing.T) {
 		}
 		out, diag := cliStreams(t, 0, nil, f.cx, args...)
 		var got waitReport
-		if err := json.Unmarshal(out, &got); err != nil || got.Next != want || got.RateLimited || got.Host != "local" ||
-			!strings.Contains(diag, "another process is waiting") {
+		if err = json.Unmarshal(out, &got); err != nil || got.Next != want || got.RateLimited || got.Host != "local" {
 			t.Fatalf("expected %s, got %s (%v), stderr %s", want, out, err, diag)
 		}
 	}
@@ -148,11 +167,11 @@ func TestWaitAnyNamedCursorHistoryAndDuplicate(t *testing.T) {
 	req := waitPollRequest{Projects: []string{"p", "q"}, Session: "manager", Limit: waitPollInterval}
 	now := filepath.Join(filepath.Dir(cursor), "now.json")
 	poll := jobWaitPoll(endpoint{State: root}, "local", now, req)
-	if event, err := poll(t.Context()); err != nil || event.row != nil {
-		t.Fatalf("new named cursor returned an event: %+v (%v)", event, err)
+	if event, pollErr := poll(t.Context()); pollErr != nil || event.row != nil {
+		t.Fatalf("new named cursor returned an event: %+v (%v)", event, pollErr)
 	}
 	var baseline map[string]waitCursor
-	if err := readJSON(now, &baseline); err != nil || len(baseline) != 3 || baseline["a/excluded"].Finished != 1 ||
+	if err = readJSON(now, &baseline); err != nil || len(baseline) != 3 || baseline["a/excluded"].Finished != 1 ||
 		baseline["p/job"].Finished != 2 || baseline["q/job"].Finished != 1 {
 		t.Fatalf("named baseline: %+v (%v)", baseline, err)
 	}

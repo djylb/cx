@@ -75,6 +75,7 @@ func ctlSubmit(ctx context.Context, hs endpoints, op string, o ctlOptions) error
 type rebaseInput struct {
 	files map[string][]byte
 	key   string
+	carry string
 }
 
 func ctlSubmitWithRebase(ctx context.Context, hs endpoints, op string, o ctlOptions, rebase rebaseInput) error {
@@ -102,6 +103,9 @@ func ctlSubmitWithRebase(ctx context.Context, hs endpoints, op string, o ctlOpti
 		}
 		fmt.Println(id)
 		return nil
+	}
+	if len(o.own) > 0 && (o.command || o.inplace || o.previous != "" || o.sandbox != "" && o.sandbox != "workspace-write") {
+		return ctlUsage(op, errors.New("--own requires a new snapshot-backed workspace-write agent"))
 	}
 	session, sessionErr := o.submissionSession()
 	if o.previous == "" && !o.reuse && sessionErr != nil {
@@ -347,9 +351,23 @@ func ctlSubmitWithRebase(ctx context.Context, hs endpoints, op string, o ctlOpti
 			return e
 		}
 	}
+	if len(o.own) > 0 {
+		if e = validateSnapshotOwnership(ctx, req.Snapshot, o.own); e != nil {
+			return e
+		}
+		for _, path := range o.own {
+			req.Options = append(req.Options, "--own", path)
+		}
+	}
 	if req.Snapshot != "" {
 		if e = verifySourceBase(ctx, src, &req, o); e != nil {
 			return e
+		}
+		if rebase.carry != "" {
+			req.Snapshot, e = carryRebaseChanges(ctx, req.Snapshot, rebase.carry)
+			if e != nil {
+				return e
+			}
 		}
 	}
 	if o.command {
@@ -386,6 +404,41 @@ func ctlSubmitWithRebase(ctx context.Context, hs endpoints, op string, o ctlOpti
 	}
 	if rebase.key == "" {
 		fmt.Println(id)
+	}
+	return nil
+}
+
+// Check the frozen object before queuing, including for pinned snapshots.
+func validateSnapshotOwnership(ctx context.Context, sid SnapshotID, paths []string) error {
+	m, e := loadSnapshot(sid)
+	if e != nil {
+		return e
+	}
+	store, e := snapStore()
+	if e != nil {
+		return e
+	}
+	members := make([]string, 0, len(m.Repositories))
+	for _, repo := range m.Repositories {
+		members = append(members, repo.Path)
+	}
+	for _, path := range paths {
+		index, rel, pathErr := ownedMember(m.Main, members, path)
+		if pathErr != nil {
+			return pathErr
+		}
+		if rel == "." {
+			continue
+		}
+		repo := m.Repositories[index]
+		git := snapGit{ctx: ctx, dir: repo.bare(store)}
+		entry, treeErr := git.get("ls-tree", "-z", repo.OID, "--", ":(literal)"+filepath.ToSlash(rel))
+		if treeErr != nil {
+			return treeErr
+		}
+		if !strings.HasPrefix(entry, "040000 ") && !strings.HasPrefix(entry, "100644 ") && !strings.HasPrefix(entry, "100755 ") {
+			return fmt.Errorf("--own %q must name an existing snapshot file or directory", path)
+		}
 	}
 	return nil
 }

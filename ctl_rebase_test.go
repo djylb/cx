@@ -46,8 +46,17 @@ printf '%s\n' '{"type":"result","session_id":"fixture","result":"STATUS: DONE"}'
 	if err = writeJSON(origin, submissionOrigin{Snapshot: original, Source: source, JobOptions: []string{"--engine", "claude", "--network", "--idle-exit", "1s"}}); err != nil {
 		t.Fatal(err)
 	}
-	if out := cliOutput(t, 0, nil, f.cx, "rebase", "local:"+id, "first request"); !strings.Contains(string(out), "queued") {
+	if out := cliOutput(t, 0, nil, f.cx, "rebase", "local:"+id, "first request", "--host", "local", "--profile", "first-account"); !strings.Contains(string(out), "queued") {
 		t.Fatalf("initial rebase: %s", out)
+	}
+	pending, err := resultDest("local", id, s.RunID, "2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var request rebaseRequest
+	if err = readJSON(pending+".rebase.json", &request); err != nil ||
+		request.Host != "local" || request.Profile != "first-account" {
+		t.Fatalf("pending destination = %+v, %v", request, err)
 	}
 	if out := cliOutput(t, 0, nil, f.cx, "rebase", "--session", "replacement", "local:"+id, "second request"); !strings.Contains(string(out), "replaced") {
 		t.Fatalf("replacement rebase: %s", out)
@@ -80,12 +89,12 @@ printf '%s\n' '{"type":"result","session_id":"fixture","result":"STATUS: DONE"}'
 		if pathErr != nil {
 			t.Fatal(pathErr)
 		}
-		var request struct{ Failure string }
+		request = rebaseRequest{}
 		if err = readJSON(dir+".rebase.json", &request); err != nil {
 			t.Fatal(err)
 		}
-		if request.Failure != "" {
-			t.Fatal(request.Failure)
+		if request.Failure != "" || request.Host != "" || request.Profile != "" {
+			t.Fatalf("replaced request = %+v", request)
 		}
 		progress, receiptErr := readSubmissionProgress(filepath.Dir(input))
 		if receiptErr != nil && !os.IsNotExist(receiptErr) {
@@ -313,5 +322,140 @@ func TestRebaseReturnsExistingClaimAtSealBoundary(t *testing.T) {
 	var request struct{ Text, Child string }
 	if err = readJSON(slot, &request); err != nil || request.Text != "original" || request.Child != child {
 		t.Fatalf("claim changed = %+v, %v", request, err)
+	}
+}
+
+func TestRebaseCarriesCachedChangesToAnotherHost(t *testing.T) {
+	f := newControllerFixture(t)
+	ctx := snapTestCtx(t)
+	const host, id, child, generation = "offline", "p/carry", "p/carry-r1", "fixture"
+	config := filepath.Join(f.home, ".config", "cx", "hosts.toml")
+	snapWriteTest(t, config, "[hosts.offline]\nssh = \"fixture\"\ncx = \"cx\"\nstate = \"offline\"\n")
+	t.Setenv("PATH", f.home+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("CX_CONTEXT_DIR", t.TempDir())
+	writeCredentialFixture(t, filepath.Join(f.home, "ssh"), "#!/bin/sh\nprintf 'cx-wire: ready\\n' >&2\nexit 9\n", 0700)
+	writeCredentialFixture(t, filepath.Join(os.Getenv("CXRUN_STATE"), "host.json"),
+		`{"min_free_bytes":0,"profiles":{"target":{"engine_homes":{"claude":"target-home"}}}}`, 0600)
+	writeCredentialFixture(t, filepath.Join(f.home, "claude"), `#!/bin/sh
+set -eu
+test "${CLAUDE_CONFIG_DIR##*/}" = target-home
+test "$(head -n 1 sample)" = 'source change'
+test "$(tail -n 1 sample)" = 'job change'
+read -r input
+printf '%s\n' '{"type":"result","session_id":"fixture","result":"STATUS: DONE"}'
+`, 0700)
+	source := t.TempDir()
+	path := filepath.Join(source, "sample")
+	const initial = "first\n2\n3\n4\n5\n6\n7\nlast\n"
+	snapWriteTest(t, path, initial)
+	g := snapGit{ctx: ctx, dir: source}
+	for _, args := range [][]string{{"init", "-q"}, {"add", "sample"}, {"-c", "user.name=fixture", "-c", "user.email=fixture@invalid", "commit", "-qm", "fixture"}} {
+		if _, gitErr := g.get(args...); gitErr != nil {
+			t.Fatal(gitErr)
+		}
+	}
+	original, manifest, err := Freeze(ctx, source, FreezeOptions{History: "HEAD"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	origin, err := originFile(host, id, generation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = writeJSON(origin, submissionOrigin{Snapshot: original, Source: source, History: "HEAD",
+		JobOptions: []string{"--engine", "claude", "--network", "--profile", "old-account", "--idle-exit", "1s"}}); err != nil {
+		t.Fatal(err)
+	}
+	dest, err := resultDest(host, id, generation, "2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cached := resultVariant(dest, true)
+	repo := manifest.Repositories[0]
+	const patch = "diff --git a/sample b/sample\n--- a/sample\n+++ b/sample\n@@ -6,3 +6,3 @@\n 6\n 7\n-last\n+job change\n"
+	snapWriteTest(t, filepath.Join(cached, "sample.patch"), patch)
+	snapWriteTest(t, filepath.Join(cached, "last.md"), "previous report")
+	if err = writeJSON(filepath.Join(cached, "result.json"), turnResult{
+		Turn: 2, TurnID: "second", Repositories: []turnPatch{{SnapshotPatch: SnapshotPatch{
+			Path: repo.Path, RepoID: repo.RepoID, SnapshotOID: repo.OID, Patch: "sample.patch",
+		}}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	marker, seen, err := resultMarkerSnapshot(host, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = publishResultMarker(ctx, marker, seen, generation, 2); err != nil {
+		t.Fatal(err)
+	}
+	args := []string{"rebase", host + ":" + id, "continue the work", "--host", "local", "--profile", "target"}
+
+	conflicting := strings.Replace(initial, "last", "source change", 1)
+	snapWriteTest(t, path, conflicting)
+	_, diagnostic := cliStreams(t, 1, nil, f.cx, args...)
+	if !strings.Contains(diagnostic, "conflicting files: sample") {
+		t.Fatalf("missing conflict diagnostic: %s", diagnostic)
+	}
+	queued, err := submissionDir("local", child)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := filepath.Join(queued, "input.json")
+	if _, statErr := os.Stat(input); !os.IsNotExist(statErr) {
+		t.Fatalf("unexpected submission after conflict: %v", statErr)
+	}
+	if data, readErr := os.ReadFile(path); readErr != nil || string(data) != conflicting {
+		t.Fatalf("source after conflict = %q, %v", data, readErr)
+	}
+
+	updated := strings.Replace(initial, "first", "source change", 1)
+	snapWriteTest(t, path, updated)
+	index := filepath.Join(source, ".git", "index")
+	before, err := os.ReadFile(index)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, diagnostic := cliStreams(t, 0, nil, f.cx, append(args, "--turn", "2")...)
+	if strings.TrimSpace(string(out)) != child || !strings.Contains(diagnostic, "using cached turn 2") {
+		t.Fatalf("offline rebase: %s %s", out, diagnostic)
+	}
+	var q queuedJob
+	if err = readJSON(input, &q); err != nil {
+		t.Fatal(err)
+	}
+	if q.Request.Host != "local" || q.Origin.Source != source || q.Origin.History != "HEAD" ||
+		!strings.Contains(q.Request.Prompt, "checkout already includes") ||
+		string(q.Request.Context["rebase/last.md"]) != "previous report" ||
+		string(q.Request.Context["rebase/sample.patch"]) != patch {
+		t.Fatalf("unexpected child submission: %+v", q)
+	}
+	merged, err := loadSnapshot(q.Request.Snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := snapStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	row := merged.Repositories[0]
+	content, err := (snapGit{ctx: ctx, dir: row.bare(store)}).get("show", row.OID+":sample")
+	if err != nil || content != strings.TrimSpace(strings.Replace(updated, "last", "job change", 1)) ||
+		row.Base != repo.Base || row.RepoID != repo.RepoID {
+		t.Fatalf("snapshot content = %q, repository = %+v, error = %v", content, row, err)
+	}
+	if data, readErr := os.ReadFile(path); readErr != nil || string(data) != updated {
+		t.Fatalf("source after dispatch = %q, %v", data, readErr)
+	}
+	if data, readErr := os.ReadFile(index); readErr != nil || !bytes.Equal(data, before) {
+		t.Fatalf("source index changed: %v", readErr)
+	}
+	job, err := jobDir(os.Getenv("CXRUN_STATE"), child)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := awaitFixtureStatus(ctx, job, func(s status) bool { return isTerminal(s.State) })
+	if err != nil || s.Profile != "target" || s.State != "done" {
+		t.Fatalf("child status = %+v, %v", s, err)
 	}
 }

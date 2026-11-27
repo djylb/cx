@@ -182,22 +182,27 @@ func controlOperands(op string, args []string) ([]string, error) {
 		}
 		operands = append(operands, operand{key, value})
 	}
-	var flags, pos []string
+	var flags []string
+	var hasText bool
 	for _, arg := range operands {
 		key, value := arg.key, arg.value
 		if key == "" {
-			switch {
-			case op != "say":
+			if op != "say" {
 				flags = append(flags, value)
-			case strings.HasPrefix(value, "@"):
-				b, e := readInputText(value[1:])
-				if e != nil {
-					return nil, e
-				}
-				flags = append(flags, "--cx-text", b)
-			default:
-				pos = append(pos, value)
+				continue
 			}
+			if hasText {
+				return nil, errors.New("expected at most one text argument")
+			}
+			hasText = true
+			if path, file := strings.CutPrefix(value, "@"); file {
+				var readErr error
+				value, readErr = readInputText(path)
+				if readErr != nil {
+					return nil, readErr
+				}
+			}
+			flags = append(flags, "--cx-text", value)
 			continue
 		}
 		switch key {
@@ -219,10 +224,6 @@ func controlOperands(op string, args []string) ([]string, error) {
 			continue
 		}
 		flags = append(flags, "--"+key+"="+value)
-	}
-	if op == "say" && len(pos) > 0 {
-		flags = append(flags, "--")
-		flags = append(flags, pos...)
 	}
 	return flags, nil
 }
@@ -305,9 +306,6 @@ func nodeAction(ctx context.Context, a []string) error {
 			argv = append(argv, operands[i])
 		}
 	}
-	if textPath != "" {
-		argv = append(argv, "--", "@"+textPath)
-	}
 	if op == "say" {
 		f := cliFlags(op)
 		var opts options
@@ -315,7 +313,14 @@ func nodeAction(ctx context.Context, a []string) error {
 		if e = f.Parse(argv); e != nil {
 			return e
 		}
-		return say(ctx, dir, host, id, opts, f.Args())
+		if f.NArg() != 0 {
+			return errors.New("invalid say text attachment")
+		}
+		var text []string
+		if textPath != "" {
+			text = []string{"@" + textPath}
+		}
+		return say(ctx, dir, host, id, opts, text)
 	}
 	return run(ctx, append([]string{op, "--job", id}, argv...))
 }

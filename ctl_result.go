@@ -11,7 +11,6 @@ import (
 	"io"
 	"io/fs"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -33,6 +32,7 @@ type ResultBase struct {
 }
 
 type turnResult struct {
+	Baseline jobBaseline `json:"baseline,omitzero"`
 	*ResultDetails
 	Bases        map[string]ResultBase `json:"bases"`
 	TurnID       string                `json:"turn_id"`
@@ -184,14 +184,23 @@ func sealTurn(ctx context.Context, dir string, s status, n int64) (string, error
 		meta.Outcome = s.CompletedStatus
 	}
 	if checkout != "" {
-		var manifest Manifest
-		if err := readJSON(filepath.Join(checkout, "input", "manifest.json"), &manifest); err != nil {
-			return "", err
+		manifest, manifestErr := readCheckoutManifest(checkout)
+		if manifestErr != nil {
+			return "", manifestErr
 		}
+		meta.Baseline, e = readJobBaseline(checkout)
+		if e != nil {
+			return "", e
+		}
+		meta.Baseline.Question, meta.Baseline.Request = "", ""
 		var req jobSubmission
 		if err := readJSON(filepath.Join(work, "request.json"), &req); err != nil && !os.IsNotExist(err) {
 			return "", err
 		}
+		if meta.Baseline.Snapshot != "" {
+			req.Sources, req.Branches = meta.Baseline.Sources, meta.Baseline.Branches
+		}
+		meta.Baseline.Sources, meta.Baseline.Branches = nil, nil
 		for _, r := range manifest.Repositories {
 			if r.Head != nil {
 				meta.Bases[r.Path] = ResultBase{Base: r.Head, Branch: req.Branches[r.Path]}
@@ -255,10 +264,7 @@ func resultArchive(ctx context.Context, folder, dir string, s status, details bo
 	defer removeBestEffort(f.Name())
 	z := gzip.NewWriter(f)
 	w := tar.NewWriter(z)
-	var payload io.Writer = w
-	if details {
-		payload = io.MultiWriter(w, &progress)
-	}
+	payload := io.MultiWriter(w, &progress)
 	add := func(root, p string, d fs.DirEntry, e error) error {
 		if e != nil || d.IsDir() {
 			return e
@@ -282,7 +288,7 @@ func resultArchive(ctx context.Context, folder, dir string, s status, details bo
 			return e
 		}
 		defer closeBestEffort(in)
-		_, e = io.Copy(payload, in)
+		_, e = io.Copy(payload, resultReader{ctx, in})
 		return e
 	}
 	manifestPath := filepath.Join(folder, "result.json")
@@ -360,7 +366,7 @@ func nodeResult(ctx context.Context, a []string) error {
 	if _, e = fmt.Fprintln(os.Stdout, st.Size()); e != nil {
 		return e
 	}
-	_, e = io.Copy(os.Stdout, f)
+	_, e = io.Copy(os.Stdout, resultReader{ctx, f})
 	return e
 }
 
@@ -389,6 +395,7 @@ func nodeObserveResult(ctx context.Context, a []string) error {
 		return err
 	}
 	defer closeBestEffort(observer)
+	var progress receiveProgress
 	for {
 		if observer.s.RunID != a[1] {
 			return errJobReplaced
@@ -403,6 +410,10 @@ func nodeObserveResult(ctx context.Context, a []string) error {
 			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 				return errObserveTimeout
 			}
+			return err
+		}
+		// A successful poll confirms that the node is still observing the turn.
+		if _, err = progress.Write(nil); err != nil {
 			return err
 		}
 	}
@@ -558,42 +569,31 @@ func installResultTurn(ctx context.Context, partial, dest string, target observe
 }
 
 func downloadTurn(ctx context.Context, h endpoint, id, dest string, details bool, target observedResult, f *os.File, offset int64) error {
-	idle, e := transferSetting("CX_TRANSFER_IDLE", 120*time.Second, false)
-	if e != nil {
-		return e
-	}
-	attempt, stop := context.WithCancel(ctx)
-	defer stop()
 	args := []string{"result-download", id, target.RunID, strconv.FormatInt(target.Number, 10), strconv.FormatInt(offset, 10)}
 	if details {
 		args = append(args, "details")
 	}
-	cmd, e := h.transportCommand(attempt, args, idle)
-	if e != nil {
-		return e
-	}
 	sink := resultStream{file: f, offset: offset, total: -1, progress: dest + ".total"}
-	var diag bytes.Buffer
-	if e = cmd.run(ctx, stop, &sink, &diag); e != nil {
-		if ctx.Err() != nil {
-			return ctx.Err()
+	diag, err := h.runIdle(ctx, &sink, args...)
+	if err != nil {
+		step := "download result archive"
+		if sink.total < 0 {
+			step = "prepare result archive"
 		}
-		if errors.Is(e, errSSHMasterUnsupported) {
-			return e
-		}
-		var ex *exec.ExitError
-		if errors.As(e, &ex) && ex.ExitCode() >= 0 && ex.ExitCode() != 255 {
-			if ex.ExitCode() == 44 {
-				reason := strings.TrimPrefix(strings.TrimSpace(cleanDiag(diag.Bytes())), "cx: ")
+		if code, ok := h.nodeExit(err); ok {
+			if code == 44 {
+				reason := strings.TrimPrefix(diag, "cx: ")
 				if reason == "" {
 					reason = fmt.Sprintf("turn %d unavailable on %s", target.Number, id)
 				}
 				return resultUnavailable(reason)
 			}
-			diagnosticf("%s", cleanDiag(diag.Bytes()))
-			return ctlExit(ex.ExitCode())
+			if diag != "" {
+				diagnosticf("%s: %s\n", step, diag)
+			}
+			return fmt.Errorf("%s: %w", step, ctlExit(code))
 		}
-		return fmt.Errorf("%w: %v %s", ctlExit(9), e, cleanDiag(diag.Bytes()))
+		return idleCallError(ctx, step, diag, err)
 	}
 	if sink.total < 0 || sink.offset != sink.total {
 		return fmt.Errorf("%w: interrupted result transfer", ctlExit(9))
@@ -639,7 +639,7 @@ func selectResultTurn(ctx context.Context, h endpoint, id, turn string, wait boo
 		}
 		target.Number = n
 	}
-	r, err := h.call(ctx, 30*time.Second, "status", "--job", id)
+	r, err := h.callIdle(ctx, "look up result status", "status", "--job", id)
 	if err != nil {
 		return status{}, target, err
 	}
@@ -665,8 +665,7 @@ func selectResultTurn(ctx context.Context, h endpoint, id, turn string, wait boo
 			return s, target, unsealedTurn(target.Number)
 		}
 		if !isTerminal(s.State) {
-			deadline, _ := ctx.Deadline()
-			r, err = h.call(ctx, deadline.Sub(timeshim.Or(contextClock(ctx)).Now()), "observe-result", id, target.RunID, strconv.FormatInt(target.Number, 10))
+			r, err = h.callIdle(ctx, "wait for result turn", "observe-result", id, target.RunID, strconv.FormatInt(target.Number, 10))
 			if err != nil {
 				return s, target, err
 			}
@@ -702,8 +701,8 @@ func ctlResult(ctx context.Context, host, id, op string, o ctlOptions) (err erro
 		ctx, cancel = timeshim.WithTimeout(ctx, timeshim.Or(contextClock(ctx)), limit)
 		defer cancel()
 		defer func() {
-			if err != nil && ctx.Err() != nil && !errors.Is(err, ctlExit(44)) {
-				err = ctx.Err()
+			if cause := ctx.Err(); err != nil && cause != nil && !errors.Is(err, ctlExit(44)) && !errors.Is(err, cause) {
+				err = cause
 			}
 		}()
 		if wait {
@@ -718,9 +717,9 @@ func ctlResult(ctx context.Context, host, id, op string, o ctlOptions) (err erro
 		fetch = collectResultTurn
 	}
 	details := o.json || o.log
-	if op == "result" || op == "patch" {
-		if o.turn != "" && !o.refresh && !o.incremental {
-			cached, e := cachedResultDir(host, id, o.turn, details, o.path)
+	if op == "result" {
+		if o.turn != "" && !o.refresh {
+			cached, _, e := cachedResultDir(host, id, o.turn, details, o.path)
 			if e != nil {
 				return e
 			}
@@ -737,6 +736,15 @@ func ctlResult(ctx context.Context, host, id, op string, o ctlOptions) (err erro
 	if e != nil {
 		return e
 	}
+	if op == "patch" && o.turn != "" && !o.refresh {
+		cached, generation, cacheErr := cachedResultDir(host, id, o.turn, false, false)
+		if cacheErr != nil {
+			return cacheErr
+		}
+		if cached != "" {
+			return ctlSealedPatches(ctx, h, host, id, generation, cached, op, o)
+		}
+	}
 	publish := op == "result" || op == "agent" || op == "patch"
 	var marker string
 	var seen resultReference
@@ -751,18 +759,6 @@ func ctlResult(ctx context.Context, host, id, op string, o ctlOptions) (err erro
 		return e
 	}
 	n := target.Number
-	var since int64
-	if o.incremental {
-		since = n
-		if since == 0 {
-			return errors.New("--incremental requires a positive completed turn")
-		}
-	} else if o.sinceTurn != "" {
-		since, e = strconv.ParseInt(o.sinceTurn, 10, 64)
-		if e != nil || since < 1 || since > n {
-			return fmt.Errorf("--since-turn must be between 1 and the latest completed turn (%d)", n)
-		}
-	}
 	turn := strconv.FormatInt(n, 10)
 	dest, e := resultDest(host, id, s.RunID, turn)
 	if e != nil {
@@ -797,40 +793,12 @@ func ctlResult(ctx context.Context, host, id, op string, o ctlOptions) (err erro
 			return e
 		}
 	}
-	if op == "apply" || since > 1 {
-		var m turnResult
-		if e = readJSON(filepath.Join(dest, "result.json"), &m); e != nil {
-			return e
-		}
-		patchDir := dest
-		if since > 1 {
-			previous, err := resultDest(host, id, s.RunID, strconv.FormatInt(since-1, 10))
-			if err != nil {
-				return err
-			}
-			if err = fetchTurn(ctx, h, id, s.RunID, strconv.FormatInt(since-1, 10), previous, false); err != nil {
-				if errors.Is(err, ctlExit(44)) {
-					return resultUnavailable(fmt.Sprintf("Sealed turn %d is unavailable for %s (%v). Use the cumulative patch or cx rebase %s TEXT.", since-1, id, err, id))
-				}
-				return err
-			}
-			patchDir, err = os.MkdirTemp("", "cx-incremental-")
-			if err != nil {
-				return err
-			}
-			defer removeTreeBestEffort(patchDir)
-			m, err = incrementalResult(ctx, previous, dest, patchDir, since-1, m)
-			if err != nil {
-				return err
-			}
-		}
-		if op == "apply" {
-			return applyTurn(ctx, dest, patchDir, id, host, target.RunID, since, o, m)
-		}
-		return displayTurn(ctx, patchDir, id, op, o)
+	if op == "apply" || op == "patch" {
+		return ctlSealedPatches(ctx, h, host, id, target.RunID, dest, op, o)
 	}
 	return displayTurn(ctx, dest, id, op, o)
 }
+
 func displayTurn(ctx context.Context, dir, id, op string, o ctlOptions) error {
 	if o.path {
 		path, err := resultReportPath(dir)
@@ -846,7 +814,7 @@ func displayTurn(ctx context.Context, dir, id, op string, o ctlOptions) error {
 	if o.json || o.log {
 		return displayResultDetails(os.Stdout, dir, id, o.log)
 	}
-	if op == "result" || op == "patch" && !o.full {
+	if op == "result" {
 		var b bytes.Buffer
 		e := writeTurn(ctx, &b, dir, id, op, o)
 		if e != nil && !errors.Is(e, ctlExit(1)) {
@@ -870,42 +838,6 @@ func writeTurn(ctx context.Context, out io.Writer, dir, id, op string, o ctlOpti
 	var m turnResult
 	if e := readJSON(filepath.Join(dir, "result.json"), &m); e != nil {
 		return e
-	}
-	if op == "patch" {
-		var rows []turnPatch
-		for _, row := range m.Repositories {
-			if o.repo == "" || o.repo == row.Path || o.repo == row.RepoID {
-				rows = append(rows, row)
-			}
-		}
-		if o.repo != "" && len(rows) != 1 {
-			return errors.New("select a unique changed repository")
-		}
-		for _, row := range rows {
-			p := filepath.Join(dir, row.Patch)
-			if o.repo == "" {
-				if _, e := fmt.Fprintf(out, "# repo: %s\n", row.Path); e != nil {
-					return e
-				}
-			}
-			if o.full {
-				b, e := readSharedFile(p)
-				if e != nil {
-					return e
-				}
-				if _, e = out.Write(b); e != nil {
-					return e
-				}
-			} else {
-				cmd := exec.CommandContext(ctx, "git", "apply", "--stat", p)
-				cmd.Stdout = out
-				cmd.Stderr = os.Stderr
-				if e := cmd.Run(); e != nil {
-					return e
-				}
-			}
-		}
-		return nil
 	}
 	p := filepath.Join(dir, "last.md")
 	b, e := readSharedFile(p)
@@ -1105,35 +1037,36 @@ func forgetResult(host, id string) error {
 	return writeJSON(path, resultReference{Epoch: old.Epoch + 1})
 }
 
-func cachedResultDir(host, id, turn string, details, reportOnly bool) (string, error) {
+func cachedResultDir(host, id, turn string, details, reportOnly bool) (string, string, error) {
 	_, ref, e := resultMarkerSnapshot(host, id)
 	if e != nil {
-		return "", e
+		return "", "", e
 	}
 	if ref.Generation == "" {
-		return "", nil
+		return "", "", nil
 	}
 	n := ref.Turn
 	if turn != "" {
 		n, e = strconv.ParseInt(turn, 10, 64)
 		if e != nil || n < 0 {
-			return "", errors.New("invalid result turn")
+			return "", "", errors.New("invalid result turn")
 		}
 	}
 	d, e := resultDest(host, id, ref.Generation, strconv.FormatInt(n, 10))
 	if e != nil {
-		return "", e
+		return "", "", e
 	}
 	if reportOnly {
-		return cachedResultReport(d, observedResult{RunID: ref.Generation, Number: n})
+		report, reportErr := cachedResultReport(d, observedResult{RunID: ref.Generation, Number: n})
+		return report, ref.Generation, reportErr
 	}
 	d = resultVariant(d, details)
 	if _, e = os.Stat(filepath.Join(d, "result.json")); os.IsNotExist(e) {
-		return "", nil
+		return "", "", nil
 	} else if e != nil {
-		return "", e
+		return "", "", e
 	}
-	return d, nil
+	return d, ref.Generation, nil
 }
 
 // The size line and archive share stdout. Preserve every received archive byte

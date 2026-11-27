@@ -226,7 +226,11 @@ func (r *runner) executeRPC(id string, e envelope, reply **agentReply) (json.Raw
 				return nil, errors.New("detached review requires a target")
 			}
 			var child struct{ Thread struct{ ID string } }
-			if err := r.call("thread/start", r.threadParams(), &child); err != nil {
+			threadParams, paramsErr := r.codexThreadParams()
+			if paramsErr != nil {
+				return nil, paramsErr
+			}
+			if err := r.call("thread/start", threadParams, &child); err != nil {
 				return nil, err
 			}
 			if child.Thread.ID == "" {

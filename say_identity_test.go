@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -22,6 +24,67 @@ func TestControllerSayValidatesBeforeResume(t *testing.T) {
 	_, diagnostic := cliStreams(t, 1, nil, f.cx, "say", "local:p/ended")
 	if !strings.Contains(diagnostic, "say requires text or @file") {
 		t.Fatalf("unexpected diagnostic: %s", diagnostic)
+	}
+}
+
+func TestControllerSayLongTextOverSSH(t *testing.T) {
+	f := newControllerFixture(t)
+	dir := filepath.Join(os.Getenv("CXRUN_STATE"), "p", "long")
+	if err := writeFixtureStatus(dir, status{Project: "p", Job: "long", RunID: "fixture", State: "running", Engine: "codex", TurnStatus: "inProgress"}); err != nil {
+		t.Fatal(err)
+	}
+	owner, err := lockPath(filepath.Join(dir, "owner.lock"), 0)
+	if err != nil || owner == nil {
+		t.Fatalf("lock owner: %v", err)
+	}
+	defer closeBestEffort(owner)
+
+	setupPrefetchSSH(t, f, "")
+	// Model a remote argv limit while running the real node wire decoder.
+	script := `#!/bin/sh
+for arg do line=$arg; done
+if [ "${#line}" -gt 32768 ]; then
+  echo 'remote argument list too long' >&2
+  exit 255
+fi
+exec sh -c "$line"
+`
+	if err = os.WriteFile(filepath.Join(f.home, "ssh"), []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	message := strings.Repeat("- 世界 '$' \n", 6000)
+	file := filepath.Join(f.home, "message.txt")
+	if err = os.WriteFile(file, []byte(message), 0600); err != nil {
+		t.Fatal(err)
+	}
+	const job = "remote:p/long"
+	cliOutput(t, 0, nil, f.cx, "say", job, "--", message)
+	attachment := filepath.Join(dir, "attachments", fmt.Sprintf("%x.txt", sha256.Sum256([]byte(message))))
+	if text, readErr := os.ReadFile(attachment); readErr != nil || string(text) != message {
+		t.Fatalf("inline text did not use the file delivery path: %v", readErr)
+	}
+	cliOutput(t, 0, nil, f.cx, "say", job, "@"+file)
+	messages, err := pendingInboxMessages(dir)
+	if err != nil || len(messages) != 2 {
+		t.Fatalf("expected two messages, got %d: %v", len(messages), err)
+	}
+	for _, record := range messages {
+		var msg inboxMessage
+		if err = json.Unmarshal(record.Value, &msg); err != nil || msg.Text != message {
+			t.Fatalf("incorrect text delivery: %d bytes, %v", len(msg.Text), err)
+		}
+	}
+	_, diag := cliStreams(t, 2, nil, f.cx, "say", job, "@"+file+".missing")
+	if !strings.Contains(diag, file+".missing") {
+		t.Fatalf("missing operand diagnostic: %s", diag)
+	}
+	cliOutput(t, 11, nil, f.cx, "say", "remote:p/missing", "message")
+	if err = os.WriteFile(filepath.Join(f.home, "ssh"), []byte("#!/bin/sh\necho 'remote argument list too long' >&2\nexit 255\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	_, diag = cliStreams(t, 9, nil, f.cx, "say", job, "message")
+	if !strings.Contains(diag, "remote argument list too long") {
+		t.Fatalf("missing transport diagnostic: %s", diag)
 	}
 }
 
@@ -101,27 +164,28 @@ func (c saySealClock) AfterFunc(d time.Duration, f func()) timeshim.Timer {
 }
 
 func TestSayRejectsReplacementDuringSeal(t *testing.T) {
-	for _, operands := range [][]string{{"--", "message"}, {"--input-json=[{\"type\":\"text\",\"text\":\"message\"}]"}} {
+	for _, operands := range [][]string{{"--cx-text", "message"}, {"--input-json=[{\"type\":\"text\",\"text\":\"message\"}]"}} {
 		t.Run(operands[0], func(t *testing.T) {
 			newControllerFixture(t)
 			root := os.Getenv("CXRUN_STATE")
 			dir := filepath.Join(root, "p", "job")
 			s := status{Project: "p", Job: "job", State: "waiting", Engine: "codex", RunID: "fixture", Thread: "saved", Finished: 1, LastCompleted: "turn"}
-			if err := writeFixtureStatus(dir, s); err != nil {
+			err := writeFixtureStatus(dir, s)
+			if err != nil {
 				t.Fatal(err)
 			}
-			owner, err := lockPath(filepath.Join(dir, "owner.lock"), 0)
-			if err != nil || owner == nil {
-				t.Fatalf("lock owner: %v", err)
+			owner, lockErr := lockPath(filepath.Join(dir, "owner.lock"), 0)
+			if lockErr != nil || owner == nil {
+				t.Fatalf("lock owner: %v", lockErr)
 			}
 			defer closeBestEffort(owner)
 			result := filepath.Join(dir, "result")
 			if err = os.MkdirAll(result, 0700); err != nil {
 				t.Fatal(err)
 			}
-			seal, err := lockPath(filepath.Join(result, ".lock"), os.O_CREATE)
-			if err != nil || seal == nil {
-				t.Fatalf("lock result: %v", err)
+			seal, lockErr := lockPath(filepath.Join(result, ".lock"), os.O_CREATE)
+			if lockErr != nil || seal == nil {
+				t.Fatalf("lock result: %v", lockErr)
 			}
 			defer closeBestEffort(seal)
 			replaced := false

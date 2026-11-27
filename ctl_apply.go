@@ -39,6 +39,8 @@ type applyPlan struct {
 	original, final, pack, delta        []byte
 	git, work                           snapGit
 	conflicts                           []string
+	since                               int64
+	incremental                         bool
 }
 
 func treeChanges(g snapGit, a, b string) (map[string]bool, error) {
@@ -71,7 +73,7 @@ func overlayIndex(g snapGit, tree string, paths []string) error {
 	return e
 }
 
-func planApply(ctx context.Context, store, src, patch, scratch string, row turnPatch, base SnapshotRepo, since int64, allowConflicts bool) (applyPlan, error) {
+func planApply(ctx context.Context, store, src, patch, scratch string, row turnPatch, base SnapshotRepo, allowConflicts bool) (applyPlan, error) {
 	g := snapGit{ctx: ctx, dir: src}
 	p := applyPlan{src: src, git: g, repo: row.Path, patch: patch}
 	if base.OID != row.SnapshotOID || base.RepoID != row.RepoID {
@@ -199,7 +201,7 @@ func planApply(ctx context.Context, store, src, patch, scratch string, row turnP
 	if e != nil {
 		return p, e
 	}
-	if since == 0 && base.Head != nil {
+	if row.mergeBase == "" && base.Head != nil {
 		if _, e = g.get("read-tree", patchBase); e != nil {
 			return p, e
 		}
@@ -220,7 +222,7 @@ func planApply(ctx context.Context, store, src, patch, scratch string, row turnP
 			return p, e
 		}
 	}
-	if since > 0 || base.Head == nil {
+	if row.mergeBase != "" || base.Head == nil {
 		p.base = ancestor
 	}
 	merged, stages, e := mergeApplyTrees(g, ancestor, ours, theirs)
@@ -304,6 +306,8 @@ func planApply(ctx context.Context, store, src, patch, scratch string, row turnP
 	return p, e
 }
 
+var errApplyRollback = errors.New("could not roll back checkout changes")
+
 func installPlans(plans []applyPlan, record func() error) (err error) {
 	var locks []string
 	defer func() {
@@ -315,7 +319,9 @@ func installPlans(plans []applyPlan, record func() error) (err error) {
 	defer func() {
 		if err != nil {
 			for _, u := range slices.Backward(undo) {
-				err = errors.Join(err, u())
+				if undoErr := u(); undoErr != nil {
+					err = errors.Join(err, errApplyRollback, undoErr)
+				}
 			}
 		}
 	}()
@@ -340,8 +346,10 @@ func installPlans(plans []applyPlan, record func() error) (err error) {
 
 	}
 	for _, p := range plans {
-		if _, e := p.git.input(p.pack, "unpack-objects", "-q"); e != nil {
-			return e
+		if len(p.pack) != 0 {
+			if _, e := p.git.input(p.pack, "unpack-objects", "-q"); e != nil {
+				return e
+			}
 		}
 		if len(p.delta) > 0 {
 			if _, e := p.work.input(p.delta, "apply", "--index", "-"); e != nil {
@@ -411,10 +419,22 @@ func mergeApplyTrees(g snapGit, ancestor, ours, theirs string) (tree string, sta
 	return entries[0], stages, nil
 }
 
-func applyTurn(ctx context.Context, dir, patchDir, id, host, runID string, since int64, o ctlOptions, m turnResult) error {
+func applyTurn(ctx context.Context, dir, project, id, host, runID string, o ctlOptions, turn int64, rows []selectedPatch) error {
+	changed := 0
+	for _, row := range rows {
+		if row.Patch != "" {
+			changed++
+		}
+	}
+	if o.repo != "" && len(rows) != 1 || o.dir != "" && (changed > 1 || changed == 0 && len(rows) != 1) {
+		return errors.New("select exactly one changed repository")
+	}
 	origin, store, manifest, e := applyOrigin(dir)
 	if e != nil {
 		return e
+	}
+	if changed == 0 {
+		return nil
 	}
 	root, e := manifest.sourceRoot(ctx, origin.Source)
 	if e != nil {
@@ -428,13 +448,11 @@ func applyTurn(ctx context.Context, dir, patchDir, id, host, runID string, since
 	var plans []applyPlan
 	var conflicts []string
 	var failures error
-	allowConflicts := o.allowConflicts && (o.repo != "" || len(m.Repositories) == 1)
-	count := 0
-	for i, row := range m.Repositories {
-		if o.repo != "" && o.repo != row.Path && o.repo != row.RepoID {
+	allowConflicts := o.allowConflicts && changed == 1
+	for i, row := range rows {
+		if row.Patch == "" {
 			continue
 		}
-		count++
 		var base *SnapshotRepo
 		for j := range manifest.Repositories {
 			if manifest.Repositories[j].Path == row.Path {
@@ -452,7 +470,7 @@ func applyTurn(ctx context.Context, dir, patchDir, id, host, runID string, since
 				return e
 			}
 		}
-		patch := filepath.Join(patchDir, row.Patch)
+		patch := filepath.Join(row.dir, row.Patch)
 		temp := filepath.Join(scratch, fmt.Sprint(i))
 		if row.ResultBase != nil && row.Base != nil && (base.Head == nil || *row.Base != *base.Head) {
 			return errors.New("result base differs from frozen source")
@@ -463,7 +481,7 @@ func applyTurn(ctx context.Context, dir, patchDir, id, host, runID string, since
 				return e
 			}
 		}
-		plan, planErr := planApply(ctx, store, src, patch, temp, row, *base, since, allowConflicts)
+		plan, planErr := planApply(ctx, store, src, patch, temp, row.turnPatch, *base, allowConflicts)
 		if planErr != nil {
 			failures = errors.Join(failures, fmt.Errorf("%s: %w", row.Path, planErr))
 			continue
@@ -471,14 +489,13 @@ func applyTurn(ctx context.Context, dir, patchDir, id, host, runID string, since
 		for _, name := range plan.conflicts {
 			conflicts = append(conflicts, row.Path+"/"+name)
 		}
+		plan.since = row.since
+		plan.incremental = row.mergeBase != ""
 		plans = append(plans, plan)
-	}
-	if (o.dir != "" || o.repo != "") && count != 1 {
-		return errors.New("select exactly one changed repository")
 	}
 	if len(conflicts) > 0 {
 		diagnosticf("Conflicting files: %s\n", strings.Join(conflicts, ", "))
-		diagnosticf("If earlier turns are already applied, try cx apply %s --since-turn N; to resolve on a fresh snapshot, use cx rebase %s TEXT.\n", id, id)
+		diagnosticf("To choose a different starting turn, use cx apply %s --since-turn N; to resolve on a fresh snapshot, use cx rebase %s TEXT.\n", id, id)
 		if e = writeJSON(dir+".conflicts.json", conflicts); e != nil {
 			return e
 		}
@@ -489,31 +506,23 @@ func applyTurn(ctx context.Context, dir, patchDir, id, host, runID string, since
 	if failures != nil || len(conflicts) > 0 && !allowConflicts {
 		return ctlExit(1)
 	}
-	project, e := outputProject(applyLogProject(id))
-	if e != nil {
-		return e
-	}
-	lock, e := lockUntil(ctx, filepath.Join(project, ".apply.lock"))
-	if e != nil {
-		return e
-	}
-	defer closeBestEffort(lock)
-	record := func(changes []applyPlan) error {
+	record := func() error {
+		if len(conflicts) > 0 {
+			return nil
+		}
 		log := filepath.Join(project, "apply-log.jsonl")
 		b, readErr := os.ReadFile(log)
 		if readErr != nil && !os.IsNotExist(readErr) {
 			return readErr
 		}
-		for _, plan := range changes {
+		for _, plan := range plans {
 			var base any
 			if plan.base != "" {
 				base = plan.base
 			}
-			entry := fields{"job": id, "host": host, "run_id": runID, "base": base, "turn": m.Turn, "repo": plan.repo, "source": plan.src, "patch": plan.patch, "applied_at": timeshim.Or(contextClock(ctx)).Now().UTC().Format(time.RFC3339Nano)}
-			if since > 0 {
-				entry["since_turn"] = since
-			}
-			if since > 1 {
+			entry := fields{"job": id, "host": host, "run_id": runID, "base": base, "turn": turn, "repo": plan.repo, "source": plan.src, "patch": plan.patch, "applied_at": timeshim.Or(contextClock(ctx)).Now().UTC().Format(time.RFC3339Nano)}
+			entry["since_turn"] = plan.since
+			if plan.incremental {
 				delete(entry, "patch")
 				entry["result"] = filepath.Join(dir, "result.json")
 			}
@@ -526,7 +535,7 @@ func applyTurn(ctx context.Context, dir, patchDir, id, host, runID string, since
 		return atomicWrite(log, b)
 	}
 	if len(plans) > 0 {
-		if e = installPlans(plans, func() error { return record(plans) }); e != nil {
+		if e = installPlans(plans, record); e != nil {
 			return e
 		}
 	}
@@ -545,7 +554,7 @@ func applyTurn(ctx context.Context, dir, patchDir, id, host, runID string, since
 		diagnosticf("Merge results written. Resolve the conflicts before committing.\n")
 		return ctlExit(1)
 	}
-	if count > 0 {
+	if len(plans) > 0 {
 		fmt.Println("Changes are ready for review and commit.")
 	}
 	if failed {
@@ -591,6 +600,13 @@ func applyOrigin(dir string) (submissionOrigin, string, Manifest, error) {
 	}
 	if origin.Snapshot == "" {
 		return origin, "", m, errors.New("in-place jobs have no patch")
+	}
+	var result struct{ Baseline jobBaseline }
+	if e = readJSON(filepath.Join(dir, "result.json"), &result); e != nil && !os.IsNotExist(e) {
+		return origin, store, m, e
+	}
+	if result.Baseline.Snapshot != "" {
+		origin.Snapshot, origin.Source = result.Baseline.Snapshot, result.Baseline.Source
 	}
 	m, _, e = snapManifest(store, string(origin.Snapshot))
 	return origin, store, m, e

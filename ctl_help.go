@@ -15,7 +15,7 @@ type ctlCommand struct {
 }
 
 const submissionSessionFlags = "session no-session"
-const submitFlags = "project profile engine model effort sandbox role parent snapshot with-history input-json image idle-exit turn-timeout approval-timeout stall queue-timeout inplace interactive web-search hard network no-network force sync no-tools clean-base context " + submissionSessionFlags
+const submitFlags = "project profile engine model effort sandbox own role parent snapshot with-history input-json image idle-exit turn-timeout approval-timeout stall queue-timeout inplace interactive web-search hard network no-network force sync no-tools clean-base context " + submissionSessionFlags
 const projectInitUsage = "NAME --repo DIR [DIR ...] [--include REPO:PATH ...] [--default-host HOST]"
 
 var ctlCommands = map[string]ctlCommand{
@@ -51,13 +51,14 @@ var ctlCommands = map[string]ctlCommand{
 	"node":         {"COMMAND [ARGS ...]", "Run an execution-node command.", ""},
 	"outbox":       {"JOB [--since N]\n  cx outbox --any [--project PROJECT] [--since N] [--to TARGET] [--latest]", "Read job messages after a sequence.", "any project since to latest"},
 	"overview":     {"", "Summarize jobs and project channels.", "json project session all max-bytes"},
-	"patch":        {"JOB", "Show collected patch statistics or contents.", "turn incremental full repo max-bytes"},
+	"patch":        {"JOB", "Show collected patch statistics or contents.", "turn since-turn incremental full repo max-bytes"},
 	"plan":         {"JOB", "Read recorded plan events.", ""},
 	"project":      {"ls | show NAME | init " + projectInitUsage, "List, inspect, or initialize projects.", ""},
 	"project-init": {projectInitUsage, "Initialize a project.", ""},
 	"project-ls":   {"", "List configured projects.", ""},
 	"project-show": {"NAME", "Print project configuration.", ""},
-	"rebase":       {"JOB TEXT", "Submit a follow-up to resolve patch conflicts.", "turn " + submissionSessionFlags},
+	"refresh":      {"JOB [DIR]", "Refresh a snapshot job before its next turn.", ""},
+	"rebase":       {"JOB TEXT", "Submit a follow-up on a fresh baseline or carry changes to another host.", "turn host profile " + submissionSessionFlags},
 	"reply":        {"JOB [--request ID] (--result JSON|@FILE | --error JSON|@FILE)", "Reply to a pending engine request.", ""},
 	"requests":     {"JOB", "List pending engine requests.", ""},
 	"result":       {"JOB", "Collect a sealed turn and show its report, path, metadata, or log.", "turn full json log path wait timeout refresh max-bytes"},
@@ -200,6 +201,8 @@ func printCtlHelp(w io.Writer, op string) {
 		_, _ = fmt.Fprintln(w, "  Check stdout JSON status=queued to identify an admission block.")
 	case "run":
 		_, _ = fmt.Fprintln(w, "  7 duplicate job\n  9 transport failure")
+	case "refresh":
+		_, _ = fmt.Fprintln(w, "  9 transport failure\n  11 job registration not found")
 	case "result", "patch", "apply", "rebase":
 		failure := "failed turn or operation"
 		if op == "apply" {
@@ -228,7 +231,7 @@ func printCtlHelp(w io.Writer, op string) {
 }
 
 var ctlFlagDescriptions = map[string]string{
-	"since-turn":      "apply changes from turn `N` through the latest sealed turn",
+	"since-turn":      "start at turn `N` (1 for cumulative)",
 	"incremental":     "show changes since the preceding sealed turn",
 	"allow-conflicts": "write merge results with conflicts and exit nonzero",
 	"all":             "include every session", "all-hosts": "include all configured hosts (default)", "any": "select multiple jobs",
@@ -252,6 +255,7 @@ var ctlFlagDescriptions = map[string]string{
 	"model": "agent `MODEL` (engine default)", "network": "enable sandbox network access (enabled by default with workspace-write)",
 	"no-network": "disable sandbox network access", "no-tools": "omit the job-scoped messaging tools",
 	"no-session": "explicitly create the job without a session",
+	"own":        "limit writes to snapshot `PATH` (repeatable, relative to the main repository root)",
 	"parent":     "parent `JOB` or session (defaults to CX_PARENT, then current session)",
 	"project":    "select `PROJECT`", "raw": "show raw job output", "refresh": "refresh the cached result",
 	"repo": "select repository `PATH`", "reuse": "reuse matching successful command output",

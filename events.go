@@ -454,7 +454,7 @@ func (r *runner) finish(t turn) error {
 	}
 	r.s.InputKind = ""
 	line, _, _ := strings.Cut(r.lastText, "\n")
-	if r.c.Interactive && t.Status == "completed" && reportStatus(line) == "QUESTION" {
+	if (r.c.Interactive || strings.HasPrefix(t.ID, "refresh-")) && t.Status == "completed" && reportStatus(line) == "QUESTION" {
 		r.s.InputKind = "next_turn"
 	}
 	r.deriveState()
@@ -619,6 +619,89 @@ func (r *runner) notify(m message) error {
 	return nil
 }
 
+// Resolve paths from the main repository root, including sibling members.
+func ownedMember(cwd string, members []string, path string) (int, string, error) {
+	main := containingMember(members, cwd)
+	if main < 0 || path == "" || filepath.IsAbs(path) || filepath.VolumeName(path) != "" ||
+		strings.HasPrefix(path, string(filepath.Separator)) || strings.ContainsAny(path, "\\\x00\r\n") {
+		return -1, "", fmt.Errorf("invalid snapshot --own path %q", path)
+	}
+	target := filepath.Join(members[main], path)
+	index := containingMember(members, target)
+	if index < 0 {
+		return -1, "", fmt.Errorf("--own %q is outside snapshot repositories", path)
+	}
+	rel, relErr := filepath.Rel(members[index], target)
+	return index, rel, relErr
+}
+
+func containingMember(members []string, path string) int {
+	for i, member := range members {
+		if snapWithin(member, path) {
+			return i
+		}
+	}
+	return -1
+}
+
+func (c *config) writableMemberRoots(root string) ([]string, error) {
+	members, rootsErr := snapshotMemberRoots(root, c.Dir)
+	if rootsErr != nil {
+		return nil, rootsErr
+	}
+	if len(c.Own) == 0 {
+		return members, nil
+	}
+	cwd, cwdErr := filepath.EvalSymlinks(c.Dir)
+	if cwdErr != nil {
+		return nil, cwdErr
+	}
+	roots := make([]string, 0, len(c.Own))
+	for _, path := range c.Own {
+		index, rel, pathErr := ownedMember(cwd, members, path)
+		if pathErr != nil {
+			return nil, pathErr
+		}
+		target := filepath.Join(members[index], rel)
+		physical, resolveErr := filepath.EvalSymlinks(target)
+		if resolveErr != nil || physical != target {
+			return nil, fmt.Errorf("--own %q must name an existing snapshot file or directory without symlinks", path)
+		}
+		roots = append(roots, target)
+	}
+	return roots, nil
+}
+
+const ownedPermissions = "cx-owned"
+
+func (r *runner) codexThreadParams() (fields, error) {
+	p := r.threadParams()
+	if len(r.c.Own) == 0 {
+		return p, nil
+	}
+	roots, rootsErr := r.c.writableMemberRoots(r.root)
+	if rootsErr != nil {
+		return nil, rootsErr
+	}
+	// The legacy workspace-write policy implicitly grants writes to cwd.
+	delete(p, "sandbox")
+	p["permissions"] = ownedPermissions
+	cfg, ok := p["config"].(fields)
+	if !ok {
+		cfg = fields{}
+		p["config"] = cfg
+	}
+	fs := fields{":root": "read"}
+	for _, root := range append(roots, r.c.Roots...) {
+		fs[root] = "write"
+	}
+	cfg["permissions."+ownedPermissions] = fields{
+		"filesystem": fs,
+		"network":    fields{"enabled": r.c.Network},
+	}
+	return p, nil
+}
+
 func (r *runner) threadParams() fields {
 	p := fields{"cwd": r.c.Dir, "approvalPolicy": appServerApprovalPolicy, "sandbox": r.c.Sandbox}
 	if r.c.Model != "" {
@@ -638,7 +721,10 @@ func (r *runner) threadParams() fields {
 }
 
 func (r *runner) connectThread() error {
-	p := r.threadParams()
+	p, paramsErr := r.codexThreadParams()
+	if paramsErr != nil {
+		return paramsErr
+	}
 	method := "thread/start"
 	previous := r.s.Thread
 	if previous == "" && r.c.ForkThread != "" {
@@ -696,6 +782,18 @@ func (r *runner) connectThread() error {
 	var latest turn
 	if len(th.Turns) > 0 {
 		latest = th.Turns[len(th.Turns)-1]
+	}
+	// The engine's history omits the node-generated refresh question.
+	if strings.HasPrefix(r.s.LastCompleted, "refresh-") && (latest.Status != "inProgress" || th.Status.Type != "active") {
+		r.releaseSlot()
+		r.deriveState()
+		r.idleSince = timeshim.Or(r.clock).Now()
+		if err := r.save(); err != nil {
+			return err
+		}
+		return r.recoverInbox(latest)
+	}
+	if latest.ID != "" {
 		r.lastText = ""
 		for _, i := range latest.Items {
 			if i.Type == "agentMessage" {
@@ -768,6 +866,14 @@ func (r *runner) sendInput(input any, id string, steer bool) error {
 			return fmt.Errorf("seal previous turn before starting the next: %w", err)
 		}
 	}
+	if !steer {
+		if err := r.acquireSlot(); err != nil {
+			return err
+		}
+		if question, err := r.refreshBeforeTurn(); question || err != nil {
+			return err
+		}
+	}
 	if r.claude != nil {
 		return r.startClaude(input, id)
 	}
@@ -779,25 +885,24 @@ func (r *runner) sendInput(input any, id string, steer bool) error {
 		}
 		return r.writeProgress("turn/steer", id+" → "+r.s.Turn)
 	}
-	sb := fields{"type": "readOnly", "networkAccess": r.c.Network}
-	switch r.c.Sandbox {
-	case "workspace-write":
-		sb["type"] = "workspaceWrite"
-		roots, err := snapshotMemberRoots(r.root, r.c.Dir)
-		if err != nil {
-			return err
+	if len(r.c.Own) == 0 {
+		sb := fields{"type": "readOnly", "networkAccess": r.c.Network}
+		switch r.c.Sandbox {
+		case "workspace-write":
+			sb["type"] = "workspaceWrite"
+			roots, rootsErr := r.c.writableMemberRoots(r.root)
+			if rootsErr != nil {
+				return rootsErr
+			}
+			if len(roots) == 0 {
+				roots = []string{r.c.Dir}
+			}
+			sb["writableRoots"] = append(roots, r.c.Roots...)
+		case dangerFullAccess:
+			sb = fields{"type": "dangerFullAccess"}
 		}
-		if len(roots) == 0 {
-			roots = []string{r.c.Dir}
-		}
-		sb["writableRoots"] = append(roots, r.c.Roots...)
-	case dangerFullAccess:
-		sb = fields{"type": "dangerFullAccess"}
+		p["sandboxPolicy"] = sb
 	}
-	if err := r.acquireSlot(); err != nil {
-		return err
-	}
-	p["sandboxPolicy"] = sb
 
 	p["approvalPolicy"] = appServerApprovalPolicy
 	var result struct{ Turn turn }

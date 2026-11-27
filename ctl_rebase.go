@@ -15,8 +15,11 @@ import (
 )
 
 type rebaseRequest struct {
+	Refresh   *refreshTodo `json:",omitempty"`
 	Text      string
 	Session   string
+	Host      string `json:",omitempty"`
+	Profile   string `json:",omitempty"`
 	Child     string `json:",omitempty"`
 	Failure   string `json:",omitempty"`
 	Submitted bool   `json:",omitempty"`
@@ -30,6 +33,10 @@ func ctlRebase(ctx context.Context, h endpoint, host, id string, o ctlOptions) e
 		return errors.New("rebase requires a project job")
 	}
 	s, target, err := selectResultTurn(ctx, h, id, o.turn, false)
+	var cached string
+	if o.host != "" && errors.Is(err, ctlExit(9)) && ctx.Err() == nil {
+		cached, target, err = offlineRebaseResult(host, id, target.Number, o.turn != "", err)
+	}
 	pending := errors.Is(err, ctlExit(44)) && resultInProgress(s) && target.Number == s.Finished+1
 	if err != nil && !pending {
 		return err
@@ -62,7 +69,7 @@ func ctlRebase(ctx context.Context, h endpoint, host, id string, o ctlOptions) e
 	defer func() { closeBestEffort(lock) }()
 	var req rebaseRequest
 	err = readJSON(slot, &req)
-	replacing := err == nil && req.Child == ""
+	replacing := err == nil && req.Text != "" && req.Child == ""
 	if err != nil && !os.IsNotExist(err) {
 		return err
 	}
@@ -77,7 +84,7 @@ func ctlRebase(ctx context.Context, h endpoint, host, id string, o ctlOptions) e
 			return nil
 		}
 	} else {
-		req.Text, req.Session = o.dir, o.session
+		req = rebaseRequest{Refresh: req.Refresh, Text: o.dir, Session: o.session, Host: o.host, Profile: o.profile}
 		if err = writeJSON(slot, req); err != nil {
 			return err
 		}
@@ -85,6 +92,13 @@ func ctlRebase(ctx context.Context, h endpoint, host, id string, o ctlOptions) e
 	if !pending && lease != nil {
 		closeBestEffort(lock)
 		lock = nil
+		if cached != "" {
+			diagnosticf("cx rebase: source host unavailable, using cached turn %s\n", turn)
+			if err = dispatchRebase(ctx, h, host, id, dest, cached); err != nil {
+				return recordRebaseFailure(ctx, dest, err)
+			}
+			return nil
+		}
 		return executeRebase(ctx, h, host, id, turn, dest, target, false)
 	}
 	if lease != nil {
@@ -100,6 +114,34 @@ func ctlRebase(ctx context.Context, h endpoint, host, id string, o ctlOptions) e
 	}
 	fmt.Printf("controller log %s\n", logPath)
 	return nil
+}
+
+func offlineRebaseResult(host, id string, turn int64, explicit bool, transportErr error) (string, observedResult, error) {
+	_, ref, err := resultMarkerSnapshot(host, id)
+	if err != nil {
+		return "", observedResult{}, errors.Join(transportErr, err)
+	}
+	target := observedResult{RunID: ref.Generation, Number: ref.Turn}
+	if target.RunID == "" {
+		return "", target, transportErr
+	}
+	if explicit {
+		target.Number = turn
+	}
+	dest, err := resultDest(host, id, target.RunID, strconv.FormatInt(target.Number, 10))
+	if err != nil {
+		return "", target, errors.Join(transportErr, err)
+	}
+	for _, path := range []string{dest, resultVariant(dest, true)} {
+		err = validateResultTurn(path, target)
+		if err == nil {
+			return path, target, nil
+		}
+		if !os.IsNotExist(err) {
+			return "", target, errors.Join(transportErr, err)
+		}
+	}
+	return "", target, transportErr
 }
 
 // A job-wide lock also serializes child name allocation across turns and generations.
@@ -146,7 +188,7 @@ func rebaseWorker(ctx context.Context, args []string) error {
 	}
 	var req rebaseRequest
 	err = readJSON(slot, &req)
-	if err != nil || req.Submitted {
+	if err != nil || req.Submitted || req.Text == "" {
 		closeBestEffort(lock)
 		if os.IsNotExist(err) {
 			return nil
@@ -179,7 +221,7 @@ func executeRebase(ctx context.Context, h endpoint, host, id, turn, dest string,
 		err = fetchResultTurn(ctx, h, id, dest, false, target)
 	}
 	if err == nil {
-		err = dispatchRebase(ctx, h, host, id, dest)
+		err = dispatchRebase(ctx, h, host, id, dest, dest)
 	}
 	if err != nil {
 		return recordRebaseFailure(ctx, dest, err)
@@ -232,27 +274,33 @@ func waitRebaseResult(ctx context.Context, h endpoint, id, turn, dest string, ta
 	return fetchResultTurn(ctx, h, id, dest, false, target)
 }
 
-func dispatchRebase(ctx context.Context, h endpoint, host, id, dest string) error {
+func dispatchRebase(ctx context.Context, h endpoint, host, id, dest, result string) error {
 	req, err := claimRebase(ctx, h, host, id, dest)
 	if err != nil {
 		return err
 	}
 	if !req.Submitted {
-		if err = submitRebase(ctx, host, dest, id, req); err != nil {
+		if req.Host != "" {
+			host = req.Host
+		}
+		if err = submitRebase(ctx, host, dest, result, id, req); err != nil {
 			return err
 		}
-		done, err := rebaseSubmitted(host, req.Child)
-		if err != nil {
-			return err
+		done, receiptErr := rebaseSubmitted(host, req.Child)
+		if receiptErr != nil {
+			return receiptErr
 		}
 		if !done {
 			return errors.New("rebase child has no submission receipt")
 		}
-		lock, err := lockUntil(ctx, rebaseLockPath(dest))
-		if err != nil {
-			return err
+		lock, lockErr := lockUntil(ctx, rebaseLockPath(dest))
+		if lockErr != nil {
+			return lockErr
 		}
 		defer closeBestEffort(lock)
+		if err = readJSON(dest+".rebase.json", &req); err != nil {
+			return err
+		}
 		req.Submitted, req.Failure = true, ""
 		if err = writeJSON(dest+".rebase.json", req); err != nil {
 			return err
@@ -286,6 +334,16 @@ func claimRebase(ctx context.Context, h endpoint, host, id, dest string) (rebase
 	if err = readJSON(slot, &req); err != nil || req.Child != "" {
 		return req, err
 	}
+	if req.Host != "" {
+		host = req.Host
+		hs, loadErr := loadEndpoints()
+		if loadErr != nil {
+			return req, loadErr
+		}
+		if h, err = hs.get(host); err != nil {
+			return req, err
+		}
+	}
 	// A claim may precede creation of the submission input. Reserve those
 	// names too, including claims from earlier generations of this job.
 	root := filepath.Dir(lockPath)
@@ -308,18 +366,31 @@ func claimRebase(ctx context.Context, h endpoint, host, id, dest string) (rebase
 		if reserved[child] {
 			continue
 		}
-		dir, err := submissionDir(host, child)
-		if err != nil {
-			return req, err
+		if req.Host != "" {
+			// An existing controller route must keep identifying its original job.
+			route, pathErr := routePath(child)
+			if pathErr != nil {
+				return req, pathErr
+			}
+			var routed string
+			if err = readJSON(route, &routed); err == nil && routed != host {
+				continue
+			} else if err != nil && !os.IsNotExist(err) {
+				return req, err
+			}
+		}
+		dir, dirErr := submissionDir(host, child)
+		if dirErr != nil {
+			return req, dirErr
 		}
 		if _, err = os.Stat(filepath.Join(dir, "input.json")); err == nil {
 			continue
 		} else if !os.IsNotExist(err) {
 			return req, err
 		}
-		r, err := h.call(ctx, 15*time.Second, "status", "--job", child)
-		if err != nil {
-			return req, err
+		r, callErr := h.call(ctx, 15*time.Second, "status", "--job", child)
+		if callErr != nil {
+			return req, callErr
 		}
 		switch r.code {
 		case 0:

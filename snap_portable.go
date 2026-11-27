@@ -70,6 +70,20 @@ func snapWindowsLinks(g snapGit) error {
 
 // Resolve all existing ancestors even when the leaf is a dangling link.
 func snapLinkInside(root, parent, target string) bool {
+	return snapshotLinkInside(root, parent, target, func(p string) (string, bool, error) {
+		st, err := os.Lstat(p)
+		if os.IsNotExist(err) {
+			return "", false, nil
+		}
+		if err != nil || st.Mode()&os.ModeSymlink == 0 {
+			return "", false, err
+		}
+		next, err := os.Readlink(p)
+		return next, true, err
+	})
+}
+
+func snapshotLinkInside(root, parent, target string, readLink func(string) (string, bool, error)) bool {
 	if filepath.IsAbs(target) || filepath.VolumeName(target) != "" {
 		return false
 	}
@@ -89,17 +103,13 @@ func snapLinkInside(root, parent, target string) bool {
 			continue
 		}
 		p := filepath.Join(parent, part)
-		st, e := os.Lstat(p)
-		if e != nil && !os.IsNotExist(e) {
+		next, isLink, err := readLink(p)
+		if err != nil {
 			return false
 		}
-		if e == nil && st.Mode()&os.ModeSymlink != 0 {
+		if isLink {
 			links++
-			if links > 64 {
-				return false
-			}
-			next, e := os.Readlink(p)
-			if e != nil || filepath.IsAbs(next) || filepath.VolumeName(next) != "" {
+			if links > 64 || filepath.IsAbs(next) || filepath.VolumeName(next) != "" {
 				return false
 			}
 			parts = append(strings.Split(filepath.ToSlash(next), "/"), parts...)

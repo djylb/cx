@@ -304,6 +304,8 @@ func nodeCLI(ctx context.Context, args []string) error {
 				return cleanNodeJob(ctx, args[1])
 			}
 			return errors.New("invalid clean arguments")
+		case "refresh-job":
+			return nodeRefresh(ctx, args[1:])
 		case "rebase-worker":
 			return rebaseWorker(ctx, args[1:])
 		case "result-download":
@@ -418,7 +420,7 @@ func (h endpoint) transportCommand(ctx context.Context, args []string, idle time
 	for len(watch) > 2 && watch[0] == "forward" {
 		watch = watch[2:]
 	}
-	live := len(watch) > 0 && (watch[0] == "adopt-job" || watch[0] == "channel" || watch[0] == "wait-poll" || watch[0] == "observe-one" || watch[0] == "observe-result" || watch[0] == "follow")
+	live := len(watch) > 0 && (watch[0] == "adopt-job" || watch[0] == "channel" || watch[0] == "wait-poll" || watch[0] == "observe-one" || watch[0] == "observe-result" || watch[0] == "result-download" || watch[0] == "follow")
 	if live {
 		argv[1] = "watch-wire"
 	}
@@ -464,6 +466,69 @@ func (h endpoint) transportCommand(ctx context.Context, args []string, idle time
 	return cmd, nil
 }
 
+// runIdle uses the caller's deadline and the transport's connection and
+// activity clocks. Only the SSH multiplexing fallback can replay the command.
+func (h endpoint) runIdle(ctx context.Context, out io.Writer, args ...string) (string, error) {
+	idle, err := transferSetting("CX_TRANSFER_IDLE", 120*time.Second, false)
+	if err != nil {
+		return "", err
+	}
+	for {
+		attempt, stop := context.WithCancel(ctx)
+		cmd, startErr := h.transportCommand(attempt, args, idle)
+		if startErr != nil {
+			stop()
+			return "", startErr
+		}
+		var diag bytes.Buffer
+		err = cmd.run(ctx, stop, out, &diag)
+		stop()
+		if !errors.Is(err, errSSHMasterUnsupported) {
+			return strings.TrimSpace(cleanDiag(diag.Bytes())), err
+		}
+	}
+}
+
+func (h endpoint) callIdle(ctx context.Context, step string, args ...string) (reply, error) {
+	var out bytes.Buffer
+	diag, err := h.runIdle(ctx, &out, args...)
+	if err == nil {
+		return reply{data: out.Bytes()}, nil
+	}
+	if code, ok := h.nodeExit(err); ok {
+		if diag != "" {
+			diagnosticf("%s: %s\n", step, diag)
+		}
+		return reply{data: out.Bytes(), code: code}, nil
+	}
+	err = idleCallError(ctx, step, diag, err)
+	if errors.Is(err, ctlExit(9)) {
+		diagnosticf("cx: %v\n", err)
+	}
+	return reply{}, err
+}
+
+func (h endpoint) nodeExit(err error) (int, bool) {
+	var exit *exec.ExitError
+	if errors.As(err, &exit) && (exit.ExitCode() != 255 || h.SSH == "") && exit.ExitCode() >= 0 {
+		return exit.ExitCode(), true
+	}
+	return 0, false
+}
+
+func idleCallError(ctx context.Context, step, diag string, err error) error {
+	if cause := ctx.Err(); cause != nil {
+		return fmt.Errorf("%s: %w", step, cause)
+	}
+	if errors.Is(err, errWireSilence) {
+		err = fmt.Errorf("no progress: %w", err)
+	}
+	if diag != "" {
+		err = fmt.Errorf("%w: %s", err, diag)
+	}
+	return fmt.Errorf("%s: %w: %v", step, ctlExit(9), err)
+}
+
 type reply struct {
 	data []byte
 	code int
@@ -498,15 +563,14 @@ func (h endpoint) invokeWithDiagnostics(parent context.Context, per time.Duratio
 			i--
 			continue
 		}
-		var exit *exec.ExitError
 		if err == nil {
 			return reply{b, 0}, nil
 		}
-		if errors.As(err, &exit) && (exit.ExitCode() != 255 || h.SSH == "") {
+		if code, ok := h.nodeExit(err); ok {
 			if diagnose && diag.Len() > 0 {
 				diagnosticf("%s", cleanDiag(diag.Bytes()))
 			}
-			return reply{b, exit.ExitCode()}, nil
+			return reply{b, code}, nil
 		}
 		if cause := parent.Err(); cause != nil {
 			return reply{}, errors.Join(ctlExit(9), cause)
@@ -606,7 +670,7 @@ func relayNode(ctx context.Context, args []string) error {
 			diagnosticf("%s", s)
 		}
 		if errors.Is(e, errWireSilence) {
-			diagnosticf("cx: relay to %s: %v\n", dest.SSH, e)
+			diagnosticf("cx: relay to %s: no progress: %v\n", dest.SSH, e)
 			return ctlExit(255)
 		}
 		if ex, ok := errors.AsType[*exec.ExitError](e); ok {

@@ -751,6 +751,9 @@ func (r *runner) deliver(record stateRecord) error {
 	if err != nil {
 		return err
 	}
+	if _, acked := r.inbox.acks[record.Seq]; acked {
+		return nil
+	}
 	return r.ackInbox(record, "delivered")
 }
 
@@ -866,6 +869,11 @@ func (r *runner) poll() (bool, error) {
 	for _, record := range r.inbox.queue {
 		if record.Kind == "interrupt" {
 			return false, r.processInterrupt(record)
+		}
+	}
+	if !r.active() && r.s.Finished > 0 {
+		if question, refreshErr := r.refreshBeforeTurn(); question || refreshErr != nil {
+			return false, refreshErr
 		}
 	}
 	if started, continueErr := r.continuePending(); started || continueErr != nil {

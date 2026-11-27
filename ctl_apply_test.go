@@ -61,16 +61,21 @@ func TestApplySealedTurns(t *testing.T) {
 	// Use the low-level node entry that bypasses the controller's say preflight.
 	cliOutput(t, 0, nil, f.cx, "node", "say", "--job", "p/rounds", "second round")
 	cliOutput(t, 0, nil, f.cx, "result", id, "--wait", "--turn", "2", "--timeout", "2m")
-	second := cliOutput(t, 0, nil, f.cx, "patch", id, "--turn", "2", "--incremental", "--full")
-	for _, want := range []string{"-round 1\n+round 2\n", "-round 1\n+base\n", "+++ b/new"} {
+	second := cliOutput(t, 0, nil, f.cx, "patch", id, "--full")
+	for _, want := range []string{"# since turn 2\n", "-round 1\n+round 2\n", "-round 1\n+base\n", "+++ b/new"} {
 		if !bytes.Contains(second, []byte(want)) {
 			t.Fatalf("incremental patch is missing %q: %s", want, second)
 		}
 	}
 
+	cumulative := cliOutput(t, 0, nil, f.cx, "patch", id, "--turn", "2", "--since-turn", "1", "--full")
+	if !bytes.Contains(cumulative, []byte("# since turn 1\n")) || !bytes.Contains(cumulative, []byte("-base\n+round 2\n")) {
+		t.Fatalf("explicit cumulative patch: %s", cumulative)
+	}
+
 	checkConflict := func(args ...string) {
 		t.Helper()
-		out, diag := cliStreams(t, 1, nil, f.cx, append([]string{"apply", id}, args...)...)
+		out, diag := cliStreams(t, 1, nil, f.cx, append([]string{"apply", id, "--since-turn", "1"}, args...)...)
 		for _, want := range []string{"/a", "--since-turn", "cx rebase"} {
 			if !strings.Contains(diag, want) {
 				t.Fatalf("missing %q in conflict diagnostics: %s", want, diag)
@@ -82,10 +87,10 @@ func TestApplySealedTurns(t *testing.T) {
 	}
 	checkConflict()
 	if !bytes.Equal(read(".git/index"), before) || string(read("a")) != "round 1\n" || string(read("undo")) != "round 1\n" {
-		t.Fatal("default conflicting apply changed index or worktree")
+		t.Fatal("cumulative conflicting apply changed index or worktree")
 	}
 	if _, err := os.Stat(filepath.Join(src, "new")); !os.IsNotExist(err) {
-		t.Fatalf("default conflicting apply wrote an unrelated patch hunk: %v", err)
+		t.Fatalf("cumulative conflicting apply wrote an unrelated patch hunk: %v", err)
 	}
 	checkConflict("--allow-conflicts")
 	if a := read("a"); !bytes.Contains(a, []byte("<<<<<<<")) || !bytes.Contains(a, []byte("=======")) || !bytes.Contains(a, []byte(">>>>>>>")) {
@@ -95,12 +100,17 @@ func TestApplySealedTurns(t *testing.T) {
 		t.Fatal("opt-in merge failed to write unmerged index or clean file")
 	}
 	git("reset", "--hard", "HEAD")
-	cliOutput(t, 0, nil, f.cx, "apply", id, "--since-turn", "2")
+	cliOutput(t, 0, nil, f.cx, "apply", id)
 	if string(read("a")) != "round 2\n" || string(read("undo")) != "base\n" || string(read("new")) != "round 2\n" {
 		t.Fatal("second turn application differs from sealed workspace")
 	}
 	if len(git("ls-files", "--unmerged")) != 0 {
 		t.Fatal("second turn left conflicts")
+	}
+
+	cliOutput(t, 0, nil, f.cx, "apply", id, "--repo", filepath.Base(src))
+	if got := cliOutput(t, 0, nil, f.cx, "patch", id, "--full"); !bytes.Contains(got, []byte("# since turn 3\n")) || bytes.Contains(got, []byte("diff --git")) {
+		t.Fatalf("fully applied patch: %s", got)
 	}
 
 	listing := cliOutput(t, 0, nil, f.cx, "ls", id, "--json")
@@ -114,7 +124,17 @@ func TestApplySealedTurns(t *testing.T) {
 	if err := os.Rename(sealed, sealed+".fixture-backup"); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("CX_HOME", t.TempDir())
+	_, ref, err := resultMarkerSnapshot("local", "p/rounds")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cached, err := resultDest("local", "p/rounds", ref.Generation, "1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.RemoveAll(cached); err != nil {
+		t.Fatal(err)
+	}
 	_, diag := cliStreams(t, 44, nil, f.cx, "patch", id, "--turn", "2", "--incremental")
 	if !strings.Contains(diag, "Sealed turn 1 is unavailable") {
 		t.Fatalf("missing prior turn diagnostic: %s", diag)

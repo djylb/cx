@@ -237,6 +237,32 @@ esac
 	expireResultOperation(t, entered, 124, "remote:p/result-status")
 }
 
+func TestResultStatusIdleTimeout(t *testing.T) {
+	f := newControllerFixture(t)
+	t.Setenv("CX_TRANSFER_IDLE", "120")
+	setupPrefetchSSH(t, f, `exec sleep 60`)
+	ctx, cancel := fixtureContext(t)
+	defer cancel()
+	start := time.Now()
+	clock := timeshim.NewFake(start)
+	done := make(chan error, 1)
+	go func() {
+		done <- dispatch(clockContext(ctx, clock), []string{"result", "remote:p/idle", "--timeout", "10m"})
+	}()
+	if err := clock.WaitDeadline(ctx, start.Add(120*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(120 * time.Second)
+	select {
+	case err := <-done:
+		if !errors.Is(err, ctlExit(9)) || !strings.Contains(err.Error(), "look up result status:") || !strings.Contains(err.Error(), "no progress") {
+			t.Fatalf("status idle timeout = %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("status lookup ignored the idle timeout", ctx.Err())
+	}
+}
+
 func expireResultOperation(t *testing.T, started string, want ctlExit, args ...string) {
 	t.Helper()
 	ctx, cancel := fixtureContext(t)

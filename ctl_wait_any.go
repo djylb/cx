@@ -328,11 +328,12 @@ func ctlWaitAny(ctx context.Context, hs endpoints, o ctlOptions) error {
 	if err != nil {
 		return err
 	}
-	lock, err := registerWaitObserver(ctx, path+".lock", fmt.Sprintf("cursor %q of this session (%s); each event goes to only one of them", o.cursor, o.session))
+	release, err := registerWaitObserver(ctx, path+".lock", fmt.Sprintf("cursor %q for session %q", o.cursor, o.session),
+		"use --cursor NAME for an independent cursor")
 	if err != nil {
 		return err
 	}
-	defer closeBestEffort(lock)
+	defer release()
 	dir := filepath.Dir(path)
 	names := o.hosts
 	if len(names) == 0 {
@@ -390,7 +391,7 @@ func ctlWaitAny(ctx context.Context, hs endpoints, o ctlOptions) error {
 		}
 	}
 	req := waitPollRequest{Session: o.session, Limit: waitPollInterval, FromStart: o.fromStart}
-	if err := initializeWaitHosts(ctx, hs, dir, req); err != nil && ctx.Err() == nil {
+	if err = initializeWaitHosts(ctx, hs, dir, req); err != nil && ctx.Err() == nil {
 		return err
 	}
 	return waitForAny(ctx, sources, os.Stdout, diagnosticf)

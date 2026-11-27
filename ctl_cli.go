@@ -29,7 +29,7 @@ type ctlOptions struct {
 	batch, snapshot, history, previous, input, profile                              string
 	quiet, timeout, idle, turnLimit, approval, stall, queue                         string
 	turn, sinceTurn, cursor, since, kind, mention, repo, script, shell, context, to string
-	hosts, projects, channels, sets, argv, pos, images                              []string
+	hosts, projects, channels, sets, argv, pos, images, own                         []string
 	interval                                                                        time.Duration
 	max                                                                             int
 	cleanBase, all, explicitSession, noSession                                      bool
@@ -113,6 +113,10 @@ func ctlFlags(op string, o *ctlOptions) *flag.FlagSet {
 				return nil
 			})
 		case "host":
+			if op == "rebase" {
+				f.StringVar(&o.host, k, "", "execution host for the follow-up")
+				continue
+			}
 			if op == "agent" {
 				f.StringVar(&o.host, k, "auto", "execution host (auto uses CX_DEFAULT_HOST, project configuration, or local)")
 				continue
@@ -133,6 +137,8 @@ func ctlFlags(op string, o *ctlOptions) *flag.FlagSet {
 			})
 		case "set":
 			f.Func(k, ctlFlagHelp(op, k), func(v string) error { o.sets = append(o.sets, v); return nil })
+		case "own":
+			f.Func(k, ctlFlagHelp(op, k), func(v string) error { o.own = append(o.own, v); return nil })
 		case "image":
 			f.Func(k, ctlFlagHelp(op, k), func(v string) error { o.images = append(o.images, v); return nil })
 		default:
@@ -197,6 +203,10 @@ func parseCtl(op string, args []string) (ctlOptions, error) {
 	e := f.Parse(flags)
 	f.Visit(func(fl *flag.Flag) {
 		switch fl.Name {
+		case "host":
+			if op == "rebase" && o.host == "" {
+				e = errors.New("--host requires a host name")
+			}
 		case "session":
 			o.explicitSession = true
 		case "since-turn":
@@ -205,7 +215,10 @@ func parseCtl(op string, args []string) (ctlOptions, error) {
 			}
 		}
 	})
-	if o.sinceTurn != "" && o.turn != "" {
+	if o.sinceTurn != "" && o.incremental {
+		return o, errors.New("--since-turn and --incremental are mutually exclusive")
+	}
+	if op != "patch" && o.sinceTurn != "" && o.turn != "" {
 		return o, errors.New("--since-turn and --turn are mutually exclusive")
 	}
 	if o.all && o.explicitSession {
@@ -361,6 +374,14 @@ func controller(ctx context.Context, a []string) error {
 		if len(o.pos) != 2 {
 			return ctlUsage(op, errors.New("rebase requires JOB and TEXT"))
 		}
+		if o.profile != "" && o.host == "" {
+			return ctlUsage(op, errors.New("--profile requires --host"))
+		}
+		if o.host != "" {
+			if _, e = hs.get(o.host); e != nil {
+				return ctlUsage(op, e)
+			}
+		}
 		o.session, e = o.submissionSession()
 		if e != nil {
 			return ctlUsage(op, e)
@@ -368,7 +389,7 @@ func controller(ctx context.Context, a []string) error {
 		o.dir = o.pos[1]
 		o.pos = o.pos[:1]
 	}
-	if op == "apply" && len(o.pos) == 2 {
+	if (op == "apply" || op == "refresh") && len(o.pos) == 2 {
 		o.dir = o.pos[1]
 		o.pos = o.pos[:1]
 	}
@@ -414,6 +435,8 @@ func controller(ctx context.Context, a []string) error {
 		return ctlAdopt(ctx, h, id, o.session)
 	case "clean":
 		return cleanControllerJob(ctx, h, name, id)
+	case "refresh":
+		return ctlRefresh(ctx, h, name, id, o)
 	case "rebase":
 		return ctlRebase(ctx, h, name, id, o)
 	case "result", "patch", "apply":

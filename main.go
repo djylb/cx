@@ -65,6 +65,7 @@ type config struct {
 	cacheUse                            *cacheUse
 	Input                               []json.RawMessage `json:"input,omitempty"`
 	Argv                                []string          `json:"argv,omitempty"`
+	Own                                 []string          `json:"own,omitempty"`
 	Roots                               []string          `json:"roots,omitempty"` // extra writable roots (workspace-write), e.g. a Go build cache
 	RestartLimit                        int               `json:"restart_limit"`
 	CmdStall                            time.Duration     `json:"cmd_stall"`
@@ -514,6 +515,10 @@ func runNodeWithRegistration(ctx context.Context, args []string, directSubmit bo
 		fs.StringVar(&c.Sandbox, "sandbox", defaultSandbox, "read-only, workspace-write, or danger-full-access")
 		fs.BoolVar(&network, "network", false, "allow sandbox network access (default for workspace-write)")
 		fs.BoolVar(&noNetwork, "no-network", false, "deny sandbox network access (default for read-only)")
+		fs.Func("own", "snapshot path relative to the main repository (repeatable)", func(v string) error {
+			c.Own = append(c.Own, v)
+			return nil
+		})
 		fs.Func("writable-root", "extra writable directory for workspace-write (repeatable)", func(v string) error {
 			c.Roots = append(c.Roots, v)
 			return nil
@@ -897,6 +902,14 @@ func runNodeWithRegistration(ctx context.Context, args []string, directSubmit bo
 		if !info.IsDir() {
 			return errors.New("--dir must be a directory")
 		}
+		if len(c.Own) > 0 {
+			if c.Sandbox != "workspace-write" || len(c.Argv) > 0 || len(c.Roots) > 0 {
+				return errors.New("--own requires a workspace-write agent without extra writable roots")
+			}
+			if _, ownErr := c.writableMemberRoots(root); ownErr != nil {
+				return ownErr
+			}
+		}
 		if len(c.Argv) == 0 {
 			if prompt != "" {
 				c.Prompt, startErr = readInputText(prompt)
@@ -907,14 +920,27 @@ func runNodeWithRegistration(ctx context.Context, args []string, directSubmit bo
 			if c.ForkThread == "" && opts.input == "" && len(opts.images) == 0 && strings.TrimSpace(c.Prompt) == "" {
 				return errors.New("empty prompt")
 			}
+			var prefix string
 			if preamblePath != "" {
-				prefix, preambleErr := readInputText(preamblePath)
-				if preambleErr != nil {
-					return preambleErr
+				prefix, startErr = readInputText(preamblePath)
+				if startErr != nil {
+					return startErr
 				}
-				if strings.TrimSpace(prefix) != "" {
-					c.Prompt = strings.TrimRight(prefix, "\r\n") + "\n\n" + c.Prompt
+			}
+			if len(c.Own) > 0 {
+				paths := make([]string, 0, len(c.Own))
+				for _, path := range c.Own {
+					paths = append(paths, fmt.Sprintf("%q", path))
 				}
+				ownership := "Owned paths in the snapshot (relative to the main repository root): " + strings.Join(paths, ", ") + "."
+				if strings.TrimSpace(prefix) == "" {
+					prefix = ownership
+				} else {
+					prefix = strings.TrimRight(prefix, "\r\n") + "\n" + ownership
+				}
+			}
+			if strings.TrimSpace(prefix) != "" {
+				c.Prompt = strings.TrimRight(prefix, "\r\n") + "\n\n" + c.Prompt
 			}
 			if opts.input != "" || len(opts.images) > 0 {
 				c.Input, startErr = opts.inputs(c.Prompt)

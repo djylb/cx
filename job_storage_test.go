@@ -37,7 +37,9 @@ func TestJobStorageDoesNotReplaceFiles(t *testing.T) {
 		"ctl_route.go":           {"rememberRoute": 1},
 		"ctl_transfer.go":        {"receiveTask": 1},
 		"snap_publish.go":        {"snapPrerequisites": 1, "snapArchive": 1, "Publish": 1},
-		"wait_any.go":            {"updateWaitCursor": 1},
+		"wait_any.go":            {"updateWaitCursor": 1, "registerWaitObserver": 1}, // Controller cursor and observer record.
+		"ctl_refresh.go":         {"ctlRefresh": 2},                                  // Controller-local pending refresh request.
+		"node_refresh.go":        {"refreshCheckout": 1, "commitRefresh": 1},         // Private checkout baseline marker and input.
 	}
 	// Every standard-library file open, including references through a
 	// function variable, must belong to one of these non-job scopes.
@@ -47,7 +49,8 @@ func TestJobStorageDoesNotReplaceFiles(t *testing.T) {
 		"ctl_center.go":      {"freezeCompilerSource": 2},
 		"ctl_cli.go":         {"preview": 1},
 		"ctl_deploy.go":      {"cacheArtifact": 1, "writeStream": 1, "copyFile": 1, "moduleDir": 1},
-		"ctl_incremental.go": {"incrementalResult": 1},
+		"ctl_incremental.go": {"incrementalResult": 1, "incrementalPatch": 1},
+		"node_refresh.go":    {"planRefresh": 2}, // Git index of the private checkout, as in planApply.
 		"ctl_journal.go":     {"journalDecision": 1},
 		"ctl_queue.go":       {"queueJob": 1},
 		"ctl_setup.go":       {"receive": 1, "fileHash": 1, "installNode": 2, "upload": 1},
@@ -66,7 +69,8 @@ func TestJobStorageDoesNotReplaceFiles(t *testing.T) {
 		"CreateTemp": true, "WriteFile": true}
 	// Check the transitive call graph from the lifecycle entry points. The
 	// explicit stops are OS/transport/cache functions or shared-open itself.
-	boundary := map[string]bool{"openJobFile": true, "atomicWrite": true, "writeJSON": true,
+	boundary := map[string]bool{"openJobFile": true, "planRefresh": true, "installPlans": true, // refresh edits only the private checkout
+		"atomicWrite": true, "writeJSON": true,
 		"platformFacts": true, "osVersion": true, "fingerprint": true, "fileHash": true,
 		"procStat": true, "scanProcesses": true, "signalMember": true,
 		"preinstallDoctor": true, "installNode": true, "receiveTask": true, "cacheNode": true,

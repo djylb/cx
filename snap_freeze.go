@@ -69,6 +69,16 @@ func snapName(name string) error {
 	}
 	return nil
 }
+func validateUntrackedSnapshotFile(name string, raw []byte) error {
+	if err := snapName(name); err != nil {
+		return err
+	}
+	if snapSecret.Match(raw) || strings.EqualFold(path.Base(name), ".npmrc") && snapAuth.Match(raw) || bytes.HasPrefix(raw, []byte("version https://git-lfs.github.com/spec/v1\n")) {
+		return fmt.Errorf("sensitive content or unresolved LFS: %s", name)
+	}
+	return nil
+}
+
 func snapList(s string) []string {
 	if s == "" {
 		return nil
@@ -132,6 +142,12 @@ func snapIncludes(repo string, patterns []string) ([]string, error) {
 	}
 	slices.Sort(names)
 	return names, nil
+}
+
+type nestedGitMetadata string
+
+func (e nestedGitMetadata) Error() string {
+	return fmt.Sprintf("nested Git metadata: %q", string(e))
 }
 
 func snapStage(source, stage snapGit, head, tmp string, isGit bool, include []string) (string, error) {
@@ -220,14 +236,14 @@ func snapStage(source, stage snapGit, head, tmp string, isGit bool, include []st
 			if e != nil {
 				return e
 			}
+			n, relErr := filepath.Rel(source.dir, p)
+			if relErr != nil {
+				return relErr
+			}
 			if strings.EqualFold(d.Name(), ".git") {
-				return errors.New("nested Git metadata")
+				return nestedGitMetadata(filepath.ToSlash(n))
 			}
 			if !d.IsDir() {
-				n, e := filepath.Rel(source.dir, p)
-				if e != nil {
-					return e
-				}
 				modes[filepath.ToSlash(n)] = ""
 			}
 			return nil
@@ -300,11 +316,8 @@ func snapStage(source, stage snapGit, head, tmp string, isGit bool, include []st
 			return "", fmt.Errorf("unsupported file: %s", n)
 		}
 		if !tracked[n] {
-			if nameErr := snapName(n); nameErr != nil {
-				return "", nameErr
-			}
-			if snapSecret.Match(raw) || strings.EqualFold(path.Base(n), ".npmrc") && snapAuth.Match(raw) || bytes.HasPrefix(raw, []byte("version https://git-lfs.github.com/spec/v1\n")) {
-				return "", fmt.Errorf("sensitive content or unresolved LFS: %s", n)
+			if e = validateUntrackedSnapshotFile(n, raw); e != nil {
+				return "", e
 			}
 		}
 		oid := indexed[n]
@@ -529,6 +542,10 @@ func Freeze(ctx context.Context, src string, opts FreezeOptions) (SnapshotID, Ma
 			}
 			r, repoErr := snapCapture(ctx, p, store, d, h, layout.git, layout.repos[p])
 			if repoErr != nil {
+				var nested nestedGitMetadata
+				if len(opts.Repositories) > 0 && errors.As(repoErr, &nested) {
+					repoErr = projectSnapshotSourceError(src, opts.Repositories, nested)
+				}
 				return nil, repoErr
 			}
 			rel, repoErr := filepath.Rel(layout.root, p)
@@ -556,6 +573,22 @@ func Freeze(ctx context.Context, src string, opts FreezeOptions) (SnapshotID, Ma
 	}
 	id := snapSum(a)
 	return SnapshotID(id), m, publishImmutable(filepath.Join(store, "manifests", id+".json"), a, filepath.Dir(store))
+}
+
+func projectSnapshotSourceError(src string, repos []projectRepository, nested nestedGitMetadata) error {
+	containsMember := false
+	members := make([]string, 0, len(repos))
+	for _, repo := range repos {
+		members = append(members, fmt.Sprintf("%q", repo.Path))
+		if path, resolveErr := filepath.EvalSymlinks(repo.Path); resolveErr == nil && snapWithin(src, path) {
+			containsMember = true
+		}
+	}
+	if !containsMember {
+		return nested
+	}
+	slices.Sort(members)
+	return fmt.Errorf("DIR must be a project member repository. Project member paths: %s", strings.Join(members, ", "))
 }
 
 func snapMatches(raw []byte, oid string) bool {

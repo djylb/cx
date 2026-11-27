@@ -5,8 +5,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
 )
 
 var patchDiff = []string{"diff", "--cached", "--binary", "--full-index", "--no-renames", "--no-ext-diff", "--no-textconv", "--no-relative", "--src-prefix=a/", "--dst-prefix=b/"}
@@ -28,69 +33,232 @@ func resultTree(g snapGit, snapshot, dir string, row turnPatch) (string, error) 
 	return g.get("write-tree")
 }
 
-func incrementalResult(ctx context.Context, previous, latest, output string, baseTurn int64, current turnResult) (turnResult, error) {
-	var old turnResult
-	if err := readJSON(filepath.Join(previous, "result.json"), &old); err != nil {
-		return current, err
+// selectedPatch describes a repository's range without modifying sealed results.
+type selectedPatch struct {
+	turnPatch
+	dir   string
+	since int64
+}
+
+func ctlSealedPatches(ctx context.Context, h endpoint, host, id, runID, dir, op string, o ctlOptions) error {
+	var m turnResult
+	if err := readJSON(filepath.Join(dir, "result.json"), &m); err != nil {
+		return err
 	}
-	if old.Turn != baseTurn || current.Turn <= old.Turn {
-		return current, errors.New("sealed turn numbers do not match requested range")
+	var project string
+	if op == "apply" {
+		var err error
+		project, err = outputProject(applyLogProject(id))
+		if err != nil {
+			return err
+		}
+		lock, lockErr := lockUntil(ctx, filepath.Join(project, ".apply.lock"))
+		if lockErr != nil {
+			return lockErr
+		}
+		defer closeBestEffort(lock)
 	}
+	scratch, err := os.MkdirTemp("", "cx-incremental-")
+	if err != nil {
+		return err
+	}
+	defer removeTreeBestEffort(scratch)
+	rows, err := selectPatches(ctx, h, host, id, runID, dir, scratch, o, m)
+	if err != nil {
+		return err
+	}
+	if op == "apply" {
+		return applyTurn(ctx, dir, project, id, host, runID, o, m.Turn, rows)
+	}
+	if o.full {
+		return writePatches(ctx, os.Stdout, rows, o)
+	}
+	var out bytes.Buffer
+	if err = writePatches(ctx, &out, rows, o); err != nil {
+		return err
+	}
+	return preview(out.Bytes(), o)
+}
+
+func selectPatches(ctx context.Context, h endpoint, host, id, runID, latest, scratch string, o ctlOptions, current turnResult) ([]selectedPatch, error) {
+	first := max(1, current.Baseline.FromTurn)
+	var since int64
+	var applied map[string]int64
+	switch {
+	case o.sinceTurn != "":
+		since, _ = strconv.ParseInt(o.sinceTurn, 10, 64)
+		if since < 1 || since > current.Turn {
+			return nil, fmt.Errorf("--since-turn must be between 1 and the latest completed turn (%d)", current.Turn)
+		}
+	case o.incremental:
+		since = current.Turn
+		if since < 1 {
+			return nil, errors.New("--incremental requires a positive completed turn")
+		}
+	default:
+		log, logErr := readAppliedTurns(applyLogProject(id))
+		if logErr != nil {
+			return nil, fmt.Errorf("apply log: %w", logErr)
+		}
+		applied = log[appliedJob{Host: host, Job: id, RunID: runID}]
+	}
+
+	// The first turn on a refreshed baseline has no prior tree to compare.
+	if since != 0 {
+		since = max(first, since)
+	}
+	matches := func(path, repoID string) bool {
+		return o.repo == "" || o.repo == path || o.repo == repoID
+	}
+	var rows []selectedPatch
+	latestRows := make(map[string]turnPatch, len(current.Repositories))
+	for _, row := range current.Repositories {
+		latestRows[row.Path] = row
+		if since <= first && applied[row.Path] < first && matches(row.Path, row.RepoID) {
+			rows = append(rows, selectedPatch{turnPatch: row, dir: latest, since: first})
+		}
+	}
+	if since <= first && len(applied) == 0 {
+		return rows, nil
+	}
+
 	_, store, manifest, err := applyOrigin(latest)
 	if err != nil {
-		return current, err
+		return nil, err
 	}
-	before, after := map[string]turnPatch{}, map[string]turnPatch{}
-	for _, row := range old.Repositories {
-		before[row.Path] = row
+	type priorResult struct {
+		dir  string
+		rows map[string]turnPatch
 	}
-	for _, row := range current.Repositories {
-		after[row.Path] = row
-	}
-	current.Repositories = nil
+	previous := map[int64]priorResult{}
 	for i, repo := range manifest.Repositories {
-		prior, next := before[repo.Path], after[repo.Path]
-		if prior.Patch == "" && next.Patch == "" {
+		if !matches(repo.Path, repo.RepoID) {
 			continue
 		}
-		name := fmt.Sprintf("%d.patch", i)
-		objects := filepath.Join(output, name+".objects")
-		if err = os.MkdirAll(objects, 0700); err != nil {
-			return current, err
+		baseTurn := since - 1
+		if since == 0 {
+			baseTurn = applied[repo.Path]
 		}
-		g := snapGit{ctx: ctx, dir: repo.bare(store), env: []string{
-			"GIT_OBJECT_DIRECTORY=" + objects, "GIT_ALTERNATE_OBJECT_DIRECTORIES=" + filepath.Join(repo.bare(store), "objects"),
-			"GIT_INDEX_FILE=" + filepath.Join(output, name+".index"), "GIT_OPTIONAL_LOCKS=0",
-		}}
-		base, err := resultTree(g, repo.OID, previous, prior)
-		if err != nil {
-			return current, fmt.Errorf("reconstruct sealed turn %d for %s: %w", old.Turn, repo.Path, err)
-		}
-		end, err := resultTree(g, repo.OID, latest, next)
-		if err != nil {
-			return current, fmt.Errorf("reconstruct sealed turn %d for %s: %w", current.Turn, repo.Path, err)
-		}
-		if base == end {
+		if baseTurn < first {
 			continue
 		}
-		data, err := g.input(nil, append(append([]string{}, patchDiff...), base)...)
-		if err != nil {
-			return current, err
+		if baseTurn >= current.Turn {
+			// All selected changes for this repository are already applied.
+			rows = append(rows, selectedPatch{turnPatch: turnPatch{SnapshotPatch: SnapshotPatch{Path: repo.Path}}, since: baseTurn + 1})
+			continue
 		}
-		names, err := g.input(nil, "diff-tree", "--no-commit-id", "-r", "--no-renames", "--name-only", "-z", base, end)
-		if err != nil {
-			return current, err
+		prior, ok := previous[baseTurn]
+		if !ok {
+			turn := strconv.FormatInt(baseTurn, 10)
+			prior.dir, err = resultDest(host, id, runID, turn)
+			if err != nil {
+				return nil, err
+			}
+			if err = fetchTurn(ctx, h, id, runID, turn, prior.dir, false); err != nil {
+				if errors.Is(err, ctlExit(44)) {
+					return nil, resultUnavailable(fmt.Sprintf("Sealed turn %d is unavailable for %s (%v). Use --since-turn 1 or cx rebase %s TEXT.", baseTurn, id, err, id))
+				}
+				return nil, err
+			}
+			var old turnResult
+			if err = readJSON(filepath.Join(prior.dir, "result.json"), &old); err != nil {
+				return nil, err
+			}
+			if old.Turn != baseTurn {
+				return nil, errors.New("sealed turn number does not match requested range")
+			}
+			if old.Baseline.FromTurn != current.Baseline.FromTurn || old.Baseline.Snapshot != current.Baseline.Snapshot {
+				return nil, errors.New("incremental range crosses a baseline refresh")
+			}
+			prior.rows = make(map[string]turnPatch, len(old.Repositories))
+			for _, row := range old.Repositories {
+				prior.rows[row.Path] = row
+			}
+			previous[baseTurn] = prior
 		}
-		if err = os.WriteFile(filepath.Join(output, name), data, 0600); err != nil {
-			return current, err
+		row, deltaErr := incrementalPatch(ctx, store, prior.dir, latest, scratch, i, repo, prior.rows[repo.Path], latestRows[repo.Path])
+		if deltaErr != nil {
+			return nil, fmt.Errorf("compare turns %d and %d for %s: %w", baseTurn, current.Turn, repo.Path, deltaErr)
 		}
-		row := next
-		if row.Patch == "" {
-			row = prior
-		}
-		row.mergeBase, row.Patch = base, name
-		row.Bytes, row.Files = len(data), bytes.Count(names, []byte{0})
-		current.Repositories = append(current.Repositories, row)
+		rows = append(rows, selectedPatch{turnPatch: row, dir: scratch, since: baseTurn + 1})
 	}
-	return current, writeJSON(filepath.Join(output, "result.json"), current)
+	slices.SortFunc(rows, func(a, b selectedPatch) int { return strings.Compare(a.Path, b.Path) })
+	return rows, nil
+}
+
+func incrementalPatch(ctx context.Context, store, previous, latest, output string, i int, repo SnapshotRepo, prior, next turnPatch) (turnPatch, error) {
+	empty := turnPatch{SnapshotPatch: SnapshotPatch{Path: repo.Path}}
+	if prior.Patch == "" && next.Patch == "" {
+		return empty, nil
+	}
+	name := fmt.Sprintf("%d.patch", i)
+	objects := filepath.Join(output, name+".objects")
+	if err := os.MkdirAll(objects, 0700); err != nil {
+		return empty, err
+	}
+	g := snapGit{ctx: ctx, dir: repo.bare(store), env: []string{
+		"GIT_OBJECT_DIRECTORY=" + objects, "GIT_ALTERNATE_OBJECT_DIRECTORIES=" + filepath.Join(repo.bare(store), "objects"),
+		"GIT_INDEX_FILE=" + filepath.Join(output, name+".index"), "GIT_OPTIONAL_LOCKS=0",
+	}}
+	base, err := resultTree(g, repo.OID, previous, prior)
+	if err != nil {
+		return empty, err
+	}
+	end, err := resultTree(g, repo.OID, latest, next)
+	if err != nil {
+		return empty, err
+	}
+	if base == end {
+		return empty, nil
+	}
+	data, err := g.input(nil, append(append([]string{}, patchDiff...), base)...)
+	if err != nil {
+		return empty, err
+	}
+	names, err := g.input(nil, "diff-tree", "--no-commit-id", "-r", "--no-renames", "--name-only", "-z", base, end)
+	if err != nil {
+		return empty, err
+	}
+	if err = os.WriteFile(filepath.Join(output, name), data, 0600); err != nil {
+		return empty, err
+	}
+	row := next
+	if row.Patch == "" {
+		row = prior
+	}
+	row.mergeBase, row.Patch = base, name
+	row.Bytes, row.Files = len(data), bytes.Count(names, []byte{0})
+	return row, nil
+}
+
+func writePatches(ctx context.Context, out io.Writer, rows []selectedPatch, o ctlOptions) error {
+	if o.repo != "" && len(rows) != 1 {
+		return errors.New("select a unique changed repository")
+	}
+	for _, row := range rows {
+		if _, e := fmt.Fprintf(out, "# repo: %s\n# since turn %d\n", row.Path, row.since); e != nil {
+			return e
+		}
+		if row.Patch == "" {
+			continue
+		}
+		p := filepath.Join(row.dir, row.Patch)
+		if o.full {
+			b, e := readSharedFile(p)
+			if e != nil {
+				return e
+			}
+			if _, e = out.Write(b); e != nil {
+				return e
+			}
+		} else {
+			cmd := exec.CommandContext(ctx, "git", "apply", "--stat", p)
+			cmd.Stdout = out
+			cmd.Stderr = os.Stderr
+			if e := cmd.Run(); e != nil {
+				return e
+			}
+		}
+	}
+	return nil
 }

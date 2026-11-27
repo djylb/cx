@@ -303,6 +303,16 @@ func Materialize(ctx context.Context, job string, m Manifest, target string) (Pr
 	return out, nil
 }
 func readCheckoutManifest(job string) (Manifest, error) {
+	baseline, err := readJobBaseline(job)
+	if err != nil {
+		return Manifest{}, err
+	}
+	if err = checkRefreshInstall(job, baseline); err != nil {
+		return Manifest{}, err
+	}
+	if baseline.Snapshot != "" {
+		return loadSnapshot(baseline.Snapshot)
+	}
 	var m Manifest
 	if err := readJSON(filepath.Join(job, "input", "manifest.json"), &m); err != nil {
 		return m, err

@@ -49,6 +49,16 @@ func projectRepoIdentity(ctx context.Context, dir string) (string, error) {
 	return filepath.EvalSymlinks(identity)
 }
 
+// projectMemberPath identifies a project member by its working tree, so other
+// worktrees of the same repository are not taken for that member.
+func projectMemberPath(ctx context.Context, dir string) (string, error) {
+	top, e := (snapGit{ctx: ctx, dir: dir}).get("rev-parse", "--show-toplevel")
+	if e != nil {
+		return "", e
+	}
+	return filepath.EvalSymlinks(top)
+}
+
 func readProject(name string) (projectDefinition, error) {
 	var def projectDefinition
 	if _, e := jobDir("", name+"/project"); e != nil {
@@ -75,7 +85,7 @@ func resolveProject(ctx context.Context, dir, name string) (string, projectDefin
 	}
 	var matched string
 	var def projectDefinition
-	if identity, e := projectRepoIdentity(ctx, dir); e == nil {
+	if identity, e := projectMemberPath(ctx, dir); e == nil {
 		directory, e := projectDirectory()
 		if e != nil {
 			return "", def, e
@@ -90,7 +100,7 @@ func resolveProject(ctx context.Context, dir, name string) (string, projectDefin
 				return "", def, e
 			}
 			for _, repo := range candidate.Repositories {
-				repoID, repoErr := projectRepoIdentity(ctx, repo.Path)
+				repoID, repoErr := projectMemberPath(ctx, repo.Path)
 				if repoErr != nil || repoID != identity {
 					continue
 				}
@@ -279,10 +289,10 @@ func addProjectInclude(ctx context.Context, repos []projectRepository, spec stri
 		return fmt.Errorf("invalid --include %q; expected REPO:PATH with a repository-relative path or glob", spec)
 	}
 	repo = volume + repo
-	identity, _ := projectRepoIdentity(ctx, repo)
+	identity, _ := projectMemberPath(ctx, repo)
 	match := -1
 	for i, r := range repos {
-		repoID, e := projectRepoIdentity(ctx, r.Path)
+		repoID, e := projectMemberPath(ctx, r.Path)
 		if e != nil {
 			return e
 		}

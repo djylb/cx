@@ -173,7 +173,7 @@ echo dependency-edit > ../dependency/content`
 	for _, repo := range []string{src, dep} {
 		cliOutput(t, 0, nil, "git", "-C", repo, "restore", "--source=HEAD", "--staged", "--worktree", "--", "content")
 	}
-	cliOutput(t, 0, nil, f.cx, "apply", job)
+	cliOutput(t, 0, nil, f.cx, "apply", job, "--since-turn", "1")
 	assertFile(filepath.Join(src, "content"), "worker-edit\n")
 	assertFile(filepath.Join(dep, "content"), "dependency-edit\n")
 	assertFile(filepath.Join(src, ".cargo", "config.toml"), "explicit\n")
@@ -308,34 +308,38 @@ func TestB3AllRepositoryPreflight(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	result, err := Collect(ctx, checkout)
-	if err != nil {
-		t.Fatal(err)
-	}
-	const id, runID, turnID = "p/merge", "fixture-run", "fixture-turn"
-	if err = writeFixtureStatus(filepath.Join(f.home, "state", id), status{
-		Project: "p", Job: "merge", RunID: runID, State: "done", Session: "fixture",
-		Finished: 1, LastCompleted: turnID, CompletedStatus: "completed",
-	}); err != nil {
-		t.Fatal(err)
-	}
-	dest, err := resultDest("local", id, runID, "1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err = os.MkdirAll(dest, 0700); err != nil {
-		t.Fatal(err)
-	}
-	m := turnResult{Turn: 1, TurnID: turnID}
-	for _, repo := range result.Repositories {
-		if err = copyFile(filepath.Join(result.Dir, repo.Patch), filepath.Join(dest, repo.Patch)); err != nil {
-			t.Fatal(err)
+	const id, runID = "p/merge", "fixture-run"
+	seal := func(turn int64, turnID string) {
+		t.Helper()
+		result, collectErr := Collect(ctx, checkout)
+		if collectErr != nil {
+			t.Fatal(collectErr)
 		}
-		m.Repositories = append(m.Repositories, turnPatch{SnapshotPatch: repo})
+		dest, destErr := resultDest("local", id, runID, strconv.FormatInt(turn, 10))
+		if destErr != nil {
+			t.Fatal(destErr)
+		}
+		if destErr = os.MkdirAll(dest, 0700); destErr != nil {
+			t.Fatal(destErr)
+		}
+		m := turnResult{Turn: turn, TurnID: turnID}
+		for _, repo := range result.Repositories {
+			if destErr = copyFile(filepath.Join(result.Dir, repo.Patch), filepath.Join(dest, repo.Patch)); destErr != nil {
+				t.Fatal(destErr)
+			}
+			m.Repositories = append(m.Repositories, turnPatch{SnapshotPatch: repo})
+		}
+		if destErr = writeJSON(filepath.Join(dest, "result.json"), m); destErr != nil {
+			t.Fatal(destErr)
+		}
+		if destErr = writeFixtureStatus(filepath.Join(f.home, "state", id), status{
+			Project: "p", Job: "merge", RunID: runID, State: "done", Session: "fixture",
+			Finished: turn, LastCompleted: turnID, CompletedStatus: "completed",
+		}); destErr != nil {
+			t.Fatal(destErr)
+		}
 	}
-	if err = writeJSON(filepath.Join(dest, "result.json"), m); err != nil {
-		t.Fatal(err)
-	}
+	seal(1, "fixture-turn-1")
 	origin, err := originFile("local", id, runID)
 	if err != nil {
 		t.Fatal(err)
@@ -392,13 +396,23 @@ func TestB3AllRepositoryPreflight(t *testing.T) {
 	if err != nil || string(second) != "local\n" {
 		t.Fatalf("single repository apply changed second worktree: %q (%v)", second, err)
 	}
-	cliOutput(t, 0, nil, "git", "-C", src, "reset", "--hard", "HEAD")
+	cliOutput(t, 0, nil, "git", "-C", src, "commit", "-qm", "applied first turn")
+	if e = os.WriteFile(filepath.Join(checkout, "work", "tree", "first", "a"), []byte("next\n"), 0600); e != nil {
+		t.Fatal(e)
+	}
+	seal(2, "fixture-turn-2")
+	patch = cliOutput(t, 0, nil, f.cx, "patch", id, "--full")
+	for _, want := range []string{"# repo: first\n# since turn 2\n", "-worker\n+next\n", "# repo: second\n# since turn 1\n", "-base\n+worker\n"} {
+		if !bytes.Contains(patch, []byte(want)) {
+			t.Fatalf("mixed patch is missing %q: %s", want, patch)
+		}
+	}
 	if e = os.WriteFile(filepath.Join(other, "a"), []byte("base\n"), 0600); e != nil {
 		t.Fatal(e)
 	}
 	cliOutput(t, 0, nil, f.cx, "apply", "p/merge")
-	for _, repo := range []string{src, other} {
-		if b, e = os.ReadFile(filepath.Join(repo, "a")); e != nil || string(b) != "worker\n" {
+	for repo, want := range map[string]string{src: "next\n", other: "worker\n"} {
+		if b, e = os.ReadFile(filepath.Join(repo, "a")); e != nil || string(b) != want {
 			t.Fatal(string(b), e)
 		}
 	}
