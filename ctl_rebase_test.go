@@ -424,7 +424,7 @@ printf '%s\n' '{"type":"result","session_id":"fixture","result":"STATUS: DONE"}'
 	if err = readJSON(input, &q); err != nil {
 		t.Fatal(err)
 	}
-	if q.Request.Host != "local" || q.Origin.Source != source || q.Origin.History != "HEAD" ||
+	if q.Request.Host != "local" || canonicalPath(q.Origin.Source) != canonicalPath(source) || q.Origin.History != "HEAD" ||
 		!strings.Contains(q.Request.Prompt, "checkout already includes") ||
 		string(q.Request.Context["rebase/last.md"]) != "previous report" ||
 		string(q.Request.Context["rebase/sample.patch"]) != patch {

@@ -53,9 +53,18 @@ func TestSnapshotOwnership(t *testing.T) {
 		t.Fatal(paramsErr)
 	}
 	dir, file := filepath.Join(prep.Source, paths[0]), filepath.Join(prep.Source, paths[1])
-	filesystem := fields{":root": "read", dir: "write", file: "write", tmp: "write"}
+	filesystem := fields{":root": "read", canonicalPath(dir): "write", canonicalPath(file): "write", canonicalPath(tmp): "write"}
 	profile := params["config"].(fields)["permissions."+ownedPermissions].(fields)
-	if params["permissions"] != ownedPermissions || params["sandbox"] != nil || !reflect.DeepEqual(profile["filesystem"], filesystem) {
+	got := fields{}
+	if fs, ok := profile["filesystem"].(fields); ok {
+		for k, v := range fs {
+			if k != ":root" {
+				k = canonicalPath(k)
+			}
+			got[k] = v
+		}
+	}
+	if params["permissions"] != ownedPermissions || params["sandbox"] != nil || !reflect.DeepEqual(got, filesystem) {
 		t.Fatalf("unexpected Codex policy: %v", params)
 	}
 	args := r.c.claudeArgs("", "", dir, file)
@@ -72,4 +81,16 @@ func TestSnapshotOwnership(t *testing.T) {
 		settings.Sandbox.AllowUnsandboxedCommands || !reflect.DeepEqual(settings.Sandbox.Filesystem.AllowWrite, []string{dir, file, tmp}) {
 		t.Fatalf("unexpected Claude policy: %v", args)
 	}
+}
+
+// canonicalPath resolves symlinks and short names so tests compare paths the
+// way the code under test records them.
+func canonicalPath(p string) string {
+	if resolved, err := filepath.EvalSymlinks(p); err == nil {
+		p = resolved
+	}
+	if abs, err := filepath.Abs(p); err == nil {
+		p = abs
+	}
+	return p
 }
