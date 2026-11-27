@@ -63,12 +63,12 @@ func TestWindowsPsmuxReapsExactJobWindow(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg.Psmux, cfg.MuxSocket, cfg.MuxSession = program, socket, session
-	if err := writeJSON(filepath.Join(h.root, hostConfigName), cfg); err != nil {
+	if err = writeJSON(filepath.Join(h.root, hostConfigName), cfg); err != nil {
 		t.Fatal(err)
 	}
 	mux := func(ctx context.Context, argv ...string) (string, error) {
-		b, err := exec.CommandContext(ctx, program, append([]string{"-L", socket}, argv...)...).CombinedOutput()
-		return string(b), err
+		b, runErr := exec.CommandContext(ctx, program, append([]string{"-L", socket}, argv...)...).CombinedOutput()
+		return string(b), runErr
 	}
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -79,13 +79,13 @@ func TestWindowsPsmuxReapsExactJobWindow(t *testing.T) {
 		{"new-session", "-d", "-s", session, "--", h.exe, "fixture-command", "sleep"},
 		{"set-option", "-g", "remain-on-exit", "on"},
 	} {
-		if out, err := mux(h.ctx, args...); err != nil {
-			t.Fatalf("%v: %s (%v)", args, out, err)
+		if out, muxErr := mux(h.ctx, args...); muxErr != nil {
+			t.Fatalf("%v: %s (%v)", args, out, muxErr)
 		}
 	}
 	list := func() ([]string, error) {
-		out, err := mux(h.ctx, "list-windows", "-a", "-F", "#{window_name}")
-		return strings.Fields(out), err
+		out, listErr := mux(h.ctx, "list-windows", "-a", "-F", "#{window_name}")
+		return strings.Fields(out), listErr
 	}
 	bootstrap, err := list()
 	if err != nil || len(bootstrap) != 1 {

@@ -453,8 +453,8 @@ func TestHealthyDiskPeriodicScanReclaimsUnleasedCache(t *testing.T) {
 	const limit = 20
 	for key, size := range map[string]int{"pinned": 30, "idle": 18} {
 		prepareCacheFixture(t, root, "p", key)
-		if err := os.WriteFile(filepath.Join(cargoCachePath(root), "p", key, "data"), make([]byte, size), 0600); err != nil {
-			t.Fatal(err)
+		if writeErr := os.WriteFile(filepath.Join(cargoCachePath(root), "p", key, "data"), make([]byte, size), 0600); writeErr != nil {
+			t.Fatal(writeErr)
 		}
 	}
 	pinned, err := shareCache(cargoTargetLease(root, "p/pinned"))
@@ -509,7 +509,7 @@ func TestGoModuleCacheEvictionRestoresWritePermission(t *testing.T) {
 	}
 	closeBestEffort(guard)
 	rel := filepath.Join("packages", goModuleCacheDir)
-	if err := prepareCacheEntry(root, rel); err != nil {
+	if err = prepareCacheEntry(root, rel); err != nil {
 		t.Fatal(err)
 	}
 	lease, err := shareCache(filepath.Join(packageCachePath(root), ".lease"))
@@ -587,16 +587,16 @@ func TestCacheScanKeepsMeasuredBytesWhenSubdirectoryDisappears(t *testing.T) {
 	prepareCacheFixture(t, root, "p", "pinned")
 	prepareCacheFixture(t, root, "p", "idle")
 	idle := filepath.Join(cargoCachePath(root), "p", "idle")
-	if err := os.WriteFile(filepath.Join(idle, "data"), []byte("x"), 0600); err != nil {
+	if err = os.WriteFile(filepath.Join(idle, "data"), []byte("x"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	base := filepath.Join(cargoCachePath(root), "p", "pinned")
 	for _, name := range []string{"a-before", "z-after"} {
-		if err := os.WriteFile(filepath.Join(base, name), make([]byte, 6), 0600); err != nil {
-			t.Fatal(err)
+		if writeErr := os.WriteFile(filepath.Join(base, name), make([]byte, 6), 0600); writeErr != nil {
+			t.Fatal(writeErr)
 		}
 	}
-	if err := os.Mkdir(filepath.Join(base, "m-vanished"), 0700); err != nil {
+	if err = os.Mkdir(filepath.Join(base, "m-vanished"), 0700); err != nil {
 		t.Fatal(err)
 	}
 	pinned, err := shareCache(cargoTargetLease(root, "p/pinned"))

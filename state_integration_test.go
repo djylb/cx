@@ -74,7 +74,7 @@ func TestWaitTracksWithdrawnInboxSequence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := publishMessage(t.Context(), dir, "target", inboxMessage{Text: "queued"}, identity); err != nil {
+	if err = publishMessage(t.Context(), dir, "target", inboxMessage{Text: "queued"}, identity); err != nil {
 		t.Fatal(err)
 	}
 	observer, err := openJobObservation(dir, stateCursor{}, "")

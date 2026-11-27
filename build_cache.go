@@ -955,12 +955,12 @@ func emptyCacheTree(ctx context.Context, dir *os.Root, expected string, mount ui
 		}
 	}
 	if writable {
-		info, err := f.Stat()
-		if err != nil {
-			return err
+		info, statErr := f.Stat()
+		if statErr != nil {
+			return statErr
 		}
 		if info.Mode().Perm()&0200 == 0 {
-			if err := dir.Chmod(".", info.Mode().Perm()|0200); err != nil {
+			if err = dir.Chmod(".", info.Mode().Perm()|0200); err != nil {
 				return err
 			}
 		}

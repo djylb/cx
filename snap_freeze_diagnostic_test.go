@@ -1,6 +1,7 @@
 package main
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -15,8 +16,12 @@ func TestFreezeIndexDiagnostics(t *testing.T) {
 		t.Run(tc.want, func(t *testing.T) {
 			ctx := snapTestCtx(t)
 			repo := t.TempDir()
+			resolvedRepo, err := filepath.EvalSymlinks(repo)
+			if err != nil {
+				t.Fatal(err)
+			}
 			git := snapGit{ctx: ctx, dir: repo}
-			if _, err := git.get("init", "-q"); err != nil {
+			if _, err = git.get("init", "-q"); err != nil {
 				t.Fatal(err)
 			}
 			oid, err := git.input([]byte("fixture"), "hash-object", "-w", "--stdin")
@@ -28,7 +33,7 @@ func TestFreezeIndexDiagnostics(t *testing.T) {
 				t.Fatal(err)
 			}
 			_, _, err = Freeze(ctx, repo, FreezeOptions{})
-			for _, want := range []string{repo, tc.want, tc.advice} {
+			for _, want := range []string{resolvedRepo, `"entry"`, tc.want, tc.advice} {
 				if err == nil || !strings.Contains(err.Error(), want) {
 					t.Fatalf("Freeze error = %v, want %q", err, want)
 				}

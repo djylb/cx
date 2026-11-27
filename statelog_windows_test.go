@@ -52,19 +52,19 @@ func TestStateLogWindowsSharing(t *testing.T) {
 	}
 	reader := os.NewFile(uintptr(h), old)
 	defer closeBestEffort(reader)
-	if err := w.Append("status", "under a reader"); err != nil {
+	if err = w.Append("status", "under a reader"); err != nil {
 		t.Fatal(err)
 	}
-	if err := w.Rotate("config", "first rotation"); err != nil {
+	if err = w.Rotate("config", "first rotation"); err != nil {
 		t.Fatal(err)
 	}
-	if err := w.Append("status", "after checkpoint"); err != nil {
+	if err = w.Append("status", "after checkpoint"); err != nil {
 		t.Fatal(err)
 	}
-	if err := w.Rotate("config", "second rotation"); err != nil {
+	if err = w.Rotate("config", "second rotation"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(old); err != nil {
+	if _, err = os.Stat(old); err != nil {
 		t.Fatalf("protected segment disappeared: %v", err)
 	}
 	active, err := windows.UTF16PtrFromString(extendedWindowsPath(segmentPath(w.dir, 3)))
@@ -97,7 +97,7 @@ func TestWindowsCleanReportsHolderAndIdleTailDoesNotPinState(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer closeBestEffort(tail)
-	if _, err := tail.Next(); err != nil {
+	if _, err = tail.Next(); err != nil {
 		t.Fatal(err)
 	}
 	segment := segmentPath(filepath.Join(dir, "state"), tail.Cursor().Seg)
@@ -123,7 +123,7 @@ func TestWindowsRetiredSegmentDoesNotUseLegacyDelete(t *testing.T) {
 		t.Fatal(err)
 	}
 	path := f.Name()
-	if err := f.Close(); err != nil {
+	if err = f.Close(); err != nil {
 		t.Fatal(err)
 	}
 	reader, err := openJobFile(path, jobFileRead)
@@ -167,7 +167,7 @@ func TestWindowsHistoryBarrierRetriesAfterDenyWriteReader(t *testing.T) {
 	reader := os.NewFile(uintptr(h), path)
 	defer closeBestEffort(reader)
 	var s status
-	if err := projected(t.Context(), dir, &s); !errors.Is(err, errStateHistoryBusy) || !strings.Contains(err.Error(), "000001.jsonl") {
+	if err = projected(t.Context(), dir, &s); !errors.Is(err, errStateHistoryBusy) || !strings.Contains(err.Error(), "000001.jsonl") {
 		t.Fatalf("history sharing conflict was not retryable or identifiable: %v", err)
 	}
 	s, _, err = loadJobStatus(dir)

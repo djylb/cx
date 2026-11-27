@@ -16,7 +16,7 @@ func syncSnapshotFile(path string, syncFile func(*os.File) error) error {
 			return errors.Join(err, statErr)
 		}
 		mode := info.Mode().Perm()
-		if err := os.Chmod(path, mode|0200); err != nil {
+		if err = os.Chmod(path, mode|0200); err != nil {
 			return err
 		}
 		f, err = openJobFile(path, jobFileSync)

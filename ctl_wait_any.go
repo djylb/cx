@@ -67,7 +67,7 @@ func initializeJobWaitCursor(ctx context.Context, h endpoint, file string, req w
 		return waitUnavailable{errObserveTimeout}
 	}
 	var result waitPollResponse
-	if err := json.Unmarshal(r.data, &result); err != nil {
+	if err = json.Unmarshal(r.data, &result); err != nil {
 		return waitUnavailable{err}
 	}
 	if result.Row != nil {
@@ -76,7 +76,7 @@ func initializeJobWaitCursor(ctx context.Context, h endpoint, file string, req w
 	if len(result.Cursor) == 0 {
 		return waitUnavailable{errors.New("missing job cursor")}
 	}
-	if _, err := decodeWaitBaseline(result.Cursor); err != nil {
+	if _, err = decodeWaitBaseline(result.Cursor); err != nil {
 		return waitUnavailable{err}
 	}
 	// Even an empty cursor records that this host reached its initialization
@@ -328,7 +328,7 @@ func ctlWaitAny(ctx context.Context, hs endpoints, o ctlOptions) error {
 	if err != nil {
 		return err
 	}
-	lock, err := registerWaitObserver(ctx, path+".lock", fmt.Sprintf("cursor %q", o.cursor))
+	lock, err := registerWaitObserver(ctx, path+".lock", fmt.Sprintf("cursor %q of this session (%s); each event goes to only one of them", o.cursor, o.session))
 	if err != nil {
 		return err
 	}

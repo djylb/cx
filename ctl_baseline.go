@@ -137,9 +137,9 @@ func submitRebase(ctx context.Context, host, dest, id string, req rebaseRequest)
 		if queued.Rebase != key {
 			return errors.New("rebase child name is bound to another submission")
 		}
-		done, err := rebaseSubmitted(host, req.Child)
-		if err != nil || done {
-			return err
+		done, submitErr := rebaseSubmitted(host, req.Child)
+		if submitErr != nil || done {
+			return submitErr
 		}
 		return queueJob(ctx, queued, true)
 	}
@@ -206,9 +206,9 @@ func rebaseAttachments(dir string) (map[string][]byte, error) {
 		if !snapPath(name) {
 			return nil, fmt.Errorf("invalid rebase result path %q", name)
 		}
-		data, err := os.ReadFile(filepath.Join(dir, name))
-		if err != nil {
-			return nil, err
+		data, readErr := os.ReadFile(filepath.Join(dir, name))
+		if readErr != nil {
+			return nil, readErr
 		}
 		attachments["rebase/"+name] = data
 	}

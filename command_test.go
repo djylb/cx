@@ -253,6 +253,34 @@ func TestCommandQuietWatchdog(t *testing.T) {
 	h := commands(t)
 	advance := h.clockJob("quiet")
 	h.start("quiet", []string{"--quiet-timeout", "250ms"}, "silent")
+	if runtime.GOOS == "windows" {
+		// Get the worker's process handle before advancing the watchdog.
+		// Terminal status clears the PID before the final cache scan finishes.
+		pid := h.status("quiet").PID
+		if pid <= 0 {
+			t.Fatalf("invalid watchdog worker PID: %d", pid)
+		}
+		worker, err := os.FindProcess(pid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			done := make(chan error, 1)
+			go func() {
+				_, err := worker.Wait()
+				_ = worker.Release()
+				done <- err
+			}()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Errorf("waiting for watchdog worker: %v", err)
+				}
+			case <-h.ctx.Done():
+				t.Errorf("waiting for watchdog worker: %v", h.ctx.Err())
+			}
+		}()
+	}
 	advance(commandPollInterval, 250*time.Millisecond)
 	if out := h.cli(3, "wait", "--job", "p/quiet"); !strings.Contains(out, "status=stalled") {
 		t.Fatal(out)

@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 	"unicode/utf16"
 
@@ -159,11 +160,20 @@ func dispatch(ctx context.Context, args []string) error {
 		}
 		return err
 	}
+	if cause, ok := errors.AsType[errSignal](context.Cause(ctx)); ok && errors.Is(err, context.Canceled) {
+		err = cause
+	}
 	diagnosticf("cx: %v\n", err)
 	if errors.Is(err, context.DeadlineExceeded) {
 		return ctlExit(124)
 	}
 	if errors.Is(err, context.Canceled) {
+		return ctlExit(130)
+	}
+	if sig, ok := errors.AsType[errSignal](err); ok {
+		if s, isSys := sig.sig.(syscall.Signal); isSys {
+			return ctlExit(128 + int(s))
+		}
 		return ctlExit(130)
 	}
 	return ctlExit(2)

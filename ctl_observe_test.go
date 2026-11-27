@@ -69,20 +69,20 @@ func TestControllerListCachedHost(t *testing.T) {
 
 	// Point the local node at a file so its rows request fails.
 	config := filepath.Join(f.home, ".config", "cx", "hosts.toml")
-	if err := os.MkdirAll(filepath.Dir(config), 0700); err != nil {
+	if err = os.MkdirAll(filepath.Dir(config), 0700); err != nil {
 		t.Fatal(err)
 	}
 	blocked := filepath.Join(f.home, "blocked-state")
-	if err := os.WriteFile(blocked, nil, 0600); err != nil {
+	if err = os.WriteFile(blocked, nil, 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(config, []byte("[hosts.local]\nstate = "+strconv.Quote(blocked)+"\n"), 0600); err != nil {
+	if err = os.WriteFile(config, []byte("[hosts.local]\nstate = "+strconv.Quote(blocked)+"\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	clock.Advance(time.Hour)
 	stale := run(1, "--json", "--all", "--project", "p", "local:p/other-session")
 	var row fields
-	if err := decodeRows([]byte(stale), &row); err != nil {
+	if err = decodeRows([]byte(stale), &row); err != nil {
 		t.Fatalf("cached JSON: %v: %q", err, stale)
 	}
 	if row["job"] != "other-session" || row["host"] != "local" || row["stale"] != true || row["as_of"] != stamp.Format(time.RFC3339Nano) {
@@ -97,14 +97,14 @@ func TestControllerListCachedHost(t *testing.T) {
 	if err != nil || string(after) != string(before) {
 		t.Fatalf("offline listing changed the cache: %v", err)
 	}
-	if err := os.WriteFile(cache, []byte("{"), 0600); err != nil {
+	if err = os.WriteFile(cache, []byte("{"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	if got := run(1, "--json", "--project", "p"); got != "" {
 		t.Fatalf("corrupt cache produced rows: %s", got)
 	}
 
-	if err := os.Remove(config); err != nil {
+	if err = os.Remove(config); err != nil {
 		t.Fatal(err)
 	}
 	recovered := run(0, "--json", "--project", "p")

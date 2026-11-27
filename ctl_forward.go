@@ -330,8 +330,8 @@ func say(ctx context.Context, dir, host, id string, opts options, args []string)
 			return err
 		}
 	}
-	if handled, err := opts.dispatch(ctx, dir, "say", args, &identity); handled {
-		return err
+	if handled, dispatchErr := opts.dispatch(ctx, dir, "say", args, &identity); handled {
+		return dispatchErr
 	}
 	name, msg, err := prepareMessage(opts, args)
 	if err != nil {
@@ -340,12 +340,12 @@ func say(ctx context.Context, dir, host, id string, opts options, args []string)
 	if host != "" {
 		if isTerminal(s.State) {
 			if len(msg.Input) != 0 && s.Engine != "cmd" {
-				eng, err := lookupEngine(s.Engine)
-				if err != nil {
-					return err
+				eng, engineErr := lookupEngine(s.Engine)
+				if engineErr != nil {
+					return engineErr
 				}
-				if err = eng.checkInput(msg.Input); err != nil {
-					return err
+				if engineErr = eng.checkInput(msg.Input); engineErr != nil {
+					return engineErr
 				}
 			}
 			if err = restartNode(ctx, []string{"resume", host, id, "", "", "", ""}, &identity, io.Discard); err != nil {

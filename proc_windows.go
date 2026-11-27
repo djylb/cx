@@ -69,7 +69,7 @@ func startCommand(cmd *exec.Cmd, id string) (commandTree, error) {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
 	}
 	cmd.SysProcAttr.CreationFlags |= windows.CREATE_NEW_PROCESS_GROUP | windows.CREATE_SUSPENDED
-	if err := cmd.Start(); err != nil {
+	if err = cmd.Start(); err != nil {
 		_ = windows.CloseHandle(job)
 		return commandTree{}, err
 	}

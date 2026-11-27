@@ -244,9 +244,9 @@ func testWaitAnyWithdrawalAndCompletion(t *testing.T, saved bool) {
 	ticks := make(chan time.Time)
 	baseline := make(map[string]waitCursor)
 	if saved {
-		dirKey, err := jobDirectoryKey(dir)
-		if err != nil {
-			t.Fatal(err)
+		dirKey, keyErr := jobDirectoryKey(dir)
+		if keyErr != nil {
+			t.Fatal(keyErr)
 		}
 		baseline["j"] = waitCursor{DirKey: dirKey, RunID: s.RunID, Finished: 1, StateCursor: start.String()}
 	}

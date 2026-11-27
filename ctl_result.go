@@ -837,7 +837,7 @@ func displayTurn(ctx context.Context, dir, id, op string, o ctlOptions) error {
 		if err != nil {
 			return err
 		}
-		if err := checkResultReport(path); err != nil {
+		if err = checkResultReport(path); err != nil {
 			return resultUnavailable(err.Error())
 		}
 		_, err = fmt.Fprintln(os.Stdout, path)

@@ -116,7 +116,7 @@ func TestSayRejectsReplacementDuringSeal(t *testing.T) {
 			}
 			defer closeBestEffort(owner)
 			result := filepath.Join(dir, "result")
-			if err := os.MkdirAll(result, 0700); err != nil {
+			if err = os.MkdirAll(result, 0700); err != nil {
 				t.Fatal(err)
 			}
 			seal, err := lockPath(filepath.Join(result, ".lock"), os.O_CREATE)
@@ -130,18 +130,18 @@ func TestSayRejectsReplacementDuringSeal(t *testing.T) {
 					t.Fatal("unexpected second seal wait")
 				}
 				replaced = true
-				if err := os.Rename(dir, dir+"-old"); err != nil {
-					t.Fatal(err)
+				if renameErr := os.Rename(dir, dir+"-old"); renameErr != nil {
+					t.Fatal(renameErr)
 				}
-				if err := writeFixtureStatus(dir, s); err != nil {
-					t.Fatal(err)
+				if writeErr := writeFixtureStatus(dir, s); writeErr != nil {
+					t.Fatal(writeErr)
 				}
 				folder := filepath.Join(result, "turn-1")
-				if err := os.MkdirAll(folder, 0700); err != nil {
-					t.Fatal(err)
+				if mkdirErr := os.MkdirAll(folder, 0700); mkdirErr != nil {
+					t.Fatal(mkdirErr)
 				}
-				if err := os.WriteFile(filepath.Join(folder, "result.json"), []byte("{}"), 0600); err != nil {
-					t.Fatal(err)
+				if writeErr := os.WriteFile(filepath.Join(folder, "result.json"), []byte("{}"), 0600); writeErr != nil {
+					t.Fatal(writeErr)
 				}
 			}}
 			ctx := context.WithValue(t.Context(), clockKey{}, clock)

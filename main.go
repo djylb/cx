@@ -1238,11 +1238,36 @@ func runNodeWithRegistration(ctx context.Context, args []string, directSubmit bo
 }
 func main() { mainContext(context.Background()) }
 
+// errSignal reports which signal stopped the process, so callers can tell an
+// external stop from an internal cancellation.
+type errSignal struct{ sig os.Signal }
+
+func (e errSignal) Error() string { return "stopped by signal " + e.sig.String() }
+
+func signalContext(parent context.Context) (context.Context, func()) {
+	ctx, cancel := context.WithCancelCause(parent)
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, os.Interrupt, syscall.SIGTERM)
+	done := make(chan struct{})
+	go func() {
+		select {
+		case sig := <-ch:
+			cancel(errSignal{sig})
+		case <-done:
+		}
+	}()
+	return ctx, func() {
+		signal.Stop(ch)
+		close(done)
+		cancel(nil)
+	}
+}
+
 func mainContext(parent context.Context) {
 	if len(os.Args) > 1 && os.Args[1] == "_command" {
 		ignoreHangup()
 	}
-	ctx, stop := signal.NotifyContext(parent, os.Interrupt, syscall.SIGTERM)
+	ctx, stop := signalContext(parent)
 	defer stop()
 	if err := dispatch(ctx, os.Args[1:]); err != nil {
 		if code, ok := errors.AsType[ctlExit](err); ok {

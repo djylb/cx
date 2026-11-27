@@ -35,8 +35,8 @@ printf '%s\n' '{"type":"result","session_id":"fixture","result":"STATUS: DONE"}'
 	}
 	defer func() {
 		r.s.State = "failed"
-		if err := r.saveTerminal(); err != nil {
-			t.Error(err)
+		if saveErr := r.saveTerminal(); saveErr != nil {
+			t.Error(saveErr)
 		}
 	}()
 	origin, err := originFile("local", id, s.RunID)
@@ -253,8 +253,8 @@ printf '%s\n' '{"type":"result","session_id":"fixture","result":"STATUS: DONE"}'
 	if err = readJSON(dest+".rebase.json", &completed); err != nil || !completed.Submitted || completed.Failure != "" {
 		t.Fatalf("completed request = %+v, %v", completed, err)
 	}
-	if after, err := os.ReadFile(input); err != nil || !bytes.Equal(before, after) {
-		t.Fatalf("retry changed submission input: %v", err)
+	if after, readErr := os.ReadFile(input); readErr != nil || !bytes.Equal(before, after) {
+		t.Fatalf("retry changed submission input: %v", readErr)
 	}
 	work, err := jobDir(filepath.Join(node, ".work"), child)
 	if err != nil {
@@ -262,14 +262,14 @@ printf '%s\n' '{"type":"result","session_id":"fixture","result":"STATUS: DONE"}'
 	}
 	dir := filepath.Join(work, "context", "rebase")
 	var m turnResult
-	if err := readJSON(filepath.Join(dir, "result.json"), &m); err != nil || len(m.Repositories) != 1 || m.Repositories[0].Patch != patch {
+	if err = readJSON(filepath.Join(dir, "result.json"), &m); err != nil || len(m.Repositories) != 1 || m.Repositories[0].Patch != patch {
 		t.Fatalf("node result manifest = %+v, %v", m, err)
 	}
-	if b, err := os.ReadFile(filepath.Join(dir, m.Repositories[0].Patch)); err != nil || string(b) != patchData {
-		t.Fatalf("node patch = %d bytes, %v", len(b), err)
+	if b, readErr := os.ReadFile(filepath.Join(dir, m.Repositories[0].Patch)); readErr != nil || string(b) != patchData {
+		t.Fatalf("node patch = %d bytes, %v", len(b), readErr)
 	}
-	if b, err := os.ReadFile(filepath.Join(dir, "last.md")); err != nil || string(b) != "previous report" {
-		t.Fatalf("node report = %q, %v", b, err)
+	if b, readErr := os.ReadFile(filepath.Join(dir, "last.md")); readErr != nil || string(b) != "previous report" {
+		t.Fatalf("node report = %q, %v", b, readErr)
 	}
 	job, err := jobDir(node, child)
 	if err != nil {

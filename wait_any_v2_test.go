@@ -463,23 +463,23 @@ func TestWaitAnyKeepsDeliveredPositionAcrossRunReplacement(t *testing.T) {
 				t.Fatal(err)
 			}
 			if !tc.seed {
-				row, err := pollWaitAny(ctx, root, projects, s.Session, baseline)
-				if err != nil || row.Event != "completion" || row.Turn != tc.turn {
-					t.Fatalf("initial delivery: %+v (%v)", row, err)
+				row, pollErr := pollWaitAny(ctx, root, projects, s.Session, baseline)
+				if pollErr != nil || row.Event != "completion" || row.Turn != tc.turn {
+					t.Fatalf("initial delivery: %+v (%v)", row, pollErr)
 				}
 			}
 			s.State = tc.state
 			for _, run := range []string{"replacement", "replacement-again"} {
 				s.RunID = run
-				if err := writeFixtureStatus(r.dir, s); err != nil {
-					t.Fatal(err)
+				if writeErr := writeFixtureStatus(r.dir, s); writeErr != nil {
+					t.Fatal(writeErr)
 				}
 				assertNoWaitAnyEvent(t, ctx, root, s.Project, s.Session, baseline)
 			}
 			s.Finished++
 			s.LastCompleted, s.CompletedStatus, s.State = "new-turn", "completed", "waiting"
 			s.CompletedRateLimited = false
-			if err := writeFixtureStatus(r.dir, s); err != nil {
+			if err = writeFixtureStatus(r.dir, s); err != nil {
 				t.Fatal(err)
 			}
 			row, err := pollWaitAny(ctx, root, projects, s.Session, baseline)
@@ -562,33 +562,44 @@ func TestWaitAnyTerminalStaysAcknowledgedInSameDirectory(t *testing.T) {
 	root := t.TempDir()
 	s := status{Project: "p", Job: "job", RunID: "first", Engine: "cmd", State: "done"}
 	const id = "p/job"
-	r := waitFixture(t, root, id, s)
-	if err := r.saveTerminal(); err != nil {
-		t.Fatal(err)
-	}
-	baseline, err := initialWaitBaseline(ctx, root, "", true)
+	dir, err := jobDir(root, id)
 	if err != nil {
 		t.Fatal(err)
 	}
-	row, err := pollWaitAny(ctx, root, nil, "", baseline)
-	if err != nil || row.Event != "terminal" {
-		t.Fatalf("initial terminal: %+v (%v)", row, err)
+	var baseline map[string]waitCursor
+	if !t.Run("same directory", func(t *testing.T) {
+		r := waitFixture(t, root, id, s)
+		if err = r.saveTerminal(); err != nil {
+			t.Fatal(err)
+		}
+		baseline, err = initialWaitBaseline(ctx, root, "", true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var row *waitReport
+		row, err = pollWaitAny(ctx, root, nil, "", baseline)
+		if err != nil || row.Event != "terminal" {
+			t.Fatalf("initial terminal: %+v (%v)", row, err)
+		}
+		s.RunID = "second"
+		if err = writeFixtureStatus(dir, s); err != nil {
+			t.Fatal(err)
+		}
+		assertNoWaitAnyEvent(t, ctx, root, "p", "", baseline)
+	}) {
+		return
 	}
-	s.RunID = "second"
-	if err := writeFixtureStatus(r.dir, s); err != nil {
-		t.Fatal(err)
-	}
-	assertNoWaitAnyEvent(t, ctx, root, "p", "", baseline)
-	// Re-register at the same path while the old directory still exists.
-	if err := os.Rename(r.dir, filepath.Join(root, ".old")); err != nil {
+	// The subtest has released the fixture owner. Keep the old directory
+	// alive so its identity cannot be reused when re-registering.
+	if err = os.Rename(dir, filepath.Join(root, ".old")); err != nil {
 		t.Fatal(err)
 	}
 	// Even a reused run ID must not hide a newly registered directory.
 	next := waitFixture(t, root, id, status{Project: "p", Job: "job", RunID: "first", Engine: "cmd", State: "done"})
-	if err := next.saveTerminal(); err != nil {
+	if err = next.saveTerminal(); err != nil {
 		t.Fatal(err)
 	}
-	row, err = pollWaitAny(ctx, root, nil, "", baseline)
+	row, err := pollWaitAny(ctx, root, nil, "", baseline)
 	if err != nil || row.Event != "terminal" {
 		t.Fatalf("new directory terminal: %+v (%v)", row, err)
 	}
@@ -760,12 +771,12 @@ func TestWaitAnyRateLimitedResetAt(t *testing.T) {
 			r.clock = clock
 			r.s.Primary = &rateLimitWindow{UsedPercent: tc.used, ResetAt: new(int64(110))}
 			r.s.Secondary = &rateLimitWindow{UsedPercent: 99, ResetAt: new(int64(105))}
-			if err := r.finish(turn{ID: "one", Error: &turnError{RateLimited: true}}); err != nil {
+			if err = r.finish(turn{ID: "one", Error: &turnError{RateLimited: true}}); err != nil {
 				t.Fatal(err)
 			}
 			clock.Advance(20 * time.Second)
 			r.s.Primary = &rateLimitWindow{UsedPercent: 100, ResetAt: new(int64(130))}
-			if err := r.begin("two"); err != nil {
+			if err = r.begin("two"); err != nil {
 				t.Fatal(err)
 			}
 			report, err := pollWaitAny(clockContext(ctx, clock), root, nil, "", baseline)

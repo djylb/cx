@@ -54,7 +54,7 @@ It watches every job this session dispatched, on every host, and returns one JSO
 1. Handle the event: `cx show JOB` for the report, `cx result JOB` to collect it, `cx say JOB TEXT` to continue. A `say` starts a new turn when the agent is idle and resumes an ended job with a saved thread and an available workspace before delivering the message. The brief phase `completed` identifies a `done` job that `say` cannot resume. Its completion arrives as a new event.
 2. Start the same command again. It resumes from its saved cursor. On exit 124, start it again.
 
-A new cursor starts from the current state, so jobs that finished before it existed are not reported: when you first start watching (or switch cursors), check `cx ls --brief` once, or add `--from-start` to replay retained events. Narrow the watch with `--project P`, `--host H`, or `--job HOST:PROJECT/JOB`. Each flag is repeatable. A job must match every filter supplied. Changing `--job` values keeps the same session cursor. A disconnected host is retried on its own while the others keep being watched. Do not poll `cx status` in a loop, wait on each job separately, or use `cx result --wait` to watch jobs.
+A new cursor starts from the current state, so jobs that finished before it existed are not reported: when you first start watching (or switch cursors), check `cx ls --brief` once, or add `--from-start` to replay retained events. Narrow the watch with `--project P`, `--host H`, or `--job HOST:PROJECT/JOB`. Each flag is repeatable. A job must match every filter supplied. Changing `--job` values keeps the same session cursor. Cursors are kept per session, so watchers of different sessions never share events. A disconnected host is retried on its own while the others keep being watched. Do not poll `cx status` in a loop, wait on each job separately, or use `cx result --wait` to watch jobs.
 
 **Sessions.** Jobs belong to the session that dispatched them, detected from `CX_SESSION`, then Claude Code, Codex and OpenCode session variables. Where none is set, dispatching and `wait --any` stop with exit 2: set `CX_SESSION`, pass `--session NAME`, or dispatch with `--no-session` on purpose. `cx adopt JOB [--session NAME]` moves an existing job into a session. Agents dispatching their own jobs get `CX_SESSION=HOST:PROJECT/JOB`.
 
@@ -66,6 +66,16 @@ Other controls: `cx interrupt JOB` stops an active turn; `cx resume JOB` restart
 - **Sub-managers.** A manager on another host dispatches from its own `~/.config/cx/`. Mark that host `manager = true` in `hosts.toml`: each submission to it first refreshes its read-only copy of these layers when they changed (`cx context push HOST` forces it). Its own extra project layers are left untouched.
 - **Opting out.** Use `--context project`, `--context shared,host` or `--context none` on `run` and `agent` to start a job without some or all layers.
 - **Progress board.** Use `cx ls --brief` for the current phase, turn counts, applied turns by repository, and plan step. For a rate-limited job, use `cx ls JOB --brief --json` to read its known `rate_limit.reset_at`. For extra notes, ask agents to `send` one line to `#board` when they start, finish or block, and read `cx outbox --any --to '#board' --latest` (newest line per job).
+
+## Run many jobs at once
+
+- Split work along file boundaries: give each set of files to one job, and keep each job to one change that can be collected on its own. Start a separate job for new findings instead of queueing them into a long-running one.
+- Name the paths each job owns and the paths it must not touch in its own prompt, or restrict its writable paths with `--own PATH`.
+- Keep one background `cx wait --any` per session and handle every event line. Restart it when your job list changes; narrow it with `--job` rather than filtering its output.
+- For multi-turn jobs, plain `cx apply JOB` applies only the turns after the last one you applied. When jobs conflict on the same files, redo one on the new base with `cx rebase` instead of merging by hand.
+- Bring inputs that Git ignores into snapshots with the project `--include` list.
+- When a job stops on a usage limit, check `rate_limited` and `reset_at` in its event; `cx rebase JOB TEXT --host H` continues its work on another host or account.
+- Collect a batch of similar jobs together once all of them have finished.
 
 ## Work while the manager is away
 

@@ -93,7 +93,7 @@ func hasRun(h windows.Handle, id string) (bool, error) {
 	}
 	readPtr := func(addr uintptr) (uintptr, error) {
 		var ptr uintptr
-		err := windows.ReadProcessMemory(h, addr, (*byte)(unsafe.Pointer(&ptr)), word, nil)
+		err = windows.ReadProcessMemory(h, addr, (*byte)(unsafe.Pointer(&ptr)), word, nil)
 		return ptr, err
 	}
 	params, err := readPtr(peb + paramsOff)
@@ -156,8 +156,8 @@ func scanProcesses(id string, v *inventory) map[int]process {
 	var e windows.ProcessEntry32
 	e.Size = uint32(unsafe.Sizeof(e))
 	for err = windows.Process32First(snap, &e); err == nil; err = windows.Process32Next(snap, &e) {
-		h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, e.ProcessID)
-		if err != nil {
+		h, openErr := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, e.ProcessID)
+		if openErr != nil {
 			v.Unreadable++
 			continue
 		}
@@ -165,7 +165,9 @@ func scanProcesses(id string, v *inventory) map[int]process {
 		p.jobObject = job != 0 && inJob(h, job)
 		// A process from an earlier invocation with this run ID can still
 		// carry the marker after a new Job Object has taken the name.
-		mem, err := windows.OpenProcess(windows.PROCESS_QUERY_INFORMATION|windows.PROCESS_VM_READ, false, e.ProcessID)
+		// err is reassigned by Process32Next before the loop condition is checked.
+		var mem windows.Handle
+		mem, err = windows.OpenProcess(windows.PROCESS_QUERY_INFORMATION|windows.PROCESS_VM_READ, false, e.ProcessID)
 		if err == nil {
 			p.Marked, err = hasRun(mem, id)
 			_ = windows.CloseHandle(mem)
@@ -208,7 +210,7 @@ func signalMember(p process, _ bool, id string) error {
 	if !match {
 		return os.ErrPermission
 	}
-	if err := windows.TerminateProcess(h, 1); err != nil {
+	if err = windows.TerminateProcess(h, 1); err != nil {
 		return err
 	}
 	waited, err := windows.WaitForSingleObject(h, 5000)
