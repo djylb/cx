@@ -249,3 +249,28 @@ func TestModuleContextAcceptanceChangesetCLI(t *testing.T) {
 		t.Fatalf("changeset filter included %s", got)
 	}
 }
+
+func TestListMarksRunnerFromOlderBinary(t *testing.T) {
+	f := newControllerFixture(t)
+	for _, job := range []struct{ name, binary string }{{"stale", "older-cx"}, {"fresh", ""}} {
+		dir := filepath.Join(f.home, "state", "p", job.name)
+		if err := writeFixtureStatus(dir, status{Project: "p", Job: job.name, RunID: "fixture", State: "waiting", Session: "s", RunnerBinary: job.binary}); err != nil {
+			t.Fatal(err)
+		}
+		owner, err := lockPath(filepath.Join(dir, "owner.lock"), os.O_CREATE)
+		if err != nil || owner == nil {
+			t.Fatalf("fixture owner: %v", err)
+		}
+		t.Cleanup(func() { closeBestEffort(owner) })
+	}
+	out := string(cliOutput(t, 0, nil, f.cx, "ls", "--all", "--json", "--project", "p"))
+	for line := range strings.SplitSeq(strings.TrimSpace(out), "\n") {
+		var row fields
+		if err := json.Unmarshal([]byte(line), &row); err != nil {
+			t.Fatal(err)
+		}
+		if outdated := row["runner_outdated"] == true; outdated != (row["job"] == "stale") {
+			t.Fatalf("runner_outdated for %v = %v: %s", row["job"], outdated, line)
+		}
+	}
+}

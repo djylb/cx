@@ -187,3 +187,18 @@ func (r *runner) reapMarked(immediate bool, note func(string) error) error {
 		time.Sleep(100 * time.Millisecond)
 	}
 }
+
+// executableIdentity names the installed binary by path, size and modification
+// time. A runner records it at start; a later install changes it, so listings
+// can tell which running jobs still execute an older cx.
+func executableIdentity() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	info, err := os.Stat(exe)
+	if err != nil {
+		return ""
+	}
+	return fmt.Sprintf("%s:%d:%d", exe, info.Size(), info.ModTime().UnixNano())
+}

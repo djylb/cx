@@ -92,9 +92,11 @@ type status struct {
 	OutputDrain string `json:"output_drain,omitempty"`
 	// TurnContext is the context share sampled for the last completed turn;
 	// nil when that turn had no sample of its own.
-	TurnContext *float64  `json:"turn_context_percent,omitempty"`
-	LastEvent   time.Time `json:"last_event_time"`
-	ExitCode    *int64    `json:"exit_code,omitempty"`
+	TurnContext *float64 `json:"turn_context_percent,omitempty"`
+	// RunnerBinary identifies the executable the runner started from.
+	RunnerBinary string    `json:"runner_binary,omitempty"`
+	LastEvent    time.Time `json:"last_event_time"`
+	ExitCode     *int64    `json:"exit_code,omitempty"`
 
 	Project     string `json:"project,omitempty"`
 	Session     string `json:"session,omitempty"`
@@ -1263,6 +1265,7 @@ func runNodeWithRegistration(ctx context.Context, args []string, directSubmit bo
 	}
 	r.s.Mux = workerWindow(ctx)
 	r.s.RunnerStart = processStart(os.Getpid())
+	r.s.RunnerBinary = executableIdentity()
 	r.s.PID = os.Getpid()
 	r.s.EnginePID = 0
 	r.s.CommandPID = 0

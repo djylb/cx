@@ -116,6 +116,7 @@ func workDir(dir string, s status) (string, error) {
 	return dir, nil
 }
 func nodeRows(ctx context.Context, root, p, session, chatProject string) error {
+	current := executableIdentity() // the cx installed on this node now
 	overview := chatProject != ""
 	now := statusTime(ctx)
 	rows := make([]fields, 0) // Encode an empty list as [].
@@ -185,6 +186,9 @@ func nodeRows(ctx context.Context, root, p, session, chatProject string) error {
 			}
 		} else {
 			r["privileged"] = s.Privileged || meta.Privileged
+			if s.RunnerBinary != "" && !isTerminal(s.State) && s.RunnerBinary != current {
+				r["runner_outdated"] = true
+			}
 			r["run_id"] = s.RunID
 			if meta.Snapshot != "" {
 				base, baseErr := readJobBaseline(work)

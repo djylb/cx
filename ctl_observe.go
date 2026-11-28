@@ -406,6 +406,9 @@ func displayHosts(ctx context.Context, hs endpoints, op string, o ctlOptions) er
 					if priv == true {
 						state += " privileged"
 					}
+					if row["runner_outdated"] == true {
+						state += " (runner predates installed cx: close and resume to update)"
+					}
 					if row["stale"] == true {
 						state += " (unreachable, last successful observation: " + asOf + ")"
 					}
