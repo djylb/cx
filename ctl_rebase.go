@@ -39,10 +39,16 @@ func ctlRebase(ctx context.Context, h endpoint, host, id string, o ctlOptions) e
 	if o.host != "" && errors.Is(err, ctlExit(9)) && ctx.Err() == nil {
 		cached, target, err = offlineRebaseResult(host, id, target.Number, o.turn != "", err)
 	}
-	pendingTurn := s.Finished + 1
-	pending := errors.Is(err, ctlExit(44)) && resultInProgress(s) && target.Number == pendingTurn
-	if err != nil && !pending {
-		return err
+	var pending bool
+	if err != nil {
+		// Only exit 44 still describes the job: the selected turn may be the
+		// one in progress, whose rebase waits for it to seal.
+		if !errors.Is(err, ctlExit(44)) {
+			return err
+		}
+		if pending = resultInProgress(s) && target.Number == s.Finished+1; !pending {
+			return err
+		}
 	}
 	if target.RunID == "" {
 		return errors.New("rebase requires a registered job generation")
