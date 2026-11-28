@@ -283,15 +283,16 @@ var snapAuth = regexp.MustCompile(`(?im)^\s*[^#;\n=]*(?:auth|password|token|keyf
 
 // Explicit repository and staging paths own the Git operation even when cx is
 // launched by a Git hook with exported repository-local environment variables.
-func snapProcessEnv() []string {
-	var env []string
-	for _, entry := range os.Environ() {
-		key, _, _ := strings.Cut(entry, "=")
-		switch strings.ToUpper(key) {
-		case "GIT_DIR", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_WORK_TREE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_SHALLOW_FILE", "GIT_QUARANTINE_PATH":
-			continue
-		}
-		env = append(env, entry)
+func gitWorkspaceEnv(entry string) bool {
+	key, _, _ := strings.Cut(entry, "=")
+	switch strings.ToUpper(key) {
+	case "GIT_DIR", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_WORK_TREE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_SHALLOW_FILE", "GIT_QUARANTINE_PATH":
+		return true
 	}
+	return false
+}
+
+func snapProcessEnv() []string {
+	env := slices.DeleteFunc(os.Environ(), gitWorkspaceEnv)
 	return append(env, "GIT_OPTIONAL_LOCKS=0", "LC_ALL=C")
 }

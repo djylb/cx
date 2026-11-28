@@ -439,7 +439,7 @@ IFS= read -r finish || exit 2
 			done := make(chan error, 1)
 			const connect, idle = time.Minute, time.Second
 			go func() {
-				_, runErr := runWithActivity(ctx, cmd, stop, connect, idle, io.Discard, io.Discard)
+				_, runErr := runWithActivity(ctx, cmd, stop, connect, idle, io.Discard, io.Discard, nil)
 				done <- runErr
 			}()
 			waitFor := func(d time.Duration) {

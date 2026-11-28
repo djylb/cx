@@ -15,7 +15,7 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-func ownGroup(cmd *exec.Cmd) {}
+func ownGroup(*exec.Cmd) {}
 func killTree(cmd *exec.Cmd) {
 	if cmd.Process != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

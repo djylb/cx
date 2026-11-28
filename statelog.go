@@ -1071,7 +1071,8 @@ func appendJobMailbox(ctx context.Context, job, mailbox string, expected *jobIde
 		return stateRecord{}, err
 	}
 	return appendSegmented(filepath.Join(job, mailbox), r, func(r *stateRecord, previous stateRecord) error {
-		if s.final && previous.Seq == 0 {
+		turnEvent := mailbox == "outbox" && (r.Kind == "acceptance" || r.Kind == "context_warning")
+		if s.final && previous.Seq == 0 && !turnEvent {
 			if r.Kind == "close" || r.Kind == adoptKind {
 				return errAlreadyClosed
 			}

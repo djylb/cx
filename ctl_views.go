@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"maps"
-	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -24,41 +23,68 @@ type appliedJob struct {
 	RunID     string `json:"run_id"`
 }
 
-func readAppliedTurns(project string) (map[appliedJob]map[string]int64, error) {
+type appliedRepo struct {
+	Source              string `json:"source"`
+	Operation           string `json:"operation"`
+	TargetRepository    string `json:"target_repository"`
+	TargetRepositoryKey string `json:"target_repository_key"`
+	Repo                string
+	TargetHead          *string `json:"target_head_at_apply"`
+	ResultTree          string  `json:"result_tree"`
+	Turn                int64
+}
+
+type applyRecord struct {
+	appliedJob
+	appliedRepo
+	Changeset string
+	Role      string
+	Baseline  SnapshotID
+	Session   string
+	Modules   []string
+}
+
+func readApplyLog(project string, visit func(applyRecord)) error {
 	dir, err := projectOutputPath(project)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	log, err := openJobFile(filepath.Join(dir, "apply-log.jsonl"), jobFileRead)
 	if os.IsNotExist(err) {
-		return nil, nil
+		return nil
 	}
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer closeBestEffort(log)
-	turns := map[appliedJob]map[string]int64{}
 	dec := json.NewDecoder(bufio.NewReader(log))
 	for {
-		var entry struct {
-			appliedJob
-			Repo string
-			Turn int64
-		}
+		var entry applyRecord
 		if err = dec.Decode(&entry); errors.Is(err, io.EOF) {
-			return turns, nil
+			return nil
 		}
 		if err != nil {
-			return nil, err
+			return err
 		}
+		visit(entry)
+	}
+}
+
+func readAppliedResults(project string) (map[appliedJob]map[string]appliedRepo, error) {
+	turns := map[appliedJob]map[string]appliedRepo{}
+	err := readApplyLog(project, func(entry applyRecord) {
 		key := entry.appliedJob
 		if turns[key] == nil {
-			turns[key] = map[string]int64{}
+			turns[key] = map[string]appliedRepo{}
 		}
-		byRepo := turns[key]
-		if previous, ok := byRepo[entry.Repo]; !ok || entry.Turn > previous {
-			byRepo[entry.Repo] = entry.Turn
-		}
+		noteAppliedRepository(turns[key], entry.appliedRepo)
+	})
+	return turns, err
+}
+
+func noteAppliedRepository(byRepo map[string]appliedRepo, entry appliedRepo) {
+	if previous, ok := byRepo[entry.Repo]; !ok || entry.Turn >= previous.Turn {
+		byRepo[entry.Repo] = entry
 	}
 }
 
@@ -76,18 +102,6 @@ func appliedTurnColumn(row fields) any {
 	return strings.Join(values, ",")
 }
 
-func usage(f fields, raw json.RawMessage) {
-	var u struct {
-		Last, Total        struct{ TotalTokens *int64 }
-		ModelContextWindow float64
-	}
-	_ = json.Unmarshal(raw, &u)
-	f["tokens"] = u.Total.TotalTokens
-	f["context_percent"] = nil
-	if u.ModelContextWindow > 0 && u.Last.TotalTokens != nil {
-		f["context_percent"] = math.RoundToEven(float64(*u.Last.TotalTokens)*1000/u.ModelContextWindow) / 10
-	}
-}
 func workDir(dir string, s status) (string, error) {
 	root := filepath.Dir(dir)
 	if s.Project != "" {
@@ -101,7 +115,7 @@ func workDir(dir string, s status) (string, error) {
 	}
 	return dir, nil
 }
-func nodeRows(ctx context.Context, root, p, session string, chatProject string) error {
+func nodeRows(ctx context.Context, root, p, session, chatProject string) error {
 	overview := chatProject != ""
 	now := statusTime(ctx)
 	rows := make([]fields, 0) // Encode an empty list as [].
@@ -126,12 +140,30 @@ func nodeRows(ctx context.Context, root, p, session string, chatProject string) 
 			return false, e
 		}
 		var meta struct {
+			moduleWork
 			Snapshot     SnapshotID
 			Role, Parent string
 			Privileged   bool
 		}
-		if e = readJSON(filepath.Join(work, "request.json"), &meta); e != nil && !os.IsNotExist(e) {
-			return false, e
+		request, e := readSharedFile(filepath.Join(work, "request.json"))
+		if e == nil {
+			if e = json.Unmarshal(request, &meta); e != nil {
+				return false, e
+			}
+		} else {
+			if !os.IsNotExist(e) {
+				return false, e
+			}
+			// Forks inherit their parent's runner configuration.
+			if s.Engine != "" && s.Engine != "cmd" {
+				var c config
+				if err := readJobConfig(dir, &c); err != nil {
+					return false, err
+				}
+				if c.Work != nil {
+					meta.moduleWork = *c.Work
+				}
+			}
 		}
 		if meta.Role == "" {
 			meta.Role = "worker"
@@ -165,8 +197,12 @@ func nodeRows(ctx context.Context, root, p, session string, chatProject string) 
 					}
 				}
 				r["baseline"], r["baseline_at"], r["baseline_from_turn"] = base.Snapshot, base.Time, base.FromTurn
+				if base.Work != nil {
+					meta.moduleWork = *base.Work
+				}
 			}
 		}
+		meta.listing().addModuleListing(r)
 		rows = append(rows, r)
 		return false, nil
 	})
@@ -483,4 +519,27 @@ func channelCursorPath(p, ch, name string) (string, error) {
 		}
 	}
 	return cursorFile("chat", p, ch, name)
+}
+
+func addAppliedListing(row fields, repos map[string]appliedRepo, floor int64) {
+	turns := make(map[string]int64)
+	heads := make(map[string]*string)
+	trees := make(map[string]string)
+	for repo, result := range repos {
+		if result.Turn < floor {
+			continue
+		}
+		turns[repo] = result.Turn
+		if result.ResultTree != "" || result.TargetHead != nil {
+			heads[repo] = result.TargetHead
+			trees[repo] = result.ResultTree
+		}
+	}
+	if len(turns) > 0 {
+		row["applied_turn"] = turns
+	}
+	if len(heads) > 0 {
+		row["target_head_at_apply"] = heads
+		row["result_tree"] = trees
+	}
 }

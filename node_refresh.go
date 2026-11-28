@@ -171,9 +171,10 @@ func (r *runner) installRefresh(record stateRecord) (string, error) {
 		return "", err
 	}
 	if base.Request == record.ID {
+		r.activateModuleWork(base)
 		return base.Question, nil
 	}
-	if base.Snapshot == req.Snapshot && base.Source == req.Source {
+	if base.Snapshot == req.Snapshot && base.Source == req.Source && reflect.DeepEqual(base.Work, req.Work) {
 		return "", nil
 	}
 	if r.s.Finished > 0 && r.s.LastCompleted != "" {
@@ -182,7 +183,20 @@ func (r *runner) installRefresh(record stateRecord) (string, error) {
 		}
 	}
 	next := jobBaseline{refreshRequest: req, FromTurn: r.s.Finished + 1, Time: time.Now().UTC(), Request: record.ID}
-	return refreshCheckout(r.ctx, work, next)
+	question, err := refreshCheckout(r.ctx, work, next)
+	if err == nil {
+		r.activateModuleWork(next)
+	}
+	return question, err
+}
+
+func (r *runner) activateModuleWork(base jobBaseline) {
+	if base.Work != nil {
+		r.c.Work = base.Work
+		r.reads.roots = nil
+		r.moduleContextVersion = ""
+		r.refreshModuleNote = r.modulePreamble()
+	}
 }
 
 func refreshCheckout(ctx context.Context, work string, next jobBaseline) (string, error) {
@@ -248,7 +262,9 @@ func refreshCheckout(ctx context.Context, work string, next jobBaseline) (string
 		var report strings.Builder
 		report.WriteString("Baseline refresh has conflicts. How should the job resolve these files?\n")
 		for _, path := range conflicts {
-			fmt.Fprintf(&report, "\n- %q", path)
+			if _, writeErr := fmt.Fprintf(&report, "\n- %q", path); writeErr != nil {
+				return "", writeErr
+			}
 		}
 		next.Question = report.String()
 	}
@@ -370,7 +386,9 @@ func planRefresh(ctx context.Context, src, scratch, result string, old, next Sna
 		_, name, _ := strings.Cut(stage, "\t")
 		if !slices.Contains(p.conflicts, name) {
 			p.conflicts = append(p.conflicts, name)
-			fmt.Fprintf(&info, "0 %s\t%s%c", strings.Repeat("0", len(next.OID)), name, 0)
+			if _, writeErr := fmt.Fprintf(&info, "0 %s\t%s%c", strings.Repeat("0", len(next.OID)), name, 0); writeErr != nil {
+				return applyPlan{}, writeErr
+			}
 		}
 		info.WriteString(stage)
 		info.WriteByte(0)

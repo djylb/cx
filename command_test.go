@@ -322,8 +322,10 @@ func TestCloseReapsGrandchildAfterTimeout(t *testing.T) {
 		}
 	})
 	if waitErr := awaitFixtureCondition(h.ctx, func() (bool, error) {
-		data, readErr := os.ReadFile(filepath.Join(h.root, "p", "tree", "output.log"))
-		return strings.Contains(string(data), "grandchild ready\n"), readErr
+		var log strings.Builder
+		dir := filepath.Join(h.root, "p", "tree")
+		readErr := writeJobLog(&log, dir, 0, status{Engine: "cmd"}, nil)
+		return strings.Contains(log.String(), "grandchild ready\n"), readErr
 	}); waitErr != nil {
 		t.Fatal(waitErr)
 	}

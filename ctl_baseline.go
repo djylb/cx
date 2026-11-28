@@ -124,7 +124,7 @@ func mirrorRefs(ctx context.Context, sid, data string) error {
 	}
 	return nil
 }
-func submitRebase(ctx context.Context, host, dest, result, id string, req rebaseRequest) error {
+func submitRebase(ctx context.Context, host, sourceHost, dest, result, id string, req rebaseRequest) error {
 	dir, err := submissionDir(host, req.Child)
 	if err != nil {
 		return err
@@ -141,7 +141,13 @@ func submitRebase(ctx context.Context, host, dest, result, id string, req rebase
 		if submitErr != nil || done {
 			return submitErr
 		}
-		return queueJob(ctx, queued, true, true)
+		hs, loadErr := loadEndpoints()
+		if loadErr != nil {
+			return loadErr
+		}
+		queued.ClaimSource = &claimAddress{Host: sourceHost, Job: id}
+		queued.OverrideReason = &req.ModuleOverride
+		return queueJob(ctx, hs, queued, true, true, nil)
 	}
 	if !os.IsNotExist(err) {
 		return err
@@ -168,15 +174,17 @@ func submitRebase(ctx context.Context, host, dest, result, id string, req rebase
 		return err
 	}
 	options := slices.DeleteFunc(slices.Clone(origin.JobOptions), func(v string) bool { return v == "--job-tools" })
-	opts, err := parseCtl("run", append([]string{host, origin.Source, req.Child, prompt.Name()}, options...))
+	args := append([]string{host, origin.Source, req.Child, prompt.Name()}, options...)
+	opts, err := parseCtl("run", append(args, origin.ModuleOptions...))
 	if err != nil {
 		return err
 	}
-	input := rebaseInput{key: key, files: attachments}
+	input := rebaseInput{key: key, files: attachments, source: &claimAddress{Host: sourceHost, Job: id}}
 	if req.Host != "" {
 		opts.profile = req.Profile
 		input.carry = result
 	}
+	opts.moduleOverride = req.ModuleOverride
 	opts.noNetwork = !slices.Contains(origin.JobOptions, "--network")
 	opts.noTools = !slices.Contains(origin.JobOptions, "--job-tools")
 	opts.history = origin.History

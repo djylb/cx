@@ -21,6 +21,11 @@ import (
 )
 
 type ctlOptions struct {
+	usage, active                                                                   bool
+	contextWarn, usageTop, usageTurns, usageContext                                 string
+	modules, accept                                                                 []string
+	moduleOverride, changeset, acceptTimeout                                        string
+	noAccept, reads                                                                 bool
 	waitJobsByHost                                                                  map[string][]string
 	env                                                                             map[string]string
 	project, session, tag, cwd, dir, host                                           string
@@ -43,6 +48,8 @@ func ctlFlags(op string, o *ctlOptions) *flag.FlagSet {
 	f := cliFlags(op)
 	cmd := ctlCommands[op]
 	bools := map[string]*bool{
+		"usage": &o.usage, "active": &o.active,
+		"no-accept": &o.noAccept, "reads": &o.reads,
 		"incremental": &o.incremental, "allow-conflicts": &o.allowConflicts,
 		"all": &o.all, "clean-base": &o.cleanBase,
 		"no-session": &o.noSession,
@@ -54,6 +61,8 @@ func ctlFlags(op string, o *ctlOptions) *flag.FlagSet {
 		"messages": &o.messages, "any": &o.any, "wait": &o.wait, "raw": &o.raw, "from-start": &o.fromStart, "latest": &o.latest,
 	}
 	stringsByName := map[string]*string{
+		"context-warn": &o.contextWarn, "usage-top": &o.usageTop, "usage-turns": &o.usageTurns, "usage-context": &o.usageContext,
+		"module-override": &o.moduleOverride, "changeset": &o.changeset, "accept-timeout": &o.acceptTimeout,
 		"type": &o.kind, "mention": &o.mention, "repo": &o.repo,
 		"engine": &o.engine, "model": &o.model, "effort": &o.effort,
 		"sandbox": &o.sandbox, "role": &o.role, "parent": &o.parent,
@@ -137,6 +146,18 @@ func ctlFlags(op string, o *ctlOptions) *flag.FlagSet {
 			})
 		case "set":
 			f.Func(k, ctlFlagHelp(op, k), func(v string) error { o.sets = append(o.sets, v); return nil })
+		case "module", "accept":
+			target := &o.modules
+			if k == "accept" {
+				target = &o.accept
+			}
+			f.Func(k, ctlFlagHelp(op, k), func(v string) error {
+				if strings.TrimSpace(v) == "" {
+					return fmt.Errorf("--%s requires a non-empty value", k)
+				}
+				*target = append(*target, v)
+				return nil
+			})
 		case "own":
 			f.Func(k, ctlFlagHelp(op, k), func(v string) error { o.own = append(o.own, v); return nil })
 		case "image":
@@ -197,7 +218,7 @@ func parseCtl(op string, args []string) (ctlOptions, error) {
 			}
 		}
 	}
-	if hasSeparator && op != "exec" && op != "run" {
+	if hasSeparator && op != "exec" && op != "run" && op != "submit" {
 		return o, errors.New("unexpected argument separator")
 	}
 	e := f.Parse(flags)
@@ -209,6 +230,10 @@ func parseCtl(op string, args []string) (ctlOptions, error) {
 			}
 		case "session":
 			o.explicitSession = true
+		case "module-override", "changeset", "accept-timeout", "context-warn", "usage-top", "usage-turns", "usage-context":
+			if strings.TrimSpace(fl.Value.String()) == "" {
+				e = fmt.Errorf("--%s requires a non-empty value", fl.Name)
+			}
 		case "since-turn":
 			if n, err := strconv.ParseInt(o.sinceTurn, 10, 64); err != nil || n < 1 {
 				e = errors.New("--since-turn requires a positive turn number")
@@ -220,6 +245,9 @@ func parseCtl(op string, args []string) (ctlOptions, error) {
 	}
 	if op != "patch" && o.sinceTurn != "" && o.turn != "" {
 		return o, errors.New("--since-turn and --turn are mutually exclusive")
+	}
+	if o.active && (o.explicitSession || len(o.pos) != 0 || o.changeset != "") {
+		return o, errors.New("--active lists all hosts and sessions and cannot be combined with a job, --session, or --changeset")
 	}
 	if o.all && o.explicitSession {
 		return o, errors.New("--all and --session are mutually exclusive")
@@ -240,14 +268,17 @@ func parseCtl(op string, args []string) (ctlOptions, error) {
 		return o, errors.New("--from-start and --since are mutually exclusive")
 	}
 	if op == "result" {
+		if o.all && (!o.reads || o.turn != "") {
+			return o, errors.New("--all requires --reads without --turn")
+		}
 		var outputModes int
-		for _, enabled := range []bool{o.full, o.json, o.log, o.path} {
+		for _, enabled := range []bool{o.full, o.json, o.log, o.path, o.reads} {
 			if enabled {
 				outputModes++
 			}
 		}
 		if outputModes > 1 {
-			return o, errors.New("--full, --json, --log and --path are mutually exclusive")
+			return o, errors.New("--full, --json, --log, --path and --reads are mutually exclusive")
 		}
 	}
 	if o.max < 0 {
@@ -347,7 +378,7 @@ func controller(ctx context.Context, a []string) error {
 			return ctlUsage(op, err)
 		}
 	}
-	if (op == "ls" || op == "overview" || op == "wait" && o.any) && !o.all && !o.explicitSession {
+	if (op == "ls" || op == "overview" || op == "wait" && o.any) && !o.all && !o.active && !o.explicitSession {
 		o.session = currentSession()
 		if o.session == "" {
 			if op == "wait" {
@@ -363,7 +394,7 @@ func controller(ctx context.Context, a []string) error {
 	switch {
 	case op == "mirror":
 		return mirror(ctx, hs, o)
-	case op == "run" || op == "agent" || op == "snapshot":
+	case op == "run" || op == "submit" || op == "agent" || op == "snapshot":
 		return ctlSubmit(ctx, hs, op, o)
 	case op == "doctor" || op == "ls" || op == "overview":
 		return displayHosts(ctx, hs, op, o)
@@ -436,7 +467,7 @@ func controller(ctx context.Context, a []string) error {
 	case "clean":
 		return cleanControllerJob(ctx, h, name, id)
 	case "refresh":
-		return ctlRefresh(ctx, h, name, id, o)
+		return ctlRefresh(ctx, hs, h, name, id, o)
 	case "rebase":
 		return ctlRebase(ctx, h, name, id, o)
 	case "result", "patch", "apply":
@@ -684,11 +715,11 @@ func preview(b []byte, o ctlOptions) error {
 	return e
 }
 func cursorFile(parts ...string) (string, error) {
-	home, e := os.UserHomeDir()
+	home, e := controllerCacheRoot()
 	if e != nil {
 		return "", e
 	}
-	p := filepath.Join(home, ".cache", "cx", "cursors")
+	p := filepath.Join(home, "cursors")
 	for _, part := range parts {
 		p, e = jobPath(p, part)
 		if e != nil {

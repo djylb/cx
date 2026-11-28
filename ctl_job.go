@@ -82,7 +82,7 @@ func startNodeJob(ctx context.Context, raw string) error {
 		env = map[string]string{}
 	}
 	env["CX_PARENT"] = req.Host + ":" + req.ID
-	if len(req.Context) > 0 {
+	if len(req.Context) > 0 || len(req.Modules) > 0 {
 		d := filepath.Join(work, "context")
 		for key, b := range req.Context {
 			if !snapPath(key) {
@@ -93,10 +93,16 @@ func startNodeJob(ctx context.Context, raw string) error {
 				return e
 			}
 		}
+		if e = os.MkdirAll(d, 0700); e != nil {
+			return e
+		}
 		env["CX_CONTEXT"] = d
 	}
 	argv := []string{"start", "--job", req.ID, "--dir", prep.Source, "--session", req.Session, "--job-host", req.Host}
 	argv = append(argv, req.Options...)
+	if req.hasModuleWork() {
+		argv = append(argv, "--module-work-file", receipt)
+	}
 	for i := range argv {
 		if argv[i] == "--input-json" && i+1 < len(argv) {
 			path := filepath.Join(work, "start-input.json")
@@ -272,18 +278,24 @@ func ctlRestart(ctx context.Context, op string, o ctlOptions) error {
 			return e
 		}
 	}
+	source := claimAddress{Host: host, Job: id}
+	target := source
+	child := o.child
+	if op == "fork" {
+		if p, _, ok := strings.Cut(id, "/"); ok {
+			child = p + "/" + child
+		}
+		target.Job = child
+	}
 	argv := []string{"restart-job", op, host, id, o.child, o.through, o.profile, session}
-	r, e := h.invoke(ctx, 20*time.Second, false, argv...)
+	r, e := withRestartClaim(ctx, hs, h, source, target, o.moduleOverride, func(info jobClaimInfo) (reply, error) {
+		return h.invoke(ctx, 20*time.Second, false, append(argv, info.wire())...)
+	})
 	if e != nil {
 		return e
 	}
 	if r.code != 0 || op == "resume" {
 		return r.output()
-	}
-	p, _, ok := strings.Cut(id, "/")
-	child := o.child
-	if ok {
-		child = p + "/" + child
 	}
 	if e = rememberRoute(child, host); e != nil {
 		return e
@@ -291,7 +303,7 @@ func ctlRestart(ctx context.Context, op string, o ctlOptions) error {
 	fmt.Println(host + ":" + child)
 	return nil
 }
-func restartNode(ctx context.Context, a []string, expected *jobIdentity, out io.Writer) error {
+func restartNode(ctx context.Context, a []string, expected *jobIdentity, out io.Writer, binding ...jobClaimInfo) error {
 	if len(a) != 7 {
 		return errors.New("invalid restart arguments")
 	}
@@ -319,6 +331,20 @@ func restartNode(ctx context.Context, a []string, expected *jobIdentity, out io.
 	identity, s, _, e := captureJobIdentity(dir)
 	if e != nil {
 		return e
+	}
+	if len(binding) != 0 && (binding[0].RunID != identity.run || binding[0].Directory != identity.key) {
+		return errJobReplaced
+	}
+	if op == "resume" && activeClaimState(s.State) {
+		if _, e = projectJobStatus(ctx, dir, &s, identity); e != nil {
+			return e
+		}
+		if activeClaimState(s.State) {
+			return json.NewEncoder(out).Encode(s.view(statusTime(ctx)))
+		}
+	}
+	if len(binding) != 0 && binding[0].ActiveOnly {
+		return errors.New("job ended during active resume; retry the command")
 	}
 	if expected != nil {
 		if *expected != identity {
@@ -350,6 +376,18 @@ func restartNode(ctx context.Context, a []string, expected *jobIdentity, out io.
 	}
 	if e = identity.check(dir, s); e != nil {
 		return e
+	}
+	if len(binding) != 0 {
+		if op == "resume" && activeClaimState(s.State) {
+			return json.NewEncoder(out).Encode(s.view(statusTime(ctx)))
+		}
+		if e = binding[0].check(dir, s); e != nil {
+			return e
+		}
+		saved, prep, e = readRestartInputs(ctx, dir, work, s, expected != nil)
+		if e != nil {
+			return e
+		}
 	}
 
 	if expected != nil && !isTerminal(s.State) {
@@ -420,10 +458,16 @@ func restartNode(ctx context.Context, a []string, expected *jobIdentity, out io.
 	if profile != "" {
 		argv = append(argv, "--profile", profile)
 	}
+	if len(binding) != 0 {
+		argv = append([]string{argv[0], "--expect-baseline", binding[0].Baseline}, argv[1:]...)
+		if binding[0].Override != "" {
+			argv = append([]string{argv[0], "--claim-override", binding[0].Override}, argv[1:]...)
+		}
+	}
 	return launchRunner(ctx, root, dir, work, argv, env, identity, bound, unlock, out)
 }
 
-func continueNode(ctx context.Context, host, id, text, profile string) error {
+func continueNode(ctx context.Context, host, id, text, profile string, binding ...jobClaimInfo) error {
 	root, e := stateRoot()
 	if e != nil {
 		return e
@@ -439,7 +483,7 @@ func continueNode(ctx context.Context, host, id, text, profile string) error {
 	if e = checkResumeProfile(root, s.Profile, profile); e != nil {
 		return e
 	}
-	return nodeAction(ctx, []string{"say", id, host, "--cx-text", text})
+	return nodeAction(ctx, []string{"say", id, host, "--cx-text", text}, binding...)
 }
 
 // readRestartInputs checks the saved thread and workspace used by automatic

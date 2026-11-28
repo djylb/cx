@@ -98,8 +98,8 @@ func TestWindowsPsmuxReapsExactJobWindow(t *testing.T) {
 	if run.Mux == nil || run.Mux.Session != session || run.Mux.Socket != socket {
 		t.Fatalf("wrong launch target: %+v", run.Mux)
 	}
-	if windows, err := list(); err != nil || !slices.Contains(windows, run.Mux.Name) {
-		t.Fatalf("running window missing: %v, %v", windows, err)
+	if names, err := list(); err != nil || !slices.Contains(names, run.Mux.Name) {
+		t.Fatalf("running window missing: %v, %v", names, err)
 	}
 	if err := os.WriteFile(filepath.Join(h.work, "parent-gone"), nil, 0600); err != nil {
 		t.Fatal(err)

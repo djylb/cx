@@ -15,7 +15,8 @@ type ctlCommand struct {
 }
 
 const submissionSessionFlags = "session no-session"
-const submitFlags = "project profile engine model effort sandbox own role parent snapshot with-history input-json image idle-exit turn-timeout approval-timeout stall queue-timeout inplace interactive web-search hard network no-network force sync no-tools clean-base context " + submissionSessionFlags
+const submitFlags = "project profile engine model effort sandbox own role parent snapshot with-history input-json image idle-exit turn-timeout approval-timeout stall queue-timeout inplace interactive web-search hard network no-network force sync no-tools clean-base context context-warn module module-override changeset accept accept-timeout no-accept " + submissionSessionFlags
+const runFlags = submitFlags + " batch cmd reuse timeout quiet-timeout json"
 const projectInitUsage = "NAME --repo DIR [DIR ...] [--include REPO:PATH ...] [--default-host HOST]"
 
 var ctlCommands = map[string]ctlCommand{
@@ -36,7 +37,7 @@ var ctlCommands = map[string]ctlCommand{
 	"doctor":       {"[HOST ...]", "Check execution hosts.", "json"},
 	"events":       {"JOB", "Read recorded events.", ""},
 	"exec":         {"HOST [options] -- ARGV...\n  cx exec HOST --script FILE [--shell SHELL] [options]", "Submit a command job.", "project tag cwd timeout quiet-timeout queue-timeout wait script shell reuse env profile " + submissionSessionFlags},
-	"fork":         {"JOB --job CHILD [--through TURN] [--profile NAME]", "Fork an agent thread on its current host.", "job through profile " + submissionSessionFlags},
+	"fork":         {"JOB --job CHILD [--through TURN] [--profile NAME]", "Fork an agent thread on its current host.", "job through profile module-override " + submissionSessionFlags},
 	"gate":         {"DIR [GATE-ARGS ...]", "Run the source directory's scripts/gate.sh.", ""},
 	"history":      {"JOB [read|turns|items]", "Read agent thread history.", ""},
 	"host":         {"HOST", "Read or update node configuration.", "set"},
@@ -44,7 +45,7 @@ var ctlCommands = map[string]ctlCommand{
 	"context":      {"push HOST", "Copy this controller's context layers to HOST for a manager running there.", ""},
 	"interrupt":    {"JOB", "Stop an active turn or command.", ""},
 	"limits":       {"JOB", "Read the engine account's rate limits.", ""},
-	"ls":           {"[JOB]", "List jobs.", "brief json watch interval project session role all all-hosts max-bytes"},
+	"ls":           {"[JOB]", "List jobs.", "active brief json watch interval project session role module changeset usage usage-top usage-turns usage-context all all-hosts max-bytes"},
 	"mcp":          {"JOB list|reload|login|resource|call", "Call an engine MCP operation.", ""},
 	"mirror":       {"[DIR | --project PROJECT]", "Publish a source baseline.", "project"},
 	"models":       {"JOB", "List the engine's available models.", ""},
@@ -57,15 +58,16 @@ var ctlCommands = map[string]ctlCommand{
 	"project-init": {projectInitUsage, "Initialize a project.", ""},
 	"project-ls":   {"", "List configured projects.", ""},
 	"project-show": {"NAME", "Print project configuration.", ""},
-	"refresh":      {"JOB [DIR]", "Refresh a snapshot job before its next turn.", ""},
-	"rebase":       {"JOB TEXT", "Submit a follow-up on a fresh baseline or carry changes to another host.", "turn host profile " + submissionSessionFlags},
+	"refresh":      {"JOB [DIR]", "Refresh a snapshot job before its next turn.", "module-override"},
+	"rebase":       {"JOB TEXT", "Submit a follow-up on a fresh baseline or carry changes to another host.", "turn host profile module-override " + submissionSessionFlags},
 	"reply":        {"JOB [--request ID] (--result JSON|@FILE | --error JSON|@FILE)", "Reply to a pending engine request.", ""},
 	"requests":     {"JOB", "List pending engine requests.", ""},
-	"result":       {"JOB", "Collect a sealed turn and show its report, path, metadata, or log.", "turn full json log path wait timeout refresh max-bytes"},
-	"resume":       {"JOB [--profile NAME]", "Restart a recoverable agent job.", "profile"},
+	"result":       {"JOB", "Collect a sealed turn and show its report, path, metadata, or log.", "turn full json log reads all path wait timeout refresh max-bytes"},
+	"resume":       {"JOB [--profile NAME]", "Restart a recoverable agent job.", "profile module-override"},
 	"review":       {"JOB --target JSON|@FILE", "Start an engine review.", ""},
 	"rpc":          {"JOB METHOD", "Invoke an engine RPC method.", ""},
-	"run":          {"HOST DIR TAG PROMPTFILE [options]\n  cx run HOST DIR TAG --cmd [options] -- ARGV...\n  cx run HOST DIR --batch FILE [options]", "Submit an agent or command job.", submitFlags + " batch cmd reuse timeout quiet-timeout"},
+	"run":          {"HOST DIR TAG PROMPTFILE [options]\n  cx run HOST DIR TAG --cmd [options] -- ARGV...\n  cx run HOST DIR --batch FILE [options]", "Submit an agent or command job.", runFlags},
+	"submit":       {"HOST DIR TAG PROMPTFILE [options]\n  cx submit HOST DIR TAG --cmd [options] -- ARGV...\n  cx submit HOST DIR --batch FILE [options]", "Submit a job using run syntax.", runFlags},
 	"say":          {"JOB [TEXT|@FILE]", "Send input or a reply to a job.", ""},
 	"settings":     {"JOB --scope turn|thread [--model MODEL] [--effort EFFORT]", "Update agent turn or thread settings.", ""},
 	"setup":        {"HOST", "Install or update cx on an execution host.", ""},
@@ -149,16 +151,16 @@ func printCtlHelp(w io.Writer, op string) {
 		_, _ = fmt.Fprintln(w, "\nJOB accepts [HOST:]PROJECT/TAG or TAG in the current project.")
 	}
 	switch op {
-	case "snapshot", "run", "agent":
+	case "snapshot", "run", "submit", "agent":
 		_, _ = fmt.Fprintln(w, "\nPut repositories that should be mounted together in one project with cx project init. A member's snapshot includes all project repositories and any discovered Go workspace repositories.")
 	}
 	switch op {
-	case "adopt", "wait", "run", "agent", "exec", "fork", "rebase", "ls", "overview":
+	case "adopt", "wait", "run", "submit", "agent", "exec", "fork", "rebase", "ls", "overview":
 		_, _ = fmt.Fprintf(w, "\nSession precedence is %s, %s.\n", sessionEnv, strings.Join(toolSessionEnv[:], ", "))
 		_, _ = fmt.Fprintln(w, "  Claude Code, Codex and OpenCode are detected when they export these variables. Set CX_SESSION in other environments.")
 	}
 	switch op {
-	case "run", "agent", "exec", "fork", "rebase":
+	case "run", "submit", "agent", "exec", "fork", "rebase":
 		_, _ = fmt.Fprintln(w, "  New jobs require a session. Set CX_SESSION, pass --session NAME, or opt out with --no-session.")
 	case "adopt":
 		_, _ = fmt.Fprintln(w, "  Omit --session to adopt into the detected session.")
@@ -197,10 +199,10 @@ func printCtlHelp(w io.Writer, op string) {
 		_, _ = fmt.Fprintln(w, "  124 observation timeout\n  130 observation canceled")
 		_, _ = fmt.Fprintln(w, "  Command jobs can return the command's exit code.")
 	case "agent":
-		_, _ = fmt.Fprintf(w, "  1 failed turn\n  6 waiting for input\n  7 duplicate job\n  9 transport failure\n  %d admission blocked (JSON with status=queued and queue_reason)\n  44 result unavailable\n  124 observation timeout\n", exitQueued)
+		_, _ = fmt.Fprintf(w, "  1 failed turn\n  6 waiting for input\n  7 duplicate job\n  9 transport failure\n  %d admission blocked (JSON with status=queued and queue_reason)\n  15 module conflict\n  44 result unavailable\n  124 observation timeout\n", exitQueued)
 		_, _ = fmt.Fprintln(w, "  Check stdout JSON status=queued to identify an admission block.")
-	case "run":
-		_, _ = fmt.Fprintln(w, "  7 duplicate job\n  9 transport failure")
+	case "run", "submit":
+		_, _ = fmt.Fprintln(w, "  7 duplicate job\n  9 transport failure\n  15 module conflict")
 	case "refresh":
 		_, _ = fmt.Fprintln(w, "  9 transport failure\n  11 job registration not found")
 	case "result", "patch", "apply", "rebase":
@@ -231,6 +233,19 @@ func printCtlHelp(w io.Writer, op string) {
 }
 
 var ctlFlagDescriptions = map[string]string{
+	"context-warn":    "advise at context percentage `N` (default 60, 0 disables)",
+	"usage":           "rank token usage by project, job and role",
+	"usage-top":       "show the top `N` entries per usage group (default 10)",
+	"usage-turns":     "flag jobs with at least `N` completed turns (default 4)",
+	"usage-context":   "flag jobs at or above context percentage `N` (default 50)",
+	"module":          "select module `NAME` (repeatable)",
+	"module-override": "allow an overlapping module claim and record `REASON`",
+	"changeset":       "select changeset `ID`",
+	"accept":          "run shell `COMMAND` after each agent turn (repeatable)",
+	"accept-timeout":  "timeout per acceptance command (`DURATION`, default 20m)",
+	"no-accept":       "skip acceptance commands",
+	"reads":           "show best-effort paths read during the selected turn",
+
 	"since-turn":      "start at turn `N` (1 for cumulative)",
 	"incremental":     "show changes since the preceding sealed turn",
 	"allow-conflicts": "write merge results with conflicts and exit nonzero",
@@ -271,6 +286,8 @@ var ctlFlagDescriptions = map[string]string{
 
 func ctlFlagHelp(op, key string) string {
 	switch key {
+	case "active":
+		return "list running, queued, submitting and waiting jobs across all hosts and sessions"
 	case "from-start":
 		if op == "wait" {
 			return "replay retained turn completions and pending events for a new --any cursor"
@@ -283,7 +300,7 @@ func ctlFlagHelp(op, key string) string {
 		switch op {
 		case "wait":
 			return "select `PROJECT` (repeatable with --any)"
-		case "snapshot", "run", "agent":
+		case "snapshot", "run", "submit", "agent":
 			return "select `PROJECT` (otherwise use CX_PROJECT or match DIR to a project member)"
 		}
 	case "path":

@@ -254,7 +254,7 @@ func seedWaitBaseline(ctx context.Context, root, session string, fromStart bool)
 		if session != "" && s.Session != session {
 			return true, false, nil
 		}
-		cursor := waitCursor{DirKey: observer.identity.key, RunID: s.RunID, StateCursor: observer.cursor.String(), Finished: s.Finished, QueueGeneration: s.QueueGeneration}
+		cursor := waitCursor{DirKey: observer.identity.key, RunID: s.RunID, StateCursor: observer.cursor.String(), Finished: completedResultCount(s), QueueGeneration: s.QueueGeneration}
 		if s.State == "waiting_input" {
 			cursor.Question = questionKey(s)
 		}
@@ -452,7 +452,7 @@ func selectWaitAny(ctx context.Context, root string, projects []string, session 
 				}
 				if baseline != nil {
 					// Snapshots after a seed can still carry earlier completions.
-					finished := max(observer.s.Finished, before.Finished)
+					finished := max(completedResultCount(observer.s), before.Finished)
 					if !replacedRun(before.RunID, observer.s.RunID) && from != nil && *from == observer.tail.Cursor() {
 						finished = before.Finished
 						observer.watchWithdrawals = true
@@ -488,7 +488,7 @@ func selectWaitAny(ctx context.Context, root string, projects []string, session 
 					return true, false, startErr
 				}
 				s = job.s
-				job.floor = waitFloor{s.RunID, s.Finished, busy}
+				job.floor = waitFloor{s.RunID, completedResultCount(s), busy}
 				job.started = true
 				job.outbox = 0
 				var from stateCursor
@@ -614,7 +614,7 @@ func waitEvent(s status, before waitCursor, anchor, cursor stateCursor, outbox u
 		report.Code, report.QueueReason = exitQueued, s.QueueReason
 		return report, next
 	}
-	blocked := floor.busy && s.Finished <= floor.finished
+	blocked := floor.busy && completedResultCount(s) <= floor.finished
 	if s.State == "waiting_input" && (!blocked || s.InputKind != "next_turn") {
 		key := questionKey(s)
 		if key != before.Question {

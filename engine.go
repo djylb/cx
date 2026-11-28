@@ -260,11 +260,13 @@ func (c *config) checkEngineOptions(e engineSpec, o options, explicitApproval bo
 		return e.unsupported("network isolation for workspace-write (pass --network)")
 	}
 	if o.input != "" || len(o.images) > 0 {
-		parts, err := o.inputs("")
+		parts, err := o.inputParts("")
 		if err != nil {
 			return err
 		}
-		return e.checkInput(parts)
+		if len(parts) != 0 {
+			return e.checkInput(parts)
+		}
 	}
 	return nil
 }

@@ -24,6 +24,7 @@ import (
 
 const sshConnect = 90 * time.Second
 const wireReady = "cx-wire: ready\n"
+const wireHopReady = "cx-wire: hop-ready\n"
 const wireProgress = "cx-wire: receiving\n"
 
 var unsupportedMaster atomic.Bool
@@ -181,21 +182,24 @@ type progressWriter struct {
 	dst      io.Writer
 	activity chan<- struct{}
 	active   *atomic.Bool
+	final    *atomic.Bool
 	tail     string
 	stderr   bool
 }
 
 func (w *progressWriter) Write(p []byte) (int, error) {
-	if !w.active.Load() {
-		if !w.stderr {
-			w.active.Store(true)
-		} else {
-			part := w.tail + string(p)
-			if strings.Contains(part, wireReady) {
-				w.active.Store(true)
-			}
-			w.tail = part[max(0, len(part)-len(wireReady)):]
+	if !w.stderr {
+		w.active.Store(true)
+		w.final.Store(true)
+	} else {
+		part := w.tail + string(p)
+		if strings.Contains(part, wireReady) {
+			w.final.Store(true)
 		}
+		if strings.Contains(part, wireReady) || strings.Contains(part, wireHopReady) {
+			w.active.Store(true)
+		}
+		w.tail = part[max(0, len(part)-max(len(wireReady), len(wireHopReady))):]
 	}
 	if w.active.Load() {
 		select {
@@ -209,18 +213,13 @@ func (w *progressWriter) Write(p []byte) (int, error) {
 var errWireSilence = fmt.Errorf("wire silence: %w", context.DeadlineExceeded)
 var errSSHMasterUnsupported = fmt.Errorf("%w: SSH multiplexing unsupported", ctlExit(9))
 
-func runActive(cmd *exec.Cmd, cancel context.CancelFunc, connect, idle time.Duration, out, diag io.Writer) error {
-	_, e := runWithActivity(context.Background(), cmd, cancel, connect, idle, out, diag)
-	return e
-}
-
 // Acknowledgement or output switches from the connection clock to the
 // silence clock. Only those clocks can produce errWireSilence.
-func runWithActivity(ctx context.Context, cmd *exec.Cmd, cancel context.CancelFunc, connect, idle time.Duration, out, diag io.Writer) (ready bool, err error) {
+func runWithActivity(ctx context.Context, cmd *exec.Cmd, cancel context.CancelFunc, connect, idle time.Duration, out, diag io.Writer, onReady func()) (ready bool, err error) {
 	activity := make(chan struct{}, 1)
-	var active atomic.Bool
-	cmd.Stdout = &progressWriter{dst: out, activity: activity, active: &active}
-	cmd.Stderr = &progressWriter{dst: diag, activity: activity, active: &active, stderr: true}
+	var active, final atomic.Bool
+	cmd.Stdout = &progressWriter{dst: out, activity: activity, active: &active, final: &final}
+	cmd.Stderr = &progressWriter{dst: diag, activity: activity, active: &active, final: &final, stderr: true}
 	cmd.WaitDelay = time.Second
 	if e := cmd.Start(); e != nil {
 		return false, e
@@ -229,25 +228,36 @@ func runWithActivity(ctx context.Context, cmd *exec.Cmd, cancel context.CancelFu
 	go func() { done <- processWait{cmd.Wait()} }()
 	timer := timeshim.NewTimer(timeshim.Or(contextClock(ctx)), connect)
 	defer timer.Stop()
+	announce := func() {
+		if onReady != nil && final.Load() {
+			onReady()
+			onReady = nil
+		}
+	}
+	defer announce()
+	progress := func() {
+		announce()
+		timer.Reset(idle)
+	}
 	for {
 		select {
 		case waited := <-done:
 			if e := ctx.Err(); e != nil {
-				return active.Load(), e
+				return final.Load(), e
 			}
-			return active.Load(), waited.err
+			return final.Load(), waited.err
 		case <-ctx.Done():
 			cancel()
 			<-done
-			return active.Load(), ctx.Err()
+			return final.Load(), ctx.Err()
 		case <-activity:
-			timer.Reset(idle)
+			progress()
 		case <-timer.C:
 			select {
 			case waited := <-done:
-				return active.Load(), waited.err
+				return final.Load(), waited.err
 			case <-activity:
-				timer.Reset(idle)
+				progress()
 				continue
 			default:
 			}
@@ -255,22 +265,35 @@ func runWithActivity(ctx context.Context, cmd *exec.Cmd, cancel context.CancelFu
 			cancel()
 			<-done
 			if cause != nil {
-				return active.Load(), cause
+				return final.Load(), cause
 			}
-			return active.Load(), errWireSilence
+			return final.Load(), errWireSilence
 		}
 	}
 }
 
 type transportProcess struct {
+	host   string
+	remote bool
 	*exec.Cmd
 	ctx           context.Context
 	master        sshMaster
 	connect, idle time.Duration
+	onReady       func()
 }
 
-func (p *transportProcess) run(ctx context.Context, cancel context.CancelFunc, out io.Writer, diag *bytes.Buffer) error {
-	ready, e := runWithActivity(p.ctx, p.Cmd, cancel, p.connect, p.idle, out, diag)
+func (p *transportProcess) run(ctx context.Context, cancel context.CancelFunc, out io.Writer, diag *bytes.Buffer) (outcome error) {
+	ready, e := runWithActivity(p.ctx, p.Cmd, cancel, p.connect, p.idle, out, diag, func() {
+		p.noteTransport(true, nil)
+		if p.onReady != nil {
+			p.onReady()
+		}
+	})
+	defer func() {
+		if ready || outcome != nil {
+			p.noteTransport(ready, outcome)
+		}
+	}()
 	if cause := ctx.Err(); cause != nil {
 		return cause
 	}
@@ -305,6 +328,7 @@ func (h endpoint) connectionBudget(idle time.Duration) time.Duration {
 }
 func cleanDiag(b []byte) string {
 	s := strings.ReplaceAll(string(b), wireReady, "")
+	s = strings.ReplaceAll(s, wireHopReady, "")
 	return strings.ReplaceAll(s, wireProgress, "")
 }
 func (h endpoint) rawSSH(ctx context.Context, program string, args []string, stdin string, idle time.Duration) ([]byte, error) {
@@ -315,7 +339,8 @@ func (h endpoint) rawSSH(ctx context.Context, program string, args []string, std
 			return nil, e
 		}
 		c, stop := context.WithCancel(ctx)
-		cmd := transportProcess{exec.CommandContext(c, program, append(opts, args...)...), c, master, sshConnect, idle}
+		cmd := transportProcess{Cmd: exec.CommandContext(c, program, append(opts, args...)...), ctx: c, master: master,
+			connect: sshConnect, idle: idle, host: h.name, remote: true}
 		cmd.Stdin = strings.NewReader(stdin)
 		var b, diag bytes.Buffer
 		e = cmd.run(ctx, stop, &b, &diag)

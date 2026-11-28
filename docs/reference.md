@@ -53,6 +53,69 @@ Run `cx refresh JOB [DIR]` from the submitting controller to freeze a new baseli
 `cx ls` shows the current snapshot ID and its activation time. Sealed results keep their original baselines. New results use the refreshed snapshot, and the applied-turn tracker starts empty for that baseline. Turn numbers continue to increase.
 
 
+### Module configuration
+
+Set these optional top-level fields in `$XDG_CONFIG_HOME/cx/projects/NAME.toml`. The default location is `~/.config/cx/projects/NAME.toml`. cx reads the module table for submissions with `--module` and when refreshing a job with declared modules.
+
+| Field | Meaning |
+| --- | --- |
+| `modules_file` | Preferred source. Read a repository-relative JSON file from the frozen snapshot. |
+| `modules_cmd` | Alternative executable and argument array. It runs in a private snapshot checkout with a minimal environment. Choose one module table source. |
+| `modules_output_bytes` | Module table byte budget. Defaults to 1 MiB. |
+| `context_output_bytes` | Byte budget for each context package. Defaults to 1 MiB. Truncated packages carry a notice. |
+| `modules_repo` | Snapshot repository path or unique repository directory name where the command runs. Defaults to the first configured repository present in the snapshot, or the source repository if the snapshot uses a standalone layout. |
+
+```toml
+modules_file = "tools/modules.json"
+modules_repo = "app"
+```
+
+```json
+{
+  "modules": [
+    {
+      "name": "api",
+      "paths": ["internal/api/**"],
+      "deps": ["shared"],
+      "context": ["./tools/context", "api"],
+      "accept": [["go", "test", "./internal/api/..."]],
+      "hotspot": true
+    },
+    {
+      "name": "shared",
+      "paths": ["internal/shared/**"]
+    }
+  ],
+  "hotspots": ["go.mod", "go.sum", "**/*_gen.go"]
+}
+```
+
+`modules` and `hotspots` are optional. Each module has a unique, filesystem-safe `name`. Its other fields are optional. Paths are relative to the configured repository and use forward slashes. Literal paths cover that path and its descendants, glob characters match within a path segment, and a `**` segment matches zero or more segments. Claim conflicts use the literal directory prefix of a glob. `deps` names direct dependencies. `"hotspot": true` in the JSON module record flags the module during dispatch. Project apply operations are serialized within the applying controller’s `CX_HOME` and `cx apply` prints files matching the table's `hotspots`.
+
+| Option | Meaning |
+| --- | --- |
+| `run`, `submit`, `agent --module NAME` | Claim a module. Repeat to claim more. With no configured module table, use a literal repository-relative path prefix. A named module table requires a snapshot-backed job. |
+| `--module-override REASON` | Allow overlapping claims and record the reason in the job input and submission log. |
+| `--changeset ID` | Record a changeset, export it as `CX_CHANGESET`, and add the Git trailer instruction `Changeset: ID` to the agent's first prompt. |
+| `--accept COMMAND` | Run a shell command from the agent's working directory after each agent turn. Repeat to add checks after the module's checks. |
+| `--accept-timeout DURATION` | Limit each acceptance command. Defaults to 20m. |
+| `--no-accept` | Skip the module and explicit acceptance commands. |
+| `ls --module NAME`, `ls --changeset ID` | Filter jobs by a declared module or exact changeset ID. Multiple module names match any supplied name. Use `--all` to search all sessions. |
+| `result --reads [--all]` | Print the selected turn’s read record as JSON or retained read history as JSON lines. |
+| `run --json`, `submit --json` | Print the job address and `claims_unchecked` host list. |
+
+`cx submit` takes the same arguments as `cx run`. Before dispatch, cx compares the requested scope with current writable jobs on reachable hosts. Overlap returns exit 15 and lists the jobs. Use `--module-override REASON` to proceed and record the reason. Direct dependencies with active writers get a separate advisory. Path overlap is scoped to a project and repository, with approximate case folding for Windows and Darwin. When a host cannot be checked, dispatch warns and includes that host in `claims_unchecked` with `--json`.
+
+The check is advisory. Concurrent submissions can both pass, and an asynchronous submission is visible to the scan once the node registers it. Resume excludes the same run. Fork and rebase name an active source and suggest closing it first. Automatic continuation and refresh also check scope. A refresh pins its definitions to the new effective baseline. Earlier turns retain their original definitions.
+
+The node runs context generators in private snapshot checkouts with a 5m limit per command. Successful stdout is published as a set under `$CX_CONTEXT/modules/<baseline-version>/NAME.md`. The prompt lists the declarations, dependencies, paths and any failures, and the resulting turn references that version. The commands run as the node execution account. `modules_cmd` runs project code as the controller account in a private snapshot checkout with a minimal environment and a timeout.
+
+After a round seals, the node starts acceptance asynchronously in a disposable checkout of its baseline with the sealed patch and declared artifacts. Module checks run from their repository and explicit checks run from the job's working directory within the disposable checkout. The next agent turn can proceed while acceptance runs. `cx result --json` reports `acceptance` as `none`, `pending`, `passed`, `failed`, `interrupted`, or `unknown`. When available, `acceptance_checks` includes each command, exit code, duration in milliseconds, output tail and truncation indicator. Acceptance results arrive separately from the immutable result archive. An `acceptance` outbox event also reports the final status. For an in-place job without a sealed snapshot baseline, acceptance reports `unknown`.
+
+`cx apply` stages patches and reports matching hotspot paths. Global hotspots also apply to jobs with no declared modules. `cx ls --changeset ID --json` reads the applying controller’s application facts, with the operation, turn, role, physical target identity, HEAD at application and resulting index tree. An unborn target branch has a null HEAD. The optional `node` field carries live state. Find final commits using the `Changeset: ID` trailer.
+
+Read paths are best-effort. Completed structured engine events take priority. Successful recognizable commands contribute literal operands. Each entry carries `source` (`structured` or `parsed`). `cx result JOB --reads` reads the selected turn and `--reads --all` lists retained turns. Both support the result observation deadline. A missing or damaged read record appears as `unavailable` in `reads_status` or the read projection.
+
 ## Node state
 
 The default state root is `~/.local/share/cx/state` on Unix and `%LOCALAPPDATA%\cx\state` on Windows. Set `CXRUN_STATE` to override it. Direct node operations that accept `--state PATH` can select it per call.
@@ -77,7 +140,28 @@ Use cx to query and manage state. For direct access on an execution host, use `c
 
 ## List jobs
 
-`cx ls` shows job status for the current session. Use `--all` for all sessions or `--session ID` to select one. When a host is unreachable, cx uses its last successful listing from `~/.cache/cx/ls/<host>.json` and shows the snapshot time. With `--json`, cached job rows include `host`, `stale: true`, and `as_of` in UTC. A one-shot listing exits with code 1 if any host query fails, even when cached rows are available.
+`cx ls` shows job status for the current session. Use `--all` for all sessions or `--session ID` to select one. `cx ls --active --brief` lists running, queued, submitting, and waiting jobs across all configured hosts and sessions. Add `--json` for the same selection in JSON. When a host is unreachable, cx uses its last successful listing from the controller cache and shows the snapshot time. With `--json`, cached job rows include `host`, `stale: true`, and `as_of` in UTC. A one-shot listing exits with code 1 if any host query fails, even when cached rows are available.
+
+### Context and token usage
+
+Use `cx ls --usage` for top token consumers by project, job and role. The default limit is 10 per group. Set `--usage-top N` to change it. The view also lists jobs with at least four completed turns and context at or above 50%. Adjust these with `--usage-turns N` and `--usage-context N`. The same session, project, module and role filters apply. Add `--json` for the ranked groups and `high_context_jobs`.
+
+The full `ls` table, usage view and sealed results show cached input, fresh input, and output tokens when reported by the engine. Fresh input is input minus cache hits. Listing JSON uses `cached_tokens`, `fresh_input_tokens`, `output_tokens` and `tokens` (total). Results bind a measurement to the engine turn and keep the latest known cumulative job counters separately. A null value identifies an unavailable measurement. Usage rankings show the number of known samples for each metric.
+
+At turn completion, a job with context usage at or above the configured threshold records a `context_warning` in its result and its outbox to `parent`. In order, it suggests continuing, compacting in place and continuing in the same job (recommended), or writing a handoff summary and starting a new job only when the task changes. The default is 60%, and `run`, `submit` and `agent --context-warn N` select a per-job threshold. Set it to 0 to disable the advisory. Context percentages are available when the engine reports both current use and its context window.
+
+Set controller defaults in `$XDG_CONFIG_HOME/cx/usage.toml`. The default location is `~/.config/cx/usage.toml`.
+
+```toml
+context_warn = 60
+usage_top = 10
+usage_turns = 4
+usage_context = 50
+```
+
+### Transport history
+
+The controller records host disconnects and reconnects in `transport/HOST.log` under the controller cache (`$CX_HOME`, or the user cache directory's `cx` folder). Each UTC record includes the host and reason. A reconnect records the elapsed outage in milliseconds. Each file is capped at 256 KiB and the controller keeps one previous file. `cx doctor HOST` shows the last ten records in `recent_transport`, including when the node is unreachable.
 
 ## Engine capabilities
 
@@ -151,6 +235,7 @@ When a host disconnects, cx reports the outage on stderr and backs off independe
 | `CX_PROJECT`, `XDG_CONFIG_HOME` | Select a project explicitly or relocate the projects configuration directory. Project membership and source directory supply the fallback name. |
 | `CX_SESSION` | Explicit session label for submissions and observation. |
 | `CX_PARENT` | Default parent job or session for a submission. Use `--parent` to override it. |
+| `CX_CHANGESET` | Changeset ID exported to the job's agent and commands when submitted with `--changeset`. |
 | `CX_DEFAULT_HOST`, `CX_HOSTS` | Automatic submission host override and comma-separated host selection for multi-host views and waits. |
 | `CX_CONTEXT_DIR`, `CX_POLICY_DIR` | Override project context and policy template directories. Context merges the shared `context/` next to the projects directory with `PROJECT/context/` (project wins); the job gets its copy at `$CX_CONTEXT`, and a `MEMORY.md` there is named in the preamble.  Host notes come from `hosts/HOST/context/` beside it, under `host/`; `--context` selects layers. |
 | `CX_SNAPSHOT_STORE`, `CX_HOME` | Override the local snapshot store and the base directory for collected results and the apply log, respectively. |
@@ -186,5 +271,6 @@ Read `cx COMMAND --help` for the codes relevant to an operation. `cx node states
 | 11 | Node observation did not find a registered job. |
 | 12 | Result download in progress. Retry or use `result --wait`. |
 | 13 | Admission notice when stdout is JSON with `status: "queued"`. The job remains queued. |
+| 15 | An active job holds an overlapping module claim. |
 | 44 | Result or required sealed turn unavailable. The reason is printed to stderr. |
 | 124 / 130 | Observation timed out or was canceled. |

@@ -146,6 +146,8 @@ func removeUnpublishedWorktree(mirror snapGit, dst string) error {
 	return nil
 }
 
+const snapshotCheckoutAttributes = "* -text !eol -crlf -ident !filter !working-tree-encoding\n"
+
 func Materialize(ctx context.Context, job string, m Manifest, target string) (PreparedSnapshot, error) {
 	var out PreparedSnapshot
 	var e error
@@ -229,7 +231,7 @@ func Materialize(ctx context.Context, job string, m Manifest, target string) (Pr
 		g := snapGit{ctx: ctx, dir: dst}
 		mirror := snapGit{ctx: ctx, dir: r.bare(target)}
 		attributes := filepath.Join(mirror.dir, "info", "attributes")
-		if err := snapImmutable(attributes, []byte("* -text !eol -crlf -ident !filter !working-tree-encoding\n")); err != nil {
+		if err := snapImmutable(attributes, []byte(snapshotCheckoutAttributes)); err != nil {
 			return out, err
 		}
 		if runtime.GOOS == "windows" {

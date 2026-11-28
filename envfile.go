@@ -381,19 +381,21 @@ func (w *filteredOutput) flush(limit int) error {
 	return err
 }
 
-func (f *secretFilter) output(cmd *exec.Cmd, dst *os.File) (io.Writer, func() error) {
+func (f *secretFilter) output(cmd *exec.Cmd, dst io.Writer) (io.Writer, func() error) {
 	if f == nil {
 		return dst, func() error { return nil }
 	}
 	w := &filteredOutput{dst: dst, filter: f}
-	// Descendants can outlive their foreground payload and inherit its pipes.
+	// Engine stderr can be inherited after the engine itself exits.
 	cmd.WaitDelay = 200 * time.Millisecond
-	return w, func() error {
-		w.mu.Lock()
-		defer w.mu.Unlock()
-		w.closed = true
-		return w.flush(len(w.pending))
-	}
+	return w, w.finish
+}
+
+func (w *filteredOutput) finish() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.closed = true
+	return w.flush(len(w.pending))
 }
 
 func checkResumeProfile(root, recorded, requested string) error {

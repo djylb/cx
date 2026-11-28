@@ -181,3 +181,25 @@ func TestWindowsHistoryBarrierRetriesAfterDenyWriteReader(t *testing.T) {
 		t.Fatalf("orphan publication could not retry: %+v %v", s, err)
 	}
 }
+
+func TestWindowsStateSegmentRepeatedSyncWithReader(t *testing.T) {
+	dir := t.TempDir()
+	w, _ := openTestLogWriter(t, dir)
+	reader, err := openJobFile(segmentPath(w.dir, 1), jobFileRead)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeBestEffort(reader)
+	for _, value := range []string{"first", "second"} {
+		if err := w.Append("status", value); err != nil {
+			t.Fatal(err)
+		}
+		if err := w.sync(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.Final("terminal"); err != nil {
+		t.Fatal(err)
+	}
+	testLogLatest(t, dir, "status", 3, 2)
+}

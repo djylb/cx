@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"slices"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -40,7 +41,13 @@ func (c *config) mark(cmd *exec.Cmd, dir string) {
 	for k, v := range c.Env {
 		env = append(env, k+"="+v)
 	}
-	env = slices.DeleteFunc(env, isSessionEnv)
+	env = slices.DeleteFunc(env, func(entry string) bool {
+		key, _, _ := strings.Cut(entry, "=")
+		return strings.EqualFold(key, "CX_CHANGESET") || isSessionEnv(entry)
+	})
+	if c.Work != nil && c.Work.Changeset != "" {
+		env = append(env, "CX_CHANGESET="+c.Work.Changeset)
+	}
 	host := c.Host
 	if host == "" {
 		host = "local"
@@ -114,6 +121,16 @@ func (r *runner) reclaim() error {
 		}
 		return r.note("process/reap", message)
 	}
+	return errors.Join(logErr, r.reapMarked(false, note))
+}
+
+func reapManagedProcesses(run string) error {
+	r := runner{c: config{RunID: run}}
+	return r.reapMarked(true, func(string) error { return nil })
+}
+
+func (r *runner) reapMarked(immediate bool, note func(string) error) error {
+	var logErr error
 	type identity struct {
 		pid   int
 		start uint64
@@ -151,7 +168,7 @@ func (r *runner) reclaim() error {
 				continue
 			}
 			termAt, already := sent[key]
-			force := runtime.GOOS == "windows" || now.After(deadline) || (already && now.Sub(termAt) >= termGrace)
+			force := immediate || runtime.GOOS == "windows" || now.After(deadline) || (already && now.Sub(termAt) >= termGrace)
 			if already && !force {
 				continue
 			}

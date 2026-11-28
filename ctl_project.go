@@ -24,8 +24,13 @@ type projectRepository struct {
 }
 
 type projectDefinition struct {
-	Host         string              `toml:"default_host"`
-	Repositories []projectRepository `toml:"repositories"`
+	ModulesFile        string              `toml:"modules_file,omitempty"`
+	ModulesOutputBytes int64               `toml:"modules_output_bytes,omitzero"`
+	ContextOutputBytes int64               `toml:"context_output_bytes,omitzero"`
+	ModulesCmd         []string            `toml:"modules_cmd,omitempty"`
+	ModulesRepo        string              `toml:"modules_repo,omitempty"`
+	Host               string              `toml:"default_host"`
+	Repositories       []projectRepository `toml:"repositories"`
 }
 
 func projectDirectory() (string, error) {

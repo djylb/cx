@@ -42,6 +42,28 @@ Repeat `--include REPO:PATH` for each input file or quoted glob. These entries a
 
 Go builds and checks share writable caches across jobs on the same node. Use `--env KEY=PATH` to override `GOCACHE`, `GOMODCACHE`, `STATICCHECK_CACHE`, or `GOLANGCI_LINT_CACHE` for one job. Use `cx hosts` to check whether caches in use exceed the node's configured budget.
 
+## Work by module (按模块工作)
+
+Configure the project's `modules_file` to supply module names, path scopes, optional context and acceptance commands, and direct dependencies. See the [module configuration reference](reference.md#module-configuration). With no module table, use repository-relative path prefixes such as `--module internal/api`.
+
+```sh
+cx run local ./app update-api prompt.txt --module api --changeset release-7
+cx ls --active --module api --brief
+cx result app/update-api
+cx result app/update-api --reads
+cx result app/update-api --reads --all
+cx apply app/update-api
+cx ls --all --changeset release-7 --json
+```
+
+Repeat `--module` to claim several modules. An active writer with the same module or an overlapping path scope can block submission. Coordinate with the listed job or pass `--module-override "reason"` to continue and record the decision. Active writers for direct dependencies also produce a warning. Overlapping scopes still conflict. Claims are checked against reachable nodes at dispatch. Concurrent submissions can both pass, and pending asynchronous submissions become visible when registered. Check `claims_unchecked` in `cx run --json`. Fork and rebase report an active source so you can close it before starting a second writer. Refresh checks the new scope. For a job that only inspects the checkout, use `--sandbox read-only`.
+
+The first prompt lists the claims, direct dependencies and generated context at `$CX_CONTEXT/modules/NAME.md`. A refreshed prompt gives the path for its new baseline. If a context command fails, the prompt points to the progress log and the job continues. Include the supplied `Changeset: ID` trailer when committing. After applying, use `ls --changeset ID --json` on the applying controller to look up applied turns, target HEADs at apply time, and result trees. Find final commits by their changeset trailers.
+
+Acceptance runs after the patch seals, in a disposable checkout. Continue the job while checks are pending. Inspect `acceptance` in `cx result JOB --json` or read the acceptance event in `cx outbox JOB`.
+
+The runner freezes the delivery and runs acceptance in a private copy. The result records the acceptance phase and any checks completed. Add `--accept 'COMMAND'` to supply a check for this job, `--accept-timeout 10m` to change its per-command deadline, or `--no-accept` to skip checks. Review failures in `cx result JOB --json`. Use `--reads` to view best-effort paths from the selected turn.
+
 ## Observe and follow up
 
 Keep exactly one watcher per session. After dispatching, run this in the background (a background task, not a shell loop):
@@ -68,6 +90,14 @@ Other controls: `cx interrupt JOB` stops an active turn; `cx resume JOB` restart
 - **Opting out.** Use `--context project`, `--context shared,host` or `--context none` on `run` and `agent` to start a job without some or all layers.
 - **Progress board.** Use `cx ls --brief` for the current phase, turn counts, applied turns by repository, and plan step. For a rate-limited job, use `cx ls JOB --brief --json` to read its known `rate_limit.reset_at`. For extra notes, ask agents to `send` one line to `#board` when they start, finish or block, and read `cx outbox --any --to '#board' --latest` (newest line per job).
 
+## Watch context and usage
+
+Use `cx ls --usage` to see token use by project, job and role. The view flags jobs with several turns and high context use. Set `--usage-top`, `--usage-turns` and `--usage-context` to tune it. The listing and sealed results show cached input, fresh input and output separately.
+
+When a turn reaches the context advisory threshold, `cx outbox JOB` and `cx result JOB` offer three choices. Continue, compact in place with `cx compact JOB` and continue the same job (recommended), or ask for a handoff summary and start a new job only when the task changes. Set `--context-warn N` on a new job to change the threshold. Use 0 to disable the advisory. See the [usage reference](reference.md#context-and-token-usage) for controller defaults.
+
+Use `cx doctor HOST --json` to see the controller’s recent disconnects and reconnects alongside the current node status.
+
 ## Run many jobs at once
 
 - Split work along file boundaries: give each set of files to one job, and keep each job to one change that can be collected on its own. Start a separate job for new findings instead of queueing them into a long-running one.
@@ -80,7 +110,7 @@ Other controls: `cx interrupt JOB` stops an active turn; `cx resume JOB` restart
 
 ## Work while the manager is away
 
-Jobs run on their hosts without the controller and keep their state on the node. An agent that needs an answer ends its turn with `STATUS: QUESTION`. The job keeps its thread and continues when the manager replies with `cx say`. After reconnecting, reuse your `cx wait --any` cursor or run `cx ls` to see current job states. Changing host, project, or job filters keeps the same session cursor. A second wait on that cursor exits with code 2 and reports the active observer’s PID and start time. Stop it by PID or use `--cursor NAME` for an independent cursor.
+Jobs run on their hosts without the controller and keep their state on the node. An agent that needs an answer ends its turn with `STATUS: QUESTION`. The job keeps its thread and continues when the manager replies with `cx say`. After reconnecting, reuse your `cx wait --any` cursor or run `cx ls --active --brief` to see running, queued, submitting, and waiting jobs across all hosts and sessions. Add `--json` for structured output. Changing host, project, or job filters keeps the same session cursor. A second wait on that cursor exits with code 2 and reports the active observer’s PID and start time. Stop it by PID or use `--cursor NAME` for an independent cursor.
 
 When a host is unreachable, `cx ls` shows its cached jobs with the time of the last successful observation. In `cx ls --json`, check `stale` and `as_of` before acting on a cached job status.
 

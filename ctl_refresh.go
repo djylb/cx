@@ -8,17 +8,21 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
 )
 
 type refreshRequest struct {
+	Work     *moduleWork        `json:"work,omitempty"`
 	Snapshot SnapshotID         `json:"snapshot"`
 	Source   string             `json:"source"`
 	Sources  map[string]string  `json:"sources,omitempty"`
 	Branches map[string]*string `json:"branches,omitempty"`
 }
+
+const refreshRequestPrefix = "refresh-"
 
 type refreshTodo struct {
 	refreshRequest
@@ -35,7 +39,7 @@ type jobBaseline struct {
 	Question string    `json:"question,omitempty"`
 }
 
-func ctlRefresh(ctx context.Context, h endpoint, host, id string, o ctlOptions) error {
+func ctlRefresh(ctx context.Context, hs endpoints, h endpoint, host, id string, o ctlOptions) error {
 	project, _, ok := strings.Cut(id, "/")
 	if !ok {
 		return errors.New("refresh requires a project job")
@@ -111,20 +115,53 @@ func ctlRefresh(ctx context.Context, h endpoint, host, id string, o ctlOptions) 
 		return err
 	}
 	refresh := refreshRequest{Snapshot: sid, Source: src, Sources: submission.Sources, Branches: submission.Branches}
-	if req.Refresh == nil || req.Refresh.Submitted || req.Refresh.Snapshot != sid || req.Refresh.Source != src {
-		req.Refresh = &refreshTodo{refreshRequest: refresh, ID: rand.Text()}
+	var oldWork *moduleWork
+	if len(origin.ModuleOptions) != 0 {
+		info, infoErr := getJobClaimInfo(ctx, h, id)
+		if infoErr != nil {
+			return infoErr
+		}
+		if info.RunID != s.RunID {
+			return errJobReplaced
+		}
+		oldWork = info.Work
+		if oldWork != nil && len(oldWork.Modules) != 0 {
+			opts := ctlOptions{modules: oldWork.Modules, sandbox: "workspace-write", moduleOverride: o.moduleOverride,
+				accept: oldWork.AcceptScripts, noAccept: oldWork.NoAccept, changeset: oldWork.Changeset}
+			if oldWork.ReadOnly {
+				opts.sandbox = "read-only"
+			}
+			if oldWork.AcceptTimeout != 0 {
+				opts.acceptTimeout = oldWork.AcceptTimeout.String()
+			}
+			submission.ID, submission.Host, submission.FoldPaths = id, host, oldWork.FoldPaths || foldTargetPaths(h.Platform)
+			if err = prepareModuleWork(ctx, &submission, def, opts); err != nil {
+				return err
+			}
+			refresh.Work = &submission.moduleWork
+		}
+	}
+	if req.Refresh == nil || req.Refresh.Submitted || req.Refresh.Snapshot != sid || req.Refresh.Source != src ||
+		!reflect.DeepEqual(req.Refresh.Work, refresh.Work) {
+		req.Refresh = &refreshTodo{refreshRequest: refresh, ID: refreshRequestPrefix + rand.Text()}
 	}
 	if err = writeJSON(slot, req); err != nil {
 		return err
 	}
 	if err = Publish(ctx, h, sid, nil); err == nil {
-		var data []byte
-		data, err = json.Marshal(req.Refresh.refreshRequest)
+		if refresh.Work != nil && !reflect.DeepEqual(oldWork, refresh.Work) {
+			if _, err = checkModuleClaims(ctx, hs, claimAddress{Host: host, Job: id}, nil, *refresh.Work); err != nil {
+				return err
+			}
+		}
+		data, encodeErr := json.Marshal(req.Refresh.refreshRequest)
+		err = encodeErr
 		if err == nil {
-			var r reply
-			r, err = h.call(ctx, 30*time.Second, "refresh-job", id, s.RunID, req.Refresh.ID, string(data))
+			var response reply
+			response, err = h.call(ctx, 30*time.Second, "refresh-job", id, s.RunID, req.Refresh.ID, string(data))
 			if err == nil {
-				err = r.output()
+				err = response.output()
+
 			}
 		}
 	}

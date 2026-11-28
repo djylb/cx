@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,13 +18,14 @@ import (
 )
 
 type submissionOrigin struct {
-	History      string
-	Source       string
-	Snapshot     SnapshotID
-	Role, Parent string
-	JobOptions   []string
-	CleanBase    bool
-	Command      bool
+	History       string
+	Source        string
+	Snapshot      SnapshotID
+	Role, Parent  string
+	JobOptions    []string
+	ModuleOptions []string `json:",omitempty"`
+	CleanBase     bool
+	Command       bool
 }
 
 func originFile(host, id, gen string) (string, error) {
@@ -35,12 +37,13 @@ func originFile(host, id, gen string) (string, error) {
 }
 
 type applyPlan struct {
-	src, index, head, repo, base, patch string
-	original, final, pack, delta        []byte
-	git, work                           snapGit
-	conflicts                           []string
-	since                               int64
-	incremental                         bool
+	src, index, head, repo, base, patch, resultTree string
+	targetKey                                       string
+	original, final, pack, delta                    []byte
+	git, work                                       snapGit
+	conflicts, paths                                []string
+	since                                           int64
+	incremental                                     bool
 }
 
 func treeChanges(g snapGit, a, b string) (map[string]bool, error) {
@@ -73,6 +76,15 @@ func overlayIndex(g snapGit, tree string, paths []string) error {
 	return e
 }
 
+func applyTargetIndex(g snapGit) (string, string, error) {
+	index, err := g.get("rev-parse", "--path-format=absolute", "--git-path", "index")
+	if err != nil {
+		return "", "", err
+	}
+	key, err := jobDirectoryKey(filepath.Dir(index))
+	return index, key, err
+}
+
 func planApply(ctx context.Context, store, src, patch, scratch string, row turnPatch, base SnapshotRepo, allowConflicts bool) (applyPlan, error) {
 	g := snapGit{ctx: ctx, dir: src}
 	p := applyPlan{src: src, git: g, repo: row.Path, patch: patch}
@@ -90,7 +102,8 @@ func planApply(ctx context.Context, store, src, patch, scratch string, row turnP
 	if top != src {
 		return p, errors.New("target must be repository root")
 	}
-	p.index, e = g.get("rev-parse", "--path-format=absolute", "--git-path", "index")
+	p.src = src
+	p.index, p.targetKey, e = applyTargetIndex(g)
 	if e != nil {
 		return p, e
 	}
@@ -152,6 +165,7 @@ func planApply(ctx context.Context, store, src, patch, scratch string, row turnP
 			return p, e
 		}
 	}
+	p.paths = paths
 	staged, e := g.get("write-tree")
 	if e != nil {
 		return p, e
@@ -290,11 +304,20 @@ func planApply(ctx context.Context, store, src, patch, scratch string, row turnP
 			return p, e
 		}
 	}
+	if len(p.conflicts) == 0 {
+		p.resultTree, e = g.get("write-tree")
+		if e != nil {
+			return p, e
+		}
+	}
 	p.final, e = os.ReadFile(index)
 	if e != nil {
 		return p, e
 	}
 	revs := []string{merged}
+	if p.resultTree != "" && p.resultTree != merged {
+		revs = append(revs, p.resultTree)
+	}
 	for _, stage := range stages {
 		meta, _, _ := strings.Cut(stage, "\t")
 		revs = append(revs, strings.Fields(meta)[1])
@@ -419,7 +442,7 @@ func mergeApplyTrees(g snapGit, ancestor, ours, theirs string) (tree string, sta
 	return entries[0], stages, nil
 }
 
-func applyTurn(ctx context.Context, dir, project, id, host, runID string, o ctlOptions, turn int64, rows []selectedPatch) error {
+func applyTurn(ctx context.Context, dir, project, id, host, runID string, o ctlOptions, result turnResult, rows []selectedPatch) error {
 	changed := 0
 	for _, row := range rows {
 		if row.Patch != "" {
@@ -435,6 +458,14 @@ func applyTurn(ctx context.Context, dir, project, id, host, runID string, o ctlO
 	}
 	if changed == 0 {
 		return nil
+	}
+	if len(result.Modules) == 0 {
+		repo, hotspots, err := applyGlobalHotspots(ctx, id, origin, result, manifest)
+		if err != nil {
+			diagnosticf("cx: load global hotspots: %v\n", err)
+		} else {
+			result.ModuleRepository, result.Hotspots = repo, hotspots
+		}
 	}
 	root, e := manifest.sourceRoot(ctx, origin.Source)
 	if e != nil {
@@ -515,13 +546,30 @@ func applyTurn(ctx context.Context, dir, project, id, host, runID string, o ctlO
 		if readErr != nil && !os.IsNotExist(readErr) {
 			return readErr
 		}
+		operation := rand.Text()
 		for _, plan := range plans {
 			var base any
 			if plan.base != "" {
 				base = plan.base
 			}
-			entry := fields{"job": id, "host": host, "run_id": runID, "base": base, "turn": turn, "repo": plan.repo, "source": plan.src, "patch": plan.patch, "applied_at": timeshim.Or(contextClock(ctx)).Now().UTC().Format(time.RFC3339Nano)}
+			entry := fields{"job": id, "host": host, "run_id": runID, "base": base, "turn": result.Turn, "repo": plan.repo, "source": plan.src, "operation": operation, "target_repository": plan.index, "target_repository_key": plan.targetKey, "patch": plan.patch, "applied_at": timeshim.Or(contextClock(ctx)).Now().UTC().Format(time.RFC3339Nano)}
 			entry["since_turn"] = plan.since
+			entry["role"] = result.Role
+			if result.Changeset != "" {
+				entry["changeset"] = result.Changeset
+				entry["modules"] = result.Modules
+				entry["session"] = result.Session
+				// apply stages patches and preserves HEAD.
+				entry["target_head_at_apply"] = nil
+				if plan.head != "" {
+					entry["target_head_at_apply"] = plan.head
+				}
+				entry["result_tree"] = plan.resultTree
+				entry["baseline"] = result.Baseline.Snapshot
+				if result.Baseline.Snapshot == "" {
+					entry["baseline"] = origin.Snapshot
+				}
+			}
 			if plan.incremental {
 				delete(entry, "patch")
 				entry["result"] = filepath.Join(dir, "result.json")
@@ -537,6 +585,13 @@ func applyTurn(ctx context.Context, dir, project, id, host, runID string, o ctlO
 	if len(plans) > 0 {
 		if e = installPlans(plans, record); e != nil {
 			return e
+		}
+	}
+	for _, plan := range plans {
+		if plan.repo == result.ModuleRepository {
+			for _, name := range hotspotFiles(plan.paths, result.Hotspots, result.FoldPaths) {
+				fmt.Printf("Hotspot: %s/%s\n", plan.repo, name)
+			}
 		}
 	}
 	var failed bool
@@ -567,6 +622,33 @@ func applyLogProject(id string) string {
 	return project
 }
 
+func applyGlobalHotspots(ctx context.Context, id string, origin submissionOrigin, result turnResult, m Manifest) (string, []string, error) {
+	def, err := readProject(applyLogProject(id))
+	if err != nil || def.ModulesFile == "" && len(def.ModulesCmd) == 0 {
+		return "", nil, err
+	}
+	if result.Baseline.Snapshot != "" && result.Baseline.Snapshot != origin.Snapshot {
+		m, err = loadSnapshot(result.Baseline.Snapshot)
+		if err != nil {
+			return "", nil, err
+		}
+	}
+	root, err := m.sourceRoot(ctx, origin.Source)
+	if err != nil {
+		return "", nil, err
+	}
+	sources := make(map[string]string, len(m.Repositories))
+	for _, member := range m.Repositories {
+		sources[member.Path] = filepath.Join(root, member.Path)
+	}
+	repo, err := moduleRepository(ctx, m, sources, def)
+	if err != nil {
+		return "", nil, err
+	}
+	table, err := snapshotModuleTable(ctx, m, repo, def)
+	return repo, table.Hotspots, err
+}
+
 func outputProject(p string) (string, error) {
 	dir, err := projectOutputPath(p)
 	if err != nil {
@@ -576,13 +658,9 @@ func outputProject(p string) (string, error) {
 }
 
 func projectOutputPath(p string) (string, error) {
-	base := os.Getenv("CX_HOME")
-	if base == "" {
-		d, e := os.UserCacheDir()
-		if e != nil {
-			return "", e
-		}
-		base = filepath.Join(d, "cx")
+	base, err := controllerCacheRoot()
+	if err != nil {
+		return "", err
 	}
 	return jobPath(filepath.Join(base, "out"), p)
 }
@@ -606,7 +684,10 @@ func applyOrigin(dir string) (submissionOrigin, string, Manifest, error) {
 		return origin, store, m, e
 	}
 	if result.Baseline.Snapshot != "" {
-		origin.Snapshot, origin.Source = result.Baseline.Snapshot, result.Baseline.Source
+		origin.Snapshot = result.Baseline.Snapshot
+		if result.Baseline.Source != "" {
+			origin.Source = result.Baseline.Source
+		}
 	}
 	m, _, e = snapManifest(store, string(origin.Snapshot))
 	return origin, store, m, e

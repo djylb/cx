@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -29,6 +30,7 @@ func controllerPolicy(name string) (string, error) {
 }
 
 type jobSubmission struct {
+	moduleWork
 	Sources                                         map[string]string  `json:",omitempty"`
 	Branches                                        map[string]*string `json:",omitempty"`
 	ReuseKey                                        string
@@ -73,9 +75,10 @@ func ctlSubmit(ctx context.Context, hs endpoints, op string, o ctlOptions) error
 }
 
 type rebaseInput struct {
-	files map[string][]byte
-	key   string
-	carry string
+	source *claimAddress
+	files  map[string][]byte
+	key    string
+	carry  string
 }
 
 func ctlSubmitWithRebase(ctx context.Context, hs endpoints, op string, o ctlOptions, rebase rebaseInput) error {
@@ -104,6 +107,9 @@ func ctlSubmitWithRebase(ctx context.Context, hs endpoints, op string, o ctlOpti
 		fmt.Println(id)
 		return nil
 	}
+	if err := o.validateModuleOptions(); err != nil {
+		return ctlUsage(op, err)
+	}
 	if len(o.own) > 0 && (o.command || o.inplace || o.previous != "" || o.sandbox != "" && o.sandbox != "workspace-write") {
 		return ctlUsage(op, errors.New("--own requires a new snapshot-backed workspace-write agent"))
 	}
@@ -128,6 +134,9 @@ func ctlSubmitWithRebase(ctx context.Context, hs endpoints, op string, o ctlOpti
 			return e
 		}
 		if o.previous != "" {
+			if o.contextWarn != "" {
+				return ctlUsage(op, errors.New("--context-warn applies to a new agent job"))
+			}
 			if o.project != "" {
 				return errors.New("--project applies to new jobs")
 			}
@@ -150,11 +159,11 @@ func ctlSubmitWithRebase(ctx context.Context, hs endpoints, op string, o ctlOpti
 			if continueErr = forgetResult(name, id); continueErr != nil {
 				return continueErr
 			}
-			argv := []string{"continue-job", name, id, prompt}
-			if o.profile != "" {
-				argv = append(argv, o.profile)
-			}
-			r, continueErr := h.invoke(ctx, controlCallIdle, false, argv...)
+			argv := []string{"continue-job", name, id, prompt, o.profile}
+			address := claimAddress{Host: name, Job: id}
+			r, continueErr := withRestartClaim(ctx, hs, h, address, address, o.moduleOverride, func(info jobClaimInfo) (reply, error) {
+				return h.invoke(ctx, controlCallIdle, false, append(argv, info.wire())...)
+			})
 			if continueErr != nil {
 				return continueErr
 			}
@@ -245,6 +254,9 @@ func ctlSubmitWithRebase(ctx context.Context, hs endpoints, op string, o ctlOpti
 	if o.reuse && !o.command {
 		return errors.New("--reuse requires a command job")
 	}
+	if o.contextWarn != "" && (o.command || o.previous != "") {
+		return ctlUsage(op, errors.New("--context-warn applies to a new agent job"))
+	}
 	if o.command && (o.engine != "" || o.interactive || o.web || o.input != "" || len(o.images) > 0) {
 		return errors.New("agent options on command job")
 	}
@@ -277,6 +289,17 @@ func ctlSubmitWithRebase(ctx context.Context, hs endpoints, op string, o ctlOpti
 			return engineErr
 		}
 		o.engine = eng.name
+		settings, usageErr := loadUsageSettings()
+		if usageErr != nil {
+			return usageErr
+		}
+		if o.contextWarn != "" {
+			settings.ContextWarn, usageErr = usagePercent(o.contextWarn)
+			if usageErr != nil {
+				return ctlUsage(op, usageErr)
+			}
+		}
+		req.Options = append(req.Options, "--context-warn", fmt.Sprint(settings.ContextWarn))
 		c := config{Effort: o.effort, Network: network, Sandbox: o.sandbox, JobTools: !o.noTools && eng.caps().JobTools}
 		if engineErr = c.checkEngineOptions(eng, options{input: o.input, images: o.images}, o.approval != ""); engineErr != nil {
 			return engineErr
@@ -370,8 +393,19 @@ func ctlSubmitWithRebase(ctx context.Context, hs endpoints, op string, o ctlOpti
 			}
 		}
 	}
+	req.FoldPaths = h.Platform == "" || foldTargetPaths(h.Platform)
+	if e = prepareModuleWork(ctx, &req, def, o); e != nil {
+		return e
+	}
 	if o.command {
 		req.ReuseKey = runReuseKey(req.Snapshot, src, req.Command)
+		if req.hasModuleWork() {
+			metadata, err := json.Marshal(req.moduleWork)
+			if err != nil {
+				return err
+			}
+			req.ReuseKey = snapSum(append([]byte(req.ReuseKey), metadata...))
+		}
 		if o.reuse {
 			found, reuseErr := lookupReuse(ctx, h, reuseQuery{ID: id, Host: host, Key: req.ReuseKey, Profile: o.profile})
 			if reuseErr != nil || found {
@@ -391,11 +425,12 @@ func ctlSubmitWithRebase(ctx context.Context, hs endpoints, op string, o ctlOpti
 	if e != nil {
 		return e
 	}
-	origin := submissionOrigin{Source: canonical, Snapshot: req.Snapshot, JobOptions: req.Options, Role: req.Role, Parent: req.Parent, Command: o.command, History: o.history, CleanBase: o.cleanBase}
+	origin := submissionOrigin{Source: canonical, Snapshot: req.Snapshot, JobOptions: req.Options, ModuleOptions: o.moduleArguments(), Role: req.Role, Parent: req.Parent, Command: o.command, History: o.history, CleanBase: o.cleanBase}
 	if e = forgetResult(host, id); e != nil {
 		return e
 	}
-	if e = queueJob(ctx, queuedJob{Request: req, Origin: origin, Rebase: rebase.key}, o.sync || o.inplace || op == "agent", o.force); e != nil {
+	var unchecked []string
+	if e = queueJob(ctx, hs, queuedJob{Request: req, Origin: origin, Rebase: rebase.key, ClaimSource: rebase.source}, o.sync || o.inplace || op == "agent", o.force, &unchecked); e != nil {
 		return e
 	}
 	if op == "agent" {
@@ -403,6 +438,9 @@ func ctlSubmitWithRebase(ctx context.Context, hs endpoints, op string, o ctlOpti
 		return agentReport(ctx, host, h, id, o.full)
 	}
 	if rebase.key == "" {
+		if o.json {
+			return json.NewEncoder(os.Stdout).Encode(fields{"job": id, "host": host, "claims_unchecked": append([]string{}, unchecked...)})
+		}
 		fmt.Println(id)
 	}
 	return nil

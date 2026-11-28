@@ -334,6 +334,10 @@ func fixtureServer() error {
 				turnID = "continued"
 			} else if p.Input[0].Text == "second round" {
 				turnID = "second"
+			} else if os.Getenv("FIXMODE") == "module-work" {
+				if err := checkModuleFixturePrompt(p.Input[0].Text); err != nil {
+					return err
+				}
 			} else if p.Input[0].Text != wantPrompt {
 				return fmt.Errorf("initial prompt: got %q, want %q", p.Input[0].Text, wantPrompt)
 			}
@@ -362,6 +366,20 @@ func fixtureServer() error {
 			result = fields{"turn": t}
 			notify("turn/started", result)
 			switch os.Getenv("FIXMODE") {
+			case "usage-advisory":
+				notify("thread/tokenUsage/updated", fields{"turnId": turnID, "tokenUsage": fields{
+					"modelContextWindow": 100,
+					"last":               fields{"totalTokens": 70, "inputTokens": 60, "cachedInputTokens": 40, "outputTokens": 10},
+					"total":              fields{"totalTokens": 200, "inputTokens": 150, "cachedInputTokens": 50, "outputTokens": 50},
+				}})
+				notify("turn/completed", fields{"turn": fields{"id": turnID, "status": "completed", "items": []fields{{"type": "agentMessage", "text": "STATUS: DONE"}}}})
+			case "module-work":
+				itemEvent(fields{"type": "fileRead", "path": "modules.json"})
+				itemEvent(fields{"type": "commandExecution", "command": "cat 'notes with spaces.md' modules.json", "exitCode": 0})
+				if err := os.WriteFile("hotspot.txt", []byte("updated\n"), 0600); err != nil {
+					return err
+				}
+				notify("turn/completed", fields{"turn": fields{"id": turnID, "status": "completed", "items": []fields{{"type": "agentMessage", "text": "STATUS: DONE"}}}})
 			case "sealed-patches":
 				content := map[string]string{"a": "round 1\n", "undo": "round 1\n"}
 				if turnID == "second" {
@@ -864,8 +882,9 @@ func TestFirstTurnPreamble(t *testing.T) {
 				t.Fatalf("runner: %v\n%s", err, stderr)
 			}
 			var saved config
-			if err := readJobConfig(filepath.Join(h.root, "job"), &saved); err != nil || saved.Prompt != tc.want {
-				t.Fatalf("saved prompt: %q, err: %v", saved.Prompt, err)
+			preamble := strings.TrimSuffix(strings.TrimSuffix(tc.want, "task"), "\n\n")
+			if err := readJobConfig(filepath.Join(h.root, "job"), &saved); err != nil || saved.Preamble != preamble || saved.Prompt != "task" {
+				t.Fatalf("saved preamble and prompt: %q / %q, err: %v", saved.Preamble, saved.Prompt, err)
 			}
 		})
 	}

@@ -32,7 +32,21 @@ type ResultBase struct {
 }
 
 type turnResult struct {
-	Baseline jobBaseline `json:"baseline,omitzero"`
+	Role             string             `json:"role,omitempty"`
+	CumulativeUsage  *usageCounters     `json:"cumulative_usage"`
+	Usage            *usageSummary      `json:"usage"`
+	ContextWarning   *contextWarning    `json:"context_warning,omitempty"`
+	Modules          []string           `json:"modules,omitempty"`
+	Session          string             `json:"session,omitempty"`
+	AcceptanceStatus string             `json:"acceptance_status"`
+	Changeset        string             `json:"changeset,omitempty"`
+	ModuleRepository string             `json:"module_repository,omitempty"`
+	FoldPaths        bool               `json:"fold_paths,omitempty"`
+	Hotspots         []string           `json:"hotspots,omitempty"`
+	Acceptance       []acceptanceResult `json:"-"`
+	ContextVersion   string             `json:"context_version,omitempty"`
+	ReadsPath        string             `json:"reads_path,omitempty"`
+	Baseline         jobBaseline        `json:"baseline,omitzero"`
 	*ResultDetails
 	Bases        map[string]ResultBase `json:"bases"`
 	TurnID       string                `json:"turn_id"`
@@ -130,7 +144,7 @@ func sealTurn(ctx context.Context, dir string, s status, n int64) (string, error
 	}
 	s = current
 	if _, e = os.Stat(filepath.Join(folder, "result.json")); e == nil {
-		return folder, nil
+		return folder, syncJobTree(base, work)
 	} else if !os.IsNotExist(e) {
 		return "", e
 	}
@@ -155,6 +169,7 @@ func sealTurn(ctx context.Context, dir string, s status, n int64) (string, error
 		return "", e
 	}
 	var result SnapshotResult
+	var scope moduleWork
 	checkout, e := resultCheckout(work)
 	if e != nil {
 		return "", e
@@ -166,8 +181,13 @@ func sealTurn(ctx context.Context, dir string, s status, n int64) (string, error
 		if e == nil {
 			defer removeTreeBestEffort(result.Dir)
 			var c config
-			if e = readJobConfig(dir, &c); e == nil && c.Dir != "" {
-				e = copySnapshotArtifacts(filepath.Join(c.Dir, "artifacts"), &result)
+			if e = readJobConfig(dir, &c); e == nil {
+				if c.Work != nil {
+					scope = *c.Work
+				}
+				if c.Dir != "" {
+					e = copySnapshotArtifacts(filepath.Join(c.Dir, "artifacts"), &result)
+				}
 			}
 		}
 	}
@@ -179,9 +199,21 @@ func sealTurn(ctx context.Context, dir string, s status, n int64) (string, error
 	if e = writeJobBytes(filepath.Join(result.Dir, "last.md"), report); e != nil {
 		return "", e
 	}
-	meta := turnResult{Turn: n, TurnID: s.LastCompleted, Repositories: []turnPatch{}, Bases: map[string]ResultBase{}}
+	meta := turnResult{AcceptanceStatus: "none", Turn: n, TurnID: s.LastCompleted, Repositories: []turnPatch{}, Bases: map[string]ResultBase{}}
 	if s.Engine != "cmd" {
 		meta.Outcome = s.CompletedStatus
+	}
+	var req jobSubmission
+	if err := readJSON(filepath.Join(work, "request.json"), &req); err == nil {
+		scope = req.moduleWork
+	} else if !os.IsNotExist(err) {
+		return "", err
+	}
+	meta.Changeset, meta.ModuleRepository, meta.Hotspots = scope.Changeset, scope.ModuleRepository, scope.Hotspots
+	meta.FoldPaths = scope.FoldPaths
+	meta.Modules, meta.Session, meta.Role = scope.Modules, s.Session, req.Role
+	if meta.Role == "" {
+		meta.Role = "worker"
 	}
 	if checkout != "" {
 		manifest, manifestErr := readCheckoutManifest(checkout)
@@ -193,12 +225,15 @@ func sealTurn(ctx context.Context, dir string, s status, n int64) (string, error
 			return "", e
 		}
 		meta.Baseline.Question, meta.Baseline.Request = "", ""
-		var req jobSubmission
-		if err := readJSON(filepath.Join(work, "request.json"), &req); err != nil && !os.IsNotExist(err) {
-			return "", err
+		if work := meta.Baseline.Work; work != nil {
+			meta.Changeset, meta.ModuleRepository, meta.Hotspots = work.Changeset, work.ModuleRepository, work.Hotspots
+			meta.FoldPaths = work.FoldPaths
+			meta.Baseline.Work = nil
 		}
 		if meta.Baseline.Snapshot != "" {
 			req.Sources, req.Branches = meta.Baseline.Sources, meta.Baseline.Branches
+		} else {
+			meta.Baseline.Snapshot = req.Snapshot
 		}
 		meta.Baseline.Sources, meta.Baseline.Branches = nil, nil
 		for _, r := range manifest.Repositories {
@@ -218,6 +253,9 @@ func sealTurn(ctx context.Context, dir string, s status, n int64) (string, error
 		result.Artifacts = []SnapshotArtifact{}
 	}
 	meta.Artifacts = result.Artifacts
+	if e = stageTurnMetadata(dir, result.Dir, &meta); e != nil {
+		return "", e
+	}
 	data, e := json.Marshal(meta)
 	if e != nil {
 		return "", e
@@ -233,10 +271,13 @@ func sealTurn(ctx context.Context, dir string, s status, n int64) (string, error
 		s.CompletedStatus != after.CompletedStatus || s.RunID != after.RunID || !canSealResult(after) {
 		return "", errors.New("job changed during collection")
 	}
+	if e = syncFileTree(result.Dir, syncJobDir, func(path string) error { return syncExistingJobFile(path, syncJobFile) }); e != nil {
+		return "", e
+	}
 	if e = os.Rename(result.Dir, folder); e != nil {
 		return "", e
 	}
-	return folder, nil
+	return folder, syncJobTree(base, work)
 }
 
 func resultArchive(ctx context.Context, folder, dir string, s status, details bool) (string, error) {
@@ -293,7 +334,7 @@ func resultArchive(ctx context.Context, folder, dir string, s status, details bo
 	}
 	manifestPath := filepath.Join(folder, "result.json")
 	e = filepath.WalkDir(folder, func(p string, d fs.DirEntry, walkErr error) error {
-		if details && p == manifestPath {
+		if p == filepath.Join(folder, acceptanceFilename) || details && p == manifestPath {
 			return walkErr
 		}
 		return add(folder, p, d, walkErr)
@@ -370,8 +411,12 @@ func nodeResult(ctx context.Context, a []string) error {
 	return e
 }
 
+func completedResultCount(s status) int64 {
+	return s.Finished
+}
+
 func resultTurnCompleted(s status, n int64) bool {
-	return n <= s.Finished && (s.Finished > 0 || readyResult(s))
+	return n <= s.Finished && (n < s.Finished || !s.final) && (s.Finished > 0 || readyResult(s))
 }
 
 func nodeObserveResult(ctx context.Context, a []string) error {
@@ -602,13 +647,9 @@ func downloadTurn(ctx context.Context, h endpoint, id, dest string, details bool
 }
 
 func resultDest(host, id, gen, turn string) (string, error) {
-	base := os.Getenv("CX_HOME")
-	if base == "" {
-		d, e := os.UserCacheDir()
-		if e != nil {
-			return "", e
-		}
-		base = filepath.Join(d, "cx")
+	base, err := controllerCacheRoot()
+	if err != nil {
+		return "", err
 	}
 	p, e := jobPath(filepath.Join(base, "out", ".hosts"), host)
 	if e != nil {
@@ -719,12 +760,25 @@ func ctlResult(ctx context.Context, host, id, op string, o ctlOptions) (err erro
 	details := o.json || o.log
 	if op == "result" {
 		if o.turn != "" && !o.refresh {
-			cached, _, e := cachedResultDir(host, id, o.turn, details, o.path)
+			cached, generation, e := cachedResultDir(host, id, o.turn, details, o.path)
 			if e != nil {
 				return e
 			}
 			if cached != "" {
-				return displayTurn(ctx, cached, id, op, o)
+				if !o.path && !o.log && !o.reads {
+					n, parseErr := strconv.ParseInt(o.turn, 10, 64)
+					if parseErr != nil {
+						return parseErr
+					}
+					if hs, loadErr := loadEndpoints(); loadErr == nil {
+						if h, lookupErr := hs.get(host); lookupErr == nil {
+							if collectErr := collectTurnAcceptance(ctx, h, id, cached, observedResult{RunID: generation, Number: n}); collectErr != nil {
+								diagnosticf("cx: acceptance attachment: %v\n", collectErr)
+							}
+						}
+					}
+				}
+				return displayTurn(cached, id, op, o)
 			}
 		}
 	}
@@ -735,6 +789,17 @@ func ctlResult(ctx context.Context, host, id, op string, o ctlOptions) (err erro
 	h, e := hs.get(host)
 	if e != nil {
 		return e
+	}
+	if op == "result" && o.reads && o.all {
+		_, target, err := selectResultTurn(ctx, h, id, o.turn, wait)
+		if err != nil {
+			return err
+		}
+		response, err := h.callIdle(ctx, "collect read history", "reads-history", id, target.RunID)
+		if err != nil {
+			return err
+		}
+		return response.output()
 	}
 	if op == "patch" && o.turn != "" && !o.refresh {
 		cached, generation, cacheErr := cachedResultDir(host, id, o.turn, false, false)
@@ -776,7 +841,7 @@ func ctlResult(ctx context.Context, host, id, op string, o ctlOptions) (err erro
 			return err
 		}
 		if cached != "" {
-			return displayTurn(ctx, cached, id, op, o)
+			return displayTurn(cached, id, op, o)
 		}
 	}
 	if _, e = os.Stat(filepath.Join(dest, "result.json")); os.IsNotExist(e) {
@@ -796,10 +861,15 @@ func ctlResult(ctx context.Context, host, id, op string, o ctlOptions) (err erro
 	if op == "apply" || op == "patch" {
 		return ctlSealedPatches(ctx, h, host, id, target.RunID, dest, op, o)
 	}
-	return displayTurn(ctx, dest, id, op, o)
+	if !o.path && !o.log && !o.reads {
+		if collectErr := collectTurnAcceptance(ctx, h, id, dest, target); collectErr != nil {
+			diagnosticf("cx: acceptance attachment: %v\n", collectErr)
+		}
+	}
+	return displayTurn(dest, id, op, o)
 }
 
-func displayTurn(ctx context.Context, dir, id, op string, o ctlOptions) error {
+func displayTurn(dir, id, op string, o ctlOptions) error {
 	if o.path {
 		path, err := resultReportPath(dir)
 		if err != nil {
@@ -811,19 +881,22 @@ func displayTurn(ctx context.Context, dir, id, op string, o ctlOptions) error {
 		_, err = fmt.Fprintln(os.Stdout, path)
 		return err
 	}
+	if o.reads {
+		return displayResultReads(os.Stdout, dir)
+	}
 	if o.json || o.log {
 		return displayResultDetails(os.Stdout, dir, id, o.log)
 	}
 	if op == "result" {
 		var b bytes.Buffer
-		e := writeTurn(ctx, &b, dir, id, op, o)
+		e := writeTurn(&b, dir, id, op, o)
 		if e != nil && !errors.Is(e, ctlExit(1)) {
 			return e
 		}
 		if previewErr := preview(b.Bytes(), o); previewErr != nil {
 			return errors.Join(previewErr, e)
 		}
-		if op == "result" && !o.full {
+		if !o.full {
 			report, pathErr := resultReportPath(dir)
 			if pathErr != nil {
 				return errors.Join(pathErr, e)
@@ -832,13 +905,14 @@ func displayTurn(ctx context.Context, dir, id, op string, o ctlOptions) error {
 		}
 		return e
 	}
-	return writeTurn(ctx, os.Stdout, dir, id, op, o)
+	return writeTurn(os.Stdout, dir, id, op, o)
 }
-func writeTurn(ctx context.Context, out io.Writer, dir, id, op string, o ctlOptions) error {
+func writeTurn(out io.Writer, dir, id, op string, o ctlOptions) error {
 	var m turnResult
 	if e := readJSON(filepath.Join(dir, "result.json"), &m); e != nil {
 		return e
 	}
+	addAcceptanceToResult(dir, &m)
 	p := filepath.Join(dir, "last.md")
 	b, e := readSharedFile(p)
 	if e != nil {
@@ -876,6 +950,28 @@ func writeTurn(ctx context.Context, out io.Writer, dir, id, op string, o ctlOpti
 	_, _ = fmt.Fprintln(out, strings.TrimSuffix(report, "\n"))
 	if op == "agent" {
 		_, _ = fmt.Fprintln(out, p)
+	}
+	if m.Usage != nil {
+		if m.Usage.Turn != nil {
+			_ = writeUsageCounters(out, "Tokens (turn)", m.Usage.Turn)
+		}
+		if m.Usage.ContextPercent != nil {
+			_, _ = fmt.Fprintf(out, "Context %.1f%%\n", *m.Usage.ContextPercent)
+		}
+	}
+	if m.ContextWarning != nil {
+		_, _ = fmt.Fprintln(out, m.ContextWarning.text())
+	}
+	_ = writeUsageCounters(out, "Tokens (job)", m.CumulativeUsage)
+	if m.AcceptanceStatus != "" && m.AcceptanceStatus != "none" {
+		_, _ = fmt.Fprintf(out, "Acceptance: %s\n", m.AcceptanceStatus)
+	}
+	for _, check := range m.Acceptance {
+		outcome := "PASS"
+		if check.Exit != 0 {
+			outcome = "FAIL"
+		}
+		_, _ = fmt.Fprintf(out, "Acceptance %s %s %q (exit %d, %d ms)\n", outcome, check.Module, check.Cmd, check.Exit, check.Duration)
 	}
 	for _, a := range m.Artifacts {
 		_, _ = fmt.Fprintf(out, "%s (%d bytes)\n", filepath.Join(dir, a.Path), a.Bytes)

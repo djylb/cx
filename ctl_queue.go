@@ -11,14 +11,21 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/djylb/timeshim"
 )
 
 type queuedJob struct {
-	Rebase  string `json:",omitempty"`
-	Request jobSubmission
-	Origin  submissionOrigin
+	ClaimSource    *claimAddress `json:"claim_source,omitempty"`
+	OverrideReason *string       `json:"-"`
+	Rebase         string        `json:",omitempty"`
+	Request        jobSubmission
+	Origin         submissionOrigin
 }
 type submissionProgress struct {
+	OverrideReason  *string  `json:"override_reason,omitempty"`
+	ClaimsUnchecked []string `json:"claims_unchecked,omitempty"`
+	moduleListing
 	Code    *int   `json:"rc"`
 	Phase   string `json:"phase,omitempty"`
 	State   string `json:"status"`
@@ -34,11 +41,11 @@ type submissionProgress struct {
 }
 
 func submissionRoot(host string) (string, error) {
-	home, e := os.UserHomeDir()
+	home, e := controllerCacheRoot()
 	if e != nil {
 		return "", e
 	}
-	return jobPath(filepath.Join(home, ".cache", "cx", "submissions"), host)
+	return jobPath(filepath.Join(home, "submissions"), host)
 }
 
 func submissionDir(host, id string) (string, error) {
@@ -48,7 +55,7 @@ func submissionDir(host, id string) (string, error) {
 	}
 	return jobDir(root, id)
 }
-func deployJob(ctx context.Context, h endpoint, q queuedJob, report func(string, int64)) error {
+func deployJob(ctx context.Context, h endpoint, q queuedJob, beforeLaunch func() error, report func(string, int64), registered func(string)) error {
 	req := q.Request
 	if req.Snapshot != "" {
 		if e := Publish(ctx, h, req.Snapshot, func(n int64) { report("snapshot", n) }); e != nil {
@@ -78,6 +85,9 @@ func deployJob(ctx context.Context, h endpoint, q queuedJob, report func(string,
 	}
 	var r reply
 	if h.SSH != "" || q.Rebase != "" {
+		if e = beforeLaunch(); e != nil {
+			return e
+		}
 		if e = sendTask(ctx, h, req, data, func(n int64) { report("packet", n) }); e != nil {
 			return e
 		}
@@ -87,6 +97,9 @@ func deployJob(ctx context.Context, h endpoint, q queuedJob, report func(string,
 			return err
 		})
 	} else {
+		if e = beforeLaunch(); e != nil {
+			return e
+		}
 		r, e = h.call(ctx, 2*time.Minute, "start-job", string(data))
 	}
 	if e != nil {
@@ -97,15 +110,19 @@ func deployJob(ctx context.Context, h endpoint, q queuedJob, report func(string,
 	}
 	var ack status
 	if e = json.Unmarshal(r.data, &ack); e != nil {
-		return e
+		return errors.Join(ctlExit(9), e)
 	}
+	if ack.RunID == "" {
+		return errors.Join(ctlExit(9), errors.New("node registration receipt has no run ID"))
+	}
+	registered(ack.RunID)
 	origin, e := originFile(req.Host, req.ID, ack.RunID)
 	if e != nil {
 		return e
 	}
 	return writeJSON(origin, q.Origin)
 }
-func queueJob(ctx context.Context, q queuedJob, sync, force bool) error {
+func queueJob(ctx context.Context, hs endpoints, q queuedJob, sync, force bool, unchecked *[]string) error {
 	req := q.Request
 	dir, e := submissionDir(req.Host, req.ID)
 	if e != nil {
@@ -139,12 +156,30 @@ func queueJob(ctx context.Context, q queuedJob, sync, force bool) error {
 		if progressErr != nil && !os.IsNotExist(progressErr) {
 			return progressErr
 		}
+		if s.State == "submitted" && req.writableClaim() {
+			if unchecked != nil {
+				*unchecked = s.ClaimsUnchecked
+			}
+			reportUncheckedClaims(s.ClaimsUnchecked)
+			return snapImmutable(input, data)
+		}
 		failed = s.State == "submit_failed"
 	}
+	if failed && !force {
+		return errors.New("previous submission failed; use --force to resubmit")
+	}
+	work := req.moduleWork
+	if q.OverrideReason != nil {
+		work.ModuleOverride = *q.OverrideReason
+	}
+	unverified, e := checkModuleClaims(ctx, hs, claimAddress{Host: req.Host, Job: req.ID}, q.ClaimSource, work)
+	if e != nil {
+		return e
+	}
+	if unchecked != nil {
+		*unchecked = unverified
+	}
 	if failed {
-		if !force {
-			return errors.New("previous submission failed; use --force to resubmit")
-		}
 		e = atomicWrite(input, data)
 	} else {
 		e = snapImmutable(input, data)
@@ -152,10 +187,28 @@ func queueJob(ctx context.Context, q queuedJob, sync, force bool) error {
 	if e != nil {
 		return e
 	}
+	if q.OverrideReason != nil && *q.OverrideReason != "" {
+		log, err := openJobFile(filepath.Join(dir, "submit.log"), jobFileAppendCreate)
+		if err != nil {
+			return err
+		}
+		_, err = fmt.Fprintf(log, "rebase retry override: %q\n", *q.OverrideReason)
+		if err = errors.Join(err, log.Close()); err != nil {
+			return err
+		}
+	}
 	if e = rememberRoute(req.ID, req.Host); e != nil {
 		return e
 	}
 	if worker != nil {
+		if req.writableClaim() {
+			p, j, _ := strings.Cut(req.ID, "/")
+			queued := submissionProgress{moduleListing: req.listing(), State: "submit_pending", Host: req.Host, Project: p, Job: j,
+				Session: req.Session, Role: req.Role, ClaimsUnchecked: unverified, OverrideReason: q.OverrideReason, Reason: "awaiting submission worker", Log: filepath.Join(dir, "submit.log")}
+			if e = writeJSON(filepath.Join(dir, "submission.json"), queued); e != nil {
+				return e
+			}
+		}
 		closeBestEffort(worker)
 		worker = nil
 		exe, launchErr := os.Executable()
@@ -197,12 +250,19 @@ func queueJob(ctx context.Context, q queuedJob, sync, force bool) error {
 			}
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(5 * time.Second):
+		case <-timeshim.After(timeshim.Or(contextClock(ctx)), 5*time.Second):
 			return errors.New("submission worker acknowledgement timed out")
 		}
 	}
 	if sync {
 		_, e = observeSubmission(ctx, req.Host, req.ID, "wait", transferLimit)
+		if e == nil && unchecked != nil {
+			progress, readErr := readSubmissionProgress(dir)
+			if readErr != nil {
+				return readErr
+			}
+			*unchecked = progress.ClaimsUnchecked
+		}
 		return e
 	}
 	return nil
@@ -222,23 +282,37 @@ func submissionWorker(ctx context.Context, host, id string) (err error) {
 		return e
 	}
 	p, j, _ := strings.Cut(id, "/")
-	s := submissionProgress{State: "submitting", Host: host, Job: j, Project: p, Session: q.Request.Session, Role: q.Request.Role, Reason: "waiting for executor registration", PID: os.Getpid(), Log: filepath.Join(dir, "submit.log")}
+	prior, progressErr := readInactiveSubmissionProgress(dir)
+	if progressErr != nil && !os.IsNotExist(progressErr) {
+		return progressErr
+	}
+	if prior.State == "submitted" {
+		_, _ = fmt.Fprintln(os.Stdout, "ready")
+		return nil
+	}
+	s := submissionProgress{ClaimsUnchecked: prior.ClaimsUnchecked, OverrideReason: prior.OverrideReason, moduleListing: q.Request.listing(), State: "submitting", Host: host, Job: j, Project: p, Session: q.Request.Session, Role: q.Request.Role, Reason: "waiting for executor registration", PID: os.Getpid(), Log: filepath.Join(dir, "submit.log")}
 	path := filepath.Join(dir, "submission.json")
 	if e = writeJSON(path, s); e != nil {
 		return e
 	}
-	if _, e = fmt.Fprintln(os.Stdout, "ready"); e != nil {
-		return e
-	}
+	_, _ = fmt.Fprintln(os.Stdout, "ready")
 	os.Stdout = os.Stderr // Parent closes the acknowledgement pipe after this line.
+	if q.Request.ModuleOverride != "" {
+		diagnosticf("cx: module override for %s (%q)\n", strings.Join(q.Request.Modules, ", "), q.Request.ModuleOverride)
+	}
+	var runID string
 	defer func() {
 		code := 0
+		uncertain := runID == "" && (errors.Is(err, ctlExit(9)) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled))
 		if err != nil {
 			code = 1
 			if exit, ok := errors.AsType[ctlExit](err); ok {
 				code = int(exit)
 			}
 			s.State = "submit_failed"
+			if uncertain {
+				s.State = "submit_unverified"
+			}
 			s.Reason = err.Error()
 		} else {
 			s.State = "submitted"
@@ -263,7 +337,16 @@ func submissionWorker(ctx context.Context, host, id string) (err error) {
 		}
 		h = hs[host]
 	}
-	return deployJob(ctx, h, q, func(phase string, n int64) { s.Phase = phase; s.Bytes = n; _ = writeJSON(path, s) })
+	beforeLaunch := func() error {
+		work := q.Request.moduleWork
+		if s.OverrideReason != nil {
+			work.ModuleOverride = *s.OverrideReason
+		}
+		unchecked, err := checkModuleClaims(ctx, hs, claimAddress{Host: host, Job: id}, q.ClaimSource, work)
+		s.ClaimsUnchecked = unchecked
+		return err
+	}
+	return deployJob(ctx, h, q, beforeLaunch, func(phase string, n int64) { s.Phase = phase; s.Bytes = n; _ = writeJSON(path, s) }, func(run string) { runID = run })
 }
 func readSubmissionProgress(dir string) (submissionProgress, error) {
 	var s submissionProgress
@@ -285,7 +368,10 @@ func readInactiveSubmissionProgress(dir string) (submissionProgress, error) {
 	err := readJSON(filepath.Join(dir, "submission.json"), &s)
 	if err == nil && s.State == "submitting" {
 		s.State = "submit_failed"
-		s.Reason = "submission worker stopped before registration"
+		if len(s.ModuleClaims) != 0 {
+			s.State = "submit_unverified"
+		}
+		s.Reason = "submission worker stopped before confirming registration"
 		code := 125
 		s.Code = &code
 	}
@@ -312,7 +398,7 @@ func observeSubmission(ctx context.Context, host, id, op string, limit time.Dura
 		if op == "status" || op == "show" {
 			return true, json.NewEncoder(os.Stdout).Encode(s)
 		}
-		if s.State == "submit_failed" {
+		if s.State == "submit_failed" || s.State == "submit_unverified" {
 			diagnosticf("%v\n", s.Reason)
 			return true, ctlExit(8)
 		}

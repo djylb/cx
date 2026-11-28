@@ -48,6 +48,9 @@ const (
 const dangerFullAccess = "danger-full-access"
 
 type config struct {
+	ContextWarn                         *float64    `json:"context_warn,omitempty"`
+	Work                                *moduleWork `json:"work,omitempty"`
+	Preamble                            string      `json:"preamble,omitempty"`
 	secret                              *secretFilter
 	Env                                 map[string]string `json:"env,omitempty"`
 	Engine                              string            `json:"engine,omitempty"`
@@ -63,7 +66,7 @@ type config struct {
 	Dir, Model, Effort, Sandbox, Prompt string
 	localEnv                            []string
 	cacheUse                            *cacheUse
-	Input                               []json.RawMessage `json:"input,omitempty"`
+	Input                               []json.RawMessage `json:"input,omitzero"`
 	Argv                                []string          `json:"argv,omitempty"`
 	Own                                 []string          `json:"own,omitempty"`
 	Roots                               []string          `json:"roots,omitempty"` // extra writable roots (workspace-write), e.g. a Go build cache
@@ -85,8 +88,9 @@ func (c *config) privileged() bool {
 }
 
 type status struct {
-	LastEvent time.Time `json:"last_event_time"`
-	ExitCode  *int64    `json:"exit_code,omitempty"`
+	OutputDrain string    `json:"output_drain,omitempty"`
+	LastEvent   time.Time `json:"last_event_time"`
+	ExitCode    *int64    `json:"exit_code,omitempty"`
 
 	Project     string `json:"project,omitempty"`
 	Session     string `json:"session,omitempty"`
@@ -301,7 +305,7 @@ func registerJob(ctx context.Context, parent, dir string, c config, s status, sy
 			switch entry.Name() {
 			case "owner.lock", "owner-probe.lock", "state":
 				continue
-			case "output.log", "progress.log", "events.jsonl", "handoff.lock":
+			case commandOutputName, commandOutputStream, commandOutputCursor, "progress.log", "events.jsonl", "handoff.lock":
 				// A staged registration has published its config before any
 				// mutable streams are created.
 				if cfg, err := jobConfigRecord(dir); err == nil && cfg.Seq != 0 {
@@ -345,7 +349,7 @@ func publishRegistration(parent, dir string, c config, s status, syncConfig func
 	}
 	files := []string{"progress.log", "events.jsonl", "handoff.lock", "owner-probe.lock"}
 	if len(c.Argv) > 0 {
-		files = append(files, "output.log")
+		files = append(files, commandOutputStream, commandOutputCursor)
 	}
 	for _, name := range files {
 		f, err := openJobFile(filepath.Join(dir, name), jobFileNew)
@@ -435,12 +439,16 @@ func runNodeWithRegistration(ctx context.Context, args []string, directSubmit bo
 		return json.NewEncoder(os.Stdout).Encode(host)
 	}
 	job := fs.String("job", "", "job ID")
-	var expectedRun, expectedDir, expectedWorkspace, launchID string
+	var expectedRun, expectedDir, expectedWorkspace, expectedBaseline, claimOverride, launchID string
 	if op == "_command" || op == "resume" || op == "fork" || op == "mcp-tools" {
 		fs.StringVar(&expectedRun, "expect-run", "", "expected job run for worker handoff")
 	}
 	if op == "_command" || op == "resume" || op == "fork" {
 		fs.StringVar(&expectedDir, "expect-dir", "", "expected directory identity for worker handoff")
+	}
+	if op == "fork" || op == "resume" {
+		fs.StringVar(&expectedBaseline, "expect-baseline", "", "expected baseline for worker handoff")
+		fs.StringVar(&claimOverride, "claim-override", "", "controller module override reason")
 	}
 	if op == "start" || op == "fork" || op == "resume" {
 		fs.StringVar(&launchID, "launch-id", "", "runner handoff identifier")
@@ -493,7 +501,7 @@ func runNodeWithRegistration(ctx context.Context, args []string, directSubmit bo
 	}
 	newProfile := op == "start"
 
-	var prompt, preamblePath, stallNudgePath string
+	var prompt, preamblePath, stallNudgePath, moduleWorkFile string
 	if op == "start" {
 		fs.BoolVar(&command, "cmd", false, "start a command")
 		fs.Func("env", "command environment NAME=VALUE", func(v string) error { return addCommandEnv(&c.Env, v) })
@@ -506,6 +514,14 @@ func runNodeWithRegistration(ctx context.Context, args []string, directSubmit bo
 		fs.BoolVar(&force, "force", false, "skip duplicate key check")
 		fs.StringVar(&c.Dir, "dir", "", "working directory")
 		fs.StringVar(&prompt, "prompt-file", "", "UTF-8 prompt file")
+		fs.Func("context-warn", "context usage percentage for a scheduler advisory (0 disables)", func(value string) error {
+			threshold, parseErr := usagePercent(value)
+			if parseErr == nil {
+				c.ContextWarn = &threshold
+			}
+			return parseErr
+		})
+		fs.StringVar(&moduleWorkFile, "module-work-file", "", "submitted job metadata file")
 		fs.StringVar(&preamblePath, "preamble-file", os.Getenv("CXRUN_PREAMBLE_FILE"), "UTF-8 first-turn preamble file")
 		fs.StringVar(&stallNudgePath, "stall-nudge-file", "", "UTF-8 stall and recovery message file")
 		fs.StringVar(&c.Engine, "engine", "", "agent engine: "+strings.Join(engineNames(), " or ")+" (default "+defaultEngine+")")
@@ -551,6 +567,13 @@ func runNodeWithRegistration(ctx context.Context, args []string, directSubmit bo
 	}
 	if op == "start" {
 		c.Network = network || !noNetwork && c.Sandbox == "workspace-write"
+		if moduleWorkFile != "" {
+			var work moduleWork
+			if err = readJSON(moduleWorkFile, &work); err != nil {
+				return err
+			}
+			c.Work = &work
+		}
 	}
 	switch op {
 	case "rpc", "fork", "mcp", "history", "threads":
@@ -627,6 +650,9 @@ func runNodeWithRegistration(ctx context.Context, args []string, directSubmit bo
 		if op == "mcp-tools" {
 			return serveToolsFor(ctx, dir, expectedRun, commandInput{ctx: ctx}, os.Stdout)
 		}
+		if replayErr := replayOutboxTurnEvents(ctx, dir); replayErr != nil {
+			diagnosticf("cx: supplement outbox: %v\n", replayErr)
+		}
 		enc := json.NewEncoder(os.Stdout)
 		return readMail(dir, outSince, func(m agentMail) error { return enc.Encode(m) })
 	}
@@ -667,6 +693,20 @@ func runNodeWithRegistration(ctx context.Context, args []string, directSubmit bo
 		expectedRun, expectedDir = "", ""
 		if sourceErr = readJobConfig(src, &c); sourceErr != nil {
 			return sourceErr
+		}
+		sourceWork, sourceErr := workDir(src, from)
+		if sourceErr != nil {
+			return sourceErr
+		}
+		base, sourceErr := readJobBaseline(sourceWork)
+		if sourceErr != nil {
+			return sourceErr
+		}
+		if base.Work != nil {
+			c.Work = base.Work
+		}
+		if claimOverride != "" && c.Work != nil {
+			c.Work.ModuleOverride = claimOverride
 		}
 		if from.Thread == "" {
 			return errors.New("source has no thread")
@@ -779,8 +819,18 @@ func runNodeWithRegistration(ctx context.Context, args []string, directSubmit bo
 		}
 		defer releaseWorkspace()
 		if sourceID != "" {
-			if identityErr := sourceIdentity.checkDir(sourceDir); identityErr != nil {
-				return identityErr
+			var from status
+			if err = loadJobStatusInto(sourceDir, &from); err != nil {
+				return err
+			}
+			if err = sourceIdentity.check(sourceDir, from); err != nil {
+				return err
+			}
+			if expectedBaseline != "" {
+				binding := jobClaimInfo{RunID: sourceIdentity.run, Directory: sourceIdentity.key, Baseline: expectedBaseline}
+				if err = binding.check(sourceDir, from); err != nil {
+					return err
+				}
 			}
 		}
 		if op == "start" && bound.path != "" {
@@ -943,10 +993,10 @@ func runNodeWithRegistration(ctx context.Context, args []string, directSubmit bo
 				}
 			}
 			if strings.TrimSpace(prefix) != "" {
-				c.Prompt = strings.TrimRight(prefix, "\r\n") + "\n\n" + c.Prompt
+				c.Preamble = strings.TrimRight(prefix, "\r\n")
 			}
 			if opts.input != "" || len(opts.images) > 0 {
-				c.Input, startErr = opts.inputs(c.Prompt)
+				c.Input, startErr = opts.inputParts(c.Prompt)
 				if startErr != nil {
 					return startErr
 				}
@@ -1130,6 +1180,12 @@ func runNodeWithRegistration(ctx context.Context, args []string, directSubmit bo
 	if resumeTerminal && !s.final {
 		return errJobOwnerBusy
 	}
+	if op == "resume" && expectedBaseline != "" {
+		binding := jobClaimInfo{RunID: identity.run, Directory: identity.key, Baseline: expectedBaseline}
+		if err = binding.check(dir, s); err != nil {
+			return err
+		}
+	}
 	if closing != nil {
 		if confirmErr := closing.check(dir, s, cursor); confirmErr != nil {
 			return confirmErr
@@ -1245,6 +1301,9 @@ func runNodeWithRegistration(ctx context.Context, args []string, directSubmit bo
 	_ = guard.Close()
 	guard = nil
 	releaseWorkspace()
+	if claimOverride != "" {
+		appendProgress(dir, "module/override", claimOverride)
+	}
 	if ticket != nil {
 		if err = r.admit(ticket); err != nil {
 			if errors.Is(err, errQueuedClose) {

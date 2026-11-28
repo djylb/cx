@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 )
 
@@ -76,10 +77,17 @@ func stageResultDetails(ctx context.Context, dir, folder, extra string, s status
 }
 
 func copyResultLog(ctx context.Context, dir, stage, name, turnID string, latest bool, progress io.Writer) (string, bool, error) {
-	if (name == "output.log" || turnID == "") && !latest {
+	if (name == commandOutputName || turnID == "") && !latest {
 		return "", false, nil
 	}
-	in, err := openJobFile(filepath.Join(dir, name), jobFileRead)
+	var in *os.File
+	var end int64
+	var err error
+	if name == commandOutputName {
+		in, end, err = openCommandOutput(dir, nil)
+	} else {
+		in, err = openJobFile(filepath.Join(dir, name), jobFileRead)
+	}
 	if os.IsNotExist(err) {
 		return "", false, nil
 	}
@@ -87,11 +95,14 @@ func copyResultLog(ctx context.Context, dir, stage, name, turnID string, latest 
 		return "", false, err
 	}
 	defer closeBestEffort(in)
-	fi, err := in.Stat()
-	if err != nil {
-		return "", false, err
+	if name != commandOutputName {
+		fi, statErr := in.Stat()
+		if statErr != nil {
+			return "", false, statErr
+		}
+		end = fi.Size()
 	}
-	start, end := int64(0), fi.Size()
+	var start int64
 	var found bool
 	if name == "progress.log" && turnID != "" {
 		start, end, found, err = turnLogRange(ctx, io.TeeReader(in, progress), turnID, end)
@@ -158,15 +169,24 @@ func turnLogRange(ctx context.Context, in io.Reader, id string, size int64) (sta
 }
 
 type resultOutput struct {
-	Status        *string            `json:"status"`
-	ExitCode      *int64             `json:"exit_code"`
-	LogPath       *string            `json:"log_path"`
-	Job           string             `json:"job"`
-	Engine        string             `json:"engine"`
-	ReportPath    string             `json:"report_path"`
-	PatchManifest string             `json:"patch_manifest"`
-	Artifacts     []SnapshotArtifact `json:"artifacts"`
-	Turn          int64              `json:"turn"`
+	CumulativeUsage  *usageCounters     `json:"cumulative_usage"`
+	Usage            *usageSummary      `json:"usage"`
+	ContextWarning   *contextWarning    `json:"context_warning,omitempty"`
+	AcceptanceStatus string             `json:"acceptance"`
+	Acceptance       []acceptanceResult `json:"acceptance_checks,omitempty"`
+	ContextVersion   string             `json:"context_version,omitempty"`
+	Changeset        string             `json:"changeset,omitempty"`
+	ReadsStatus      string             `json:"reads_status"`
+	ReadsPath        *string            `json:"reads_path"`
+	Status           *string            `json:"status"`
+	ExitCode         *int64             `json:"exit_code"`
+	LogPath          *string            `json:"log_path"`
+	Job              string             `json:"job"`
+	Engine           string             `json:"engine"`
+	ReportPath       string             `json:"report_path"`
+	PatchManifest    string             `json:"patch_manifest"`
+	Artifacts        []SnapshotArtifact `json:"artifacts"`
+	Turn             int64              `json:"turn"`
 }
 
 func resultReportPath(dir string) (string, error) {
@@ -241,8 +261,37 @@ func displayResultDetails(out io.Writer, dir, id string, logOnly bool) error {
 		row.Path = filepath.Join(dir, row.Path)
 		artifacts = append(artifacts, row)
 	}
+	reads, path := readResultReads(dir, m.Turn)
+	addAcceptanceToResult(dir, &m)
 	return json.NewEncoder(out).Encode(resultOutput{
+		ContextVersion: m.ContextVersion, Usage: m.Usage, CumulativeUsage: m.CumulativeUsage, ContextWarning: m.ContextWarning, AcceptanceStatus: m.AcceptanceStatus, Acceptance: m.Acceptance, Changeset: m.Changeset, ReadsPath: path, ReadsStatus: reads.Status,
 		Job: id, Engine: m.Engine, Status: m.Status, ExitCode: m.ExitCode, Turn: m.Turn,
 		ReportPath: report, LogPath: logPath, PatchManifest: manifest, Artifacts: artifacts,
 	})
+}
+
+func readResultReads(dir string, number int64) (turnReads, *string) {
+	missing := turnReads{Turn: number, Status: "unavailable"}
+	path, err := filepath.Abs(filepath.Join(dir, readsFilename))
+	if err != nil {
+		return missing, nil
+	}
+	var reads turnReads
+	if err := readJSON(path, &reads); err != nil || reads.Turn != number || reads.Paths == nil ||
+		slices.ContainsFunc(reads.Paths, func(p readObservation) bool {
+			return p.Path == "" || p.Source != "structured" && p.Source != "parsed"
+		}) {
+		return missing, nil
+	}
+	reads.Status = "available"
+	return reads, &path
+}
+
+func displayResultReads(out io.Writer, dir string) error {
+	var meta turnResult
+	if err := readJSON(filepath.Join(dir, "result.json"), &meta); err != nil {
+		return err
+	}
+	reads, _ := readResultReads(dir, meta.Turn)
+	return json.NewEncoder(out).Encode(reads)
 }

@@ -271,18 +271,35 @@ func observe(ctx context.Context, op, dir string) error {
 	if err = observer.poll(ctx); err != nil {
 		return err
 	}
-	log, err := openObservedFile(dir, observer.s.logName(), &observer.identity)
-	if err != nil {
-		return err
-	}
-	defer closeBestEffort(log)
-	for {
-		if _, err = io.Copy(os.Stdout, log); err != nil {
-			return err
+	if observer.s.Engine != "cmd" {
+		log, openErr := openObservedFile(dir, observer.s.logName(), &observer.identity)
+		if openErr != nil {
+			return openErr
 		}
-		if observer.s.final {
+		defer closeBestEffort(log)
+		for {
+			if _, err = io.Copy(os.Stdout, log); err != nil || observer.s.final {
+				return err
+			}
+			if err = pause(ctx, 500*time.Millisecond); err != nil {
+				return err
+			}
+			if err = observer.poll(ctx); err != nil {
+				return err
+			}
+		}
+	}
+	var offset int64
+	for {
+		var length int64
+		length, err = streamCommandOutput(os.Stdout, dir, offset, observer.s, &observer.identity)
+		if errors.Is(err, errDrained) {
 			return nil
 		}
+		if err != nil {
+			return err
+		}
+		offset += length
 		if err = pause(ctx, 500*time.Millisecond); err != nil {
 			return err
 		}
@@ -346,6 +363,7 @@ func waitJob(ctx context.Context, dir string, acknowledge bool) (waitObservation
 		return waitObservation{}, err
 	}
 	initial := s
+	initial.Finished = completedResultCount(s)
 	observer.floor = &initial
 	for {
 		if replacedRun(initial.RunID, s.RunID) {
@@ -355,7 +373,7 @@ func waitJob(ctx context.Context, dir string, acknowledge bool) (waitObservation
 			fmt.Printf("job=%s status=%s outcome=interrupted\n", s.Job, s.State)
 			return waitObservation{status: s}, outcomeError(s.State, "interrupted")
 		}
-		advanced := s.Finished > initial.Finished
+		advanced := completedResultCount(s) > initial.Finished
 		if !advanced && s.State == "queued" && s.QueueReason != "" {
 			observation := waitObservation{status: s, EventID: queueEventID(s)}
 			if !acknowledge {
@@ -530,6 +548,10 @@ func writeLogFrom(out io.Writer, dir string, args []string) error {
 }
 
 func writeJobLog(out io.Writer, dir string, off int64, s status, identity *jobIdentity) error {
+	if s.Engine == "cmd" {
+		_, err := streamCommandOutput(out, dir, off, s, identity)
+		return err
+	}
 	f, err := openObservedFile(dir, s.logName(), identity)
 	if err != nil {
 		return err
@@ -537,15 +559,6 @@ func writeJobLog(out io.Writer, dir string, off int64, s status, identity *jobId
 	defer closeBestEffort(f)
 	if _, err = f.Seek(off, io.SeekStart); err != nil {
 		return err
-	}
-	if s.Engine == "cmd" {
-		if _, err = io.Copy(out, f); err != nil {
-			return err
-		}
-		if s.final {
-			return errDrained
-		}
-		return nil
 	}
 	b, err := io.ReadAll(f)
 	if err != nil {

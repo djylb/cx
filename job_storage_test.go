@@ -15,7 +15,7 @@ func TestJobStorageDoesNotReplaceFiles(t *testing.T) {
 	// snapshot storage, and publication/cleanup of whole directories.
 	allowed := map[string]map[string]int{
 		// These records are private cache maintenance metadata outside all job directories.
-		"build_cache.go": {"prepareCaches": 1, "prepareCacheEntry": 1, "scanCaches": 1, "startCachedCommand": 1},
+		"build_cache.go": {"prepareCaches": 1, "prepareCacheEntry": 1, "scanCaches": 1, "startScopedCommand": 1},
 		"main.go":        {"atomicWrite": 1, "atomicWriteSync": 1, "writeJSON": 1, "detachCleanJob": 1},
 		"ctl_apply.go":   {"installPlans": 2, "applyTurn": 2},
 		"ctl_center.go":  {"freezeCompilerSource": 2, "compileSnapshot": 1},
@@ -31,16 +31,23 @@ func TestJobStorageDoesNotReplaceFiles(t *testing.T) {
 		"ctl_node.go":            {"hostSettings": 1},
 		"ctl_observe.go":         {"ctlWaitAny": 1, "saveLSSnapshot": 1}, // Controller-local ls cache, replaced whole.
 		"ctl_project.go":         {"ctlProject": 1},
-		"ctl_queue.go":           {"deployJob": 1, "submissionWorker": 3, "queueJob": 1},                            // A failed submission request is replaced under the submit lock.
-		"ctl_rebase.go":          {"ctlRebase": 2, "recordRebaseFailure": 1, "dispatchRebase": 1, "claimRebase": 1}, // Controller-local pending rebase requests, replaced whole.
+		"ctl_queue.go":           {"deployJob": 1, "submissionWorker": 3, "queueJob": 2},                            // Controller request, queued progress, and confirmed local launch failure under the schedule lock.
+		"ctl_rebase.go":          {"ctlRebase": 3, "recordRebaseFailure": 1, "dispatchRebase": 1, "claimRebase": 1}, // Controller-local pending rebase requests, replaced whole.
 		"ctl_result.go":          {"sealTurn": 1, "unpackTurn": 1, "publishResultMarker": 1, "forgetResult": 1, "Write": 1},
-		"ctl_route.go":           {"rememberRoute": 1},
-		"ctl_transfer.go":        {"receiveTask": 1},
-		"snap_publish.go":        {"snapPrerequisites": 1, "snapArchive": 1, "Publish": 1},
-		"wait_any.go":            {"updateWaitCursor": 1, "registerWaitObserver": 1}, // Controller cursor and observer record.
-		"ctl_refresh.go":         {"ctlRefresh": 2},                                  // Controller-local pending refresh request.
-		"node_refresh.go":        {"refreshCheckout": 1, "commitRefresh": 1},         // Private checkout baseline marker and input.
+		// Context output is published as one immutable directory per baseline.
+		"runner_modules.go": {"prepareModuleContexts": 1},
+		// Controller transport history rotates complete private log files.
+		"transport_log.go": {"recordTransportSample": 1},
+		"ctl_route.go":     {"rememberRoute": 1},
+		"ctl_transfer.go":  {"receiveTask": 1},
+		"snap_publish.go":  {"snapPrerequisites": 1, "snapArchive": 1, "Publish": 1},
+		"wait_any.go":      {"updateWaitCursor": 1, "registerWaitObserver": 1}, // Controller cursor and observer record.
+		"ctl_refresh.go":   {"ctlRefresh": 2},                                  // Controller-local pending refresh request.
+		"node_refresh.go":  {"refreshCheckout": 1, "commitRefresh": 1},         // Private checkout baseline marker and input.
 	}
+	// Module contexts and turn metadata use exclusive staging files and
+	// immutable links. Read histories derive from turn references. Frozen
+	// deliveries publish whole private directories before and after checks.
 	// Every standard-library file open, including references through a
 	// function variable, must belong to one of these non-job scopes.
 	rawAllowed := map[string]map[string]int{

@@ -9,7 +9,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"syscall"
 	"time"
 
 	"github.com/djylb/timeshim"
@@ -45,17 +44,16 @@ const (
 )
 
 func (r *runner) publishOutputTail() error {
-	f, err := openJobFile(filepath.Join(r.dir, "output.log"), jobFileRead)
+	f, length, err := openCommandOutput(r.dir, nil)
 	if err != nil {
 		return err
 	}
 	defer closeBestEffort(f)
-	fi, err := f.Stat()
-	if err != nil {
-		return err
+	size := min(length, outputTailBytes)
+	b, err := io.ReadAll(io.NewSectionReader(f, length-size, size))
+	if err == nil && int64(len(b)) != size {
+		err = io.ErrUnexpectedEOF
 	}
-	size := min(fi.Size(), outputTailBytes)
-	b, err := io.ReadAll(io.NewSectionReader(f, fi.Size()-size, size))
 	if err != nil {
 		return err
 	}
@@ -69,6 +67,7 @@ func (r *runner) publishOutputTail() error {
 
 func (r *runner) serveCommand() (err error) {
 	var cmd *exec.Cmd
+	var abandoned bool
 	// Publish terminal status only after output and progress are flushed.
 	defer func() {
 		r.s.CommandPID = 0
@@ -98,44 +97,52 @@ func (r *runner) serveCommand() (err error) {
 		return err
 	}
 	defer closeBestEffort(r.log)
-	out, err := openJobFile(filepath.Join(r.dir, "output.log"), jobFileAppend)
+	out, err := openCommandOutputWriter(r.dir)
 	if err != nil {
 		return err
 	}
-	defer closeBestEffort(out)
-	defer func() { err = errors.Join(err, r.publishOutputTail()) }()
-	if r.c.Shell {
-		cmd = shellCommand(r.c.Argv[0])
-	} else {
-		cmd = exec.Command(r.c.Argv[0], r.c.Argv[1:]...)
-	}
-	cmd.Dir = r.c.Dir
-	output, flush := r.c.secret.output(cmd, out)
-	cmd.Stdout, cmd.Stderr = output, output
-	defer func() { err = errors.Join(err, flush()) }()
-	r.c.mark(cmd, r.dir)
-	tree, err := r.c.startCachedCommand(cmd)
-	if err != nil {
-		return err
-	}
-	stopRuntime := r.startRuntime()
-	defer stopRuntime()
-	done := make(chan processWait, 1)
-	go func() { done <- processWait{cmd.Wait()} }()
-	var exited bool
 	defer func() {
-		if !exited {
-			_ = cmd.Process.Kill()
+		_, sealErr := out.seal(context.WithoutCancel(r.baseContext()), r.dir, abandoned)
+		if sealErr != nil {
+			r.s.OutputDrain = "truncated"
 		}
-		err = errors.Join(err, tree.cleanup())
-		if !exited {
-			select {
-			case <-done:
-			case <-time.After(5 * time.Second):
-				err = errors.Join(err, errReapDeadline)
-			}
+		err = errors.Join(err, sealErr, r.publishOutputTail())
+	}()
+	if r.c.Work != nil && r.c.Work.hasModuleContext() {
+		r.modulePreamble()
+	}
+	if r.closeRequest != 0 {
+		r.closeCompleted = true
+		r.s.State, r.s.CompletedStatus = "failed", "interrupted"
+		return r.note("command/stop", "interrupted before start")
+	}
+	if _, close, closeErr := r.takeMarker("close"); closeErr != nil {
+		return closeErr
+	} else if close {
+		r.closeCompleted = true
+		r.s.State, r.s.CompletedStatus = "failed", "interrupted"
+		return r.note("command/stop", "interrupted before start")
+	}
+	cmd = commandArgv(r.c.Argv, r.c.Shell)
+	cmd.Dir = r.c.Dir
+	output, _ := r.c.secret.output(cmd, out)
+	cmd.Stdout, cmd.Stderr = output, output
+	r.c.mark(cmd, r.dir)
+	child, err := startManagedCommand(cmd, &r.c, false)
+	if err != nil {
+		return err
+	}
+	finished := false
+	defer func() {
+		if !finished {
+			outputErr := child.finish()
+			abandoned = errors.Is(outputErr, errOutputTruncated)
+			r.s.OutputDrain = managedOutputStatus(outputErr)
+			err = errors.Join(err, outputErr)
 		}
 	}()
+	stopRuntime := r.startRuntime()
+	defer stopRuntime()
 	r.s.State = "running"
 	r.s.CommandPID = cmd.Process.Pid
 	r.s.LastEvent = time.Now().UTC()
@@ -147,95 +154,64 @@ func (r *runner) serveCommand() (err error) {
 	}
 	clock := timeshim.Or(r.clock)
 	lastOutput := clock.Now()
-	ticker := timeshim.NewTicker(clock, commandPollInterval)
-	defer ticker.Stop()
 	var size int64
-	for {
-		var reason string
-		var closing bool
-		select {
-		case waited := <-done:
-			err = waited.err
-			exited = true
-			if cmd.ProcessState == nil {
-				return err
-			}
-			if errors.Is(err, exec.ErrWaitDelay) {
-				err = nil
-			}
-			code := commandExitCode(cmd.ProcessState)
-			r.s.ExitCode = &code
-			if err == nil {
-				r.s.State = "done"
-			} else {
-				r.s.State = "failed"
-				r.s.Error = err.Error()
-			}
-			return r.note("command/exit", fmt.Sprintf("exit_code=%d", code))
-		case <-r.ctx.Done():
-			reason = "timeout"
-			if !errors.Is(r.ctx.Err(), context.DeadlineExceeded) {
-				reason = "interrupted"
-			}
-		case <-ticker.C:
-			fi, e := out.Stat()
-			if e != nil {
-				return e
-			}
-			if fi.Size() != size {
-				size = fi.Size()
-				lastOutput = clock.Now()
-			}
-			if _, ok, e := r.takeMarker("close"); e != nil {
-				return e
-			} else if ok {
-				reason = "interrupted"
-				closing = true
-				if runtime.GOOS != "windows" {
-					if err = r.reclaim(); err != nil {
-						return err
-					}
-				}
-			} else if r.c.Quiet > 0 && timeshim.Since(clock, lastOutput) >= r.c.Quiet {
-				reason = "stalled"
-			} else {
-				continue
-			}
+	poll := func() error {
+		if end := out.length(); end != size {
+			size = end
+			lastOutput = clock.Now()
 		}
-		if err = r.note("command/stop", reason); err != nil {
-			return err
+		if _, ok, e := r.takeMarker("close"); e != nil {
+			return e
+		} else if ok {
+			return errQueuedClose
 		}
-		if runtime.GOOS == "windows" {
-			if err = tree.cleanup(); err != nil {
-				return err
-			}
-		} else {
-			// The Unix process group remains available for explicit close or clean.
-			_ = cmd.Process.Signal(syscall.SIGTERM)
+		if r.c.Quiet > 0 && timeshim.Since(clock, lastOutput) >= r.c.Quiet {
+			return errStalled
 		}
-		select {
-		case <-done:
-		case <-time.After(10 * time.Second):
-			_ = cmd.Process.Kill()
-			select {
-			case <-done:
-			case <-time.After(5 * time.Second):
-				return errReapDeadline
-			}
-		}
-		exited = true
-		r.closeCompleted = closing
-		if cmd.ProcessState != nil {
-			code := commandExitCode(cmd.ProcessState)
-			r.s.ExitCode = &code
-		}
-		r.s.State = reason
-		r.s.CompletedStatus = reason
-		if reason == "interrupted" {
-			r.s.State = "failed"
-		}
-		return r.note("command/exit", reason)
+		return nil
 	}
+	waitErr, stopErr := child.wait(r.ctx, r.clock, poll)
+	outputErr := child.finish()
+	finished = true
+	r.s.ExitCode = child.exitCode()
+	r.s.OutputDrain = managedOutputStatus(outputErr)
+	abandoned = errors.Is(outputErr, errOutputTruncated)
+	if errors.Is(outputErr, errQueuedClose) {
+		r.closeCompleted = true
+	}
+	if errors.Is(outputErr, errManagedReap) {
+		defer func() { err = errors.Join(err, outputErr) }()
+	}
+	if stopErr == nil {
+		if r.s.ExitCode == nil {
+			return waitErr
+		}
+		r.s.State = "done"
+		if waitErr != nil {
+			r.s.State = "failed"
+			r.s.Error = waitErr.Error()
+		}
+		return r.note("command/exit", fmt.Sprintf("exit_code=%d", *r.s.ExitCode))
+	}
+	switch {
+	case errors.Is(stopErr, context.DeadlineExceeded):
+		r.s.State, r.s.CompletedStatus = "timeout", "timeout"
+	case errors.Is(stopErr, errStalled):
+		r.s.State, r.s.CompletedStatus = "stalled", "stalled"
+	case errors.Is(stopErr, errQueuedClose), errors.Is(stopErr, context.Canceled):
+		if errors.Is(stopErr, errQueuedClose) {
+			if runtime.GOOS != "windows" {
+				if reclaimErr := r.reclaim(); reclaimErr != nil {
+					return reclaimErr
+				}
+			}
+			r.closeCompleted = true
+		}
+		r.s.State, r.s.CompletedStatus = "failed", "interrupted"
+	default:
+		return stopErr
+	}
+	return r.note("command/exit", r.s.CompletedStatus)
 }
 
 var errReapDeadline = errors.New("process reap deadline")
@@ -249,4 +225,51 @@ func waitProcess(cmd *exec.Cmd, limit time.Duration, clock timeshim.Clock) error
 	case <-timeshim.After(timeshim.Or(clock), limit):
 		return errReapDeadline
 	}
+}
+
+func commandArgv(argv []string, shell bool) *exec.Cmd {
+	if shell {
+		return shellCommand(argv[0])
+	}
+	return exec.Command(argv[0], argv[1:]...)
+}
+
+// Auxiliary commands have no job of their own. Their processes are scoped
+// to a separate group so stopping a check cannot stop the agent engine.
+func runBoundedCommand(ctx context.Context, clock timeshim.Clock, limit time.Duration, cmd *exec.Cmd, poll func() error, config *config) (int64, error) {
+	clock = timeshim.Or(clock)
+	ctx, cancel := timeshim.WithTimeout(ctx, clock, limit)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return -1, err
+	}
+	child, err := startManagedCommand(cmd, config, true)
+	if err != nil {
+		return -1, err
+	}
+	waitErr, stopErr := child.wait(ctx, clock, poll)
+	err = errors.Join(waitErr, stopErr, child.finish())
+	if errors.Is(stopErr, context.DeadlineExceeded) {
+		return 124, err
+	}
+	if stopErr == nil {
+		if code := child.exitCode(); code != nil {
+			return *code, err
+		}
+	}
+	return -1, err
+}
+
+type commandTail []byte
+
+func (t *commandTail) Write(p []byte) (int, error) {
+	if len(p) >= outputTailBytes {
+		*t = append((*t)[:0], p[len(p)-outputTailBytes:]...)
+	} else {
+		if discard := len(*t) + len(p) - outputTailBytes; discard > 0 {
+			*t = append((*t)[:0], (*t)[discard:]...)
+		}
+		*t = append(*t, p...)
+	}
+	return len(p), nil
 }

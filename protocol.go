@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/djylb/timeshim"
@@ -375,6 +376,8 @@ func (r *runner) call(method string, p any, result any) error {
 }
 
 type runner struct {
+	liveTurn                      string
+	startingTurn                  bool
 	idleSince, turnSince, closing time.Time
 	lastAction                    time.Time
 	lastStateWrite                time.Time
@@ -393,9 +396,17 @@ type runner struct {
 	cmdOpen                   map[string]time.Time // command items in progress
 	follow                    *followAdmission
 
-	root, dir string
-	lastText  string
-	pending   string // a turn to start once the current one ended (stall recovery)
+	root, dir            string
+	lastText             string
+	moduleContextVersion string
+	usageTurn            string
+	usageGeneration      uint64
+	auxiliaryCtx         context.Context
+	auxiliary            sync.WaitGroup
+	refreshModuleNote    string
+	moduleNote           string
+	reads                readTracker
+	pending              string // a turn to start once the current one ended (stall recovery)
 
 	c              config
 	s              status
@@ -450,10 +461,7 @@ func (r *runner) saveTerminal() (result error) {
 			defer func() { result = errors.Join(result, err) }()
 		}
 	}
-	ctx := r.ctx
-	if ctx == nil {
-		ctx = context.Background()
-	}
+	ctx := r.baseContext()
 	// Cleanup must still run after the runtime deadline or a canceled caller.
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 	defer cancel()
@@ -655,7 +663,44 @@ func (r *runner) serveAgent(session func() error) (err error) {
 		return err
 	}
 	defer closeBestEffort(r.events)
-	err = session()
+	work, err := workDir(r.dir, r.s)
+	if err != nil {
+		return err
+	}
+	base, err := readJobBaseline(work)
+	if err != nil {
+		return err
+	}
+	if base.Work != nil {
+		r.c.Work = base.Work
+	}
+	auxiliary, cancelAuxiliary := context.WithCancel(r.baseContext())
+	r.auxiliaryCtx = auxiliary
+	defer func() {
+		cancelAuxiliary()
+		r.auxiliary.Wait()
+	}()
+	if cleanupErr := r.recoverAuxiliaryWorkspace(); cleanupErr != nil {
+		diagnosticf("cx: recover auxiliary work for %s: %v\n", r.dir, cleanupErr)
+	}
+	if r.c.ForkThread == "" {
+		if r.s.Finished == 0 && r.s.Turn == "" {
+			r.moduleNote = r.modulePreamble()
+		} else if r.c.Work != nil && r.c.Work.hasModuleContext() {
+			previous, readErr := readTurnMetadata(r.dir, r.s.LastCompleted)
+			if readErr == nil {
+				r.moduleContextVersion = previous.ContextVersion
+			}
+			if base.Request != "" && base.Request != r.moduleContextVersion {
+				r.refreshModuleNote = r.modulePreamble()
+			}
+		}
+	}
+	if r.closeRequest != 0 {
+		err = errQueuedClose
+	} else {
+		err = session()
+	}
 	if errors.Is(err, errQueuedClose) {
 		r.s.CompletedStatus = "interrupted"
 		err = nil
@@ -749,4 +794,13 @@ func (r *runner) initialize() error {
 		return err
 	}
 	return r.srv.send(fields{"method": "initialized"})
+}
+
+// baseContext is the runner's lifetime context; runners built without one
+// (tests, direct calls) run under Background.
+func (r *runner) baseContext() context.Context {
+	if r.ctx == nil {
+		return context.Background()
+	}
+	return r.ctx
 }

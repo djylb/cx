@@ -61,7 +61,7 @@ func TestControllerListCachedHost(t *testing.T) {
 		t.Fatalf("live: %s", live)
 	}
 
-	cache := filepath.Join(f.home, ".cache", "cx", "ls", "local.json")
+	cache := filepath.Join(f.home, "ls", "local.json") // CX_HOME is the fixture home
 	before, err := os.ReadFile(cache)
 	if err != nil {
 		t.Fatal(err)
@@ -236,4 +236,50 @@ func TestListWatchBriefRemovalColumns(t *testing.T) {
 		return
 	}
 	t.Fatalf("missing removal: %v", scanner.Err())
+}
+
+func TestListActiveAcrossHostsAndSessions(t *testing.T) {
+	f := newControllerFixture(t)
+	root := filepath.Join(f.home, "state")
+	for _, s := range []status{
+		{Project: "p", Job: "local-running", Session: "fixture", State: "running", RunID: "active"},
+		{Project: "p", Job: "local-waiting", Session: "other", State: "waiting", RunID: "waiting"},
+		{Project: "p", Job: "local-done", Session: "fixture", State: "done", RunID: "finished"},
+	} {
+		waitFixture(t, root, "p/"+s.Job, s)
+	}
+	slot, err := submissionDir("local", "p/pending")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.MkdirAll(slot, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err = writeJSON(filepath.Join(slot, "submission.json"), submissionProgress{State: "submitting", Host: "local", Project: "p", Job: "pending", Session: "other"}); err != nil {
+		t.Fatal(err)
+	}
+	lock, err := lockPath(filepath.Join(slot, "worker.lock"), os.O_CREATE)
+	if err != nil || lock == nil {
+		t.Fatalf("hold submit worker: %v", err)
+	}
+	defer closeBestEffort(lock)
+	snapWriteTest(t, filepath.Join(f.home, ".config", "cx", "hosts.toml"), "[hosts.worker]\nssh = \"worker\"\nplatform = \"linux/amd64\"\n")
+	fake := "#!/bin/sh\nprintf 'cx-wire: ready\\n' >&2\nprintf '%s\\n' '[{\"project\":\"p\",\"job\":\"remote-queued\",\"status\":\"queued\",\"session\":\"remote\"},{\"project\":\"p\",\"job\":\"remote-failed\",\"status\":\"failed\"},{\"project\":\"p\",\"job\":\"remote-approval\",\"status\":\"waiting_approval\"}]'\n"
+	if err := os.WriteFile(filepath.Join(f.home, "ssh"), []byte(fake), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", f.home+string(os.PathListSeparator)+os.Getenv("PATH"))
+	for _, args := range [][]string{{"ls", "--active", "--brief"}, {"ls", "--active", "--json", "--brief"}} {
+		out := string(cliOutput(t, 0, nil, f.cx, args...))
+		for _, job := range []string{"local-running", "local-waiting", "pending", "remote-queued"} {
+			if !strings.Contains(out, job) {
+				t.Errorf("%v omitted %s: %s", args, job, out)
+			}
+		}
+		for _, job := range []string{"local-done", "remote-failed", "remote-approval"} {
+			if strings.Contains(out, job) {
+				t.Errorf("%v included %s: %s", args, job, out)
+			}
+		}
+	}
 }

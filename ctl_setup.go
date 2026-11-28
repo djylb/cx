@@ -149,7 +149,7 @@ func upload(ctx context.Context, h endpoint, source, dest string) error {
 			return e
 		}
 		attempt, stop := context.WithCancel(ctx)
-		cmd, e := h.command(attempt, []string{"recv", dest, "--offset", strconv.FormatInt(n, 10)})
+		cmd, e := h.transportCommand(attempt, []string{"recv", dest, "--offset", strconv.FormatInt(n, 10)}, 45*time.Second)
 		if e != nil {
 			stop()
 			_ = f.Close()
@@ -166,7 +166,7 @@ func upload(ctx context.Context, h endpoint, source, dest string) error {
 			sent <- err
 		}()
 		var diag bytes.Buffer
-		e = runActive(cmd, stop, h.connectionBudget(45*time.Second), 45*time.Second, io.Discard, &diag)
+		e = cmd.run(ctx, stop, io.Discard, &diag)
 		_ = rd.Close()
 		e = errors.Join(e, <-sent)
 		if e != nil {

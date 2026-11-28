@@ -65,6 +65,14 @@ func rawArg(v string) (json.RawMessage, error) {
 	return b, nil
 }
 func (o *options) inputs(text string) ([]json.RawMessage, error) {
+	parts, err := o.inputParts(text)
+	if err == nil && len(parts) == 0 {
+		err = errors.New("empty input")
+	}
+	return parts, err
+}
+
+func (o *options) inputParts(text string) ([]json.RawMessage, error) {
 	var a []json.RawMessage
 	if o.input != "" {
 		b, err := rawArg(o.input)
@@ -86,9 +94,6 @@ func (o *options) inputs(text string) ([]json.RawMessage, error) {
 		}
 		b, _ := json.Marshal(fields{"type": "localImage", "path": path})
 		a = append(a, b)
-	}
-	if len(a) == 0 {
-		return nil, errors.New("empty input")
 	}
 	return a, nil
 }

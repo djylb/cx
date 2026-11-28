@@ -232,6 +232,13 @@ func projectJobStatusWithBarrier(ctx context.Context, dir string, s *status, bar
 	if err = barrier(r.stateLog); err != nil {
 		return false, errors.Join(err, r.stateLog.Close())
 	}
+	if r.c.Engine != "cmd" {
+		// Recovery owns the old run here. Reap its auxiliary processes
+		// before removing their temporary snapshot checkouts.
+		if cleanupErr := r.recoverAuxiliaryWorkspace(); cleanupErr != nil {
+			diagnosticf("cx: recover auxiliary work for %s: %v\n", dir, cleanupErr)
+		}
+	}
 	if err = errors.Join(r.saveTerminal(), r.s.Mux.close(ctx)); err != nil {
 		return false, err
 	}

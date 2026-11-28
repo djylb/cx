@@ -15,14 +15,15 @@ import (
 )
 
 type rebaseRequest struct {
-	Refresh   *refreshTodo `json:",omitempty"`
-	Text      string
-	Session   string
-	Host      string `json:",omitempty"`
-	Profile   string `json:",omitempty"`
-	Child     string `json:",omitempty"`
-	Failure   string `json:",omitempty"`
-	Submitted bool   `json:",omitempty"`
+	ModuleOverride string       `json:",omitempty"`
+	Refresh        *refreshTodo `json:",omitempty"`
+	Text           string
+	Session        string
+	Host           string `json:",omitempty"`
+	Profile        string `json:",omitempty"`
+	Child          string `json:",omitempty"`
+	Failure        string `json:",omitempty"`
+	Submitted      bool   `json:",omitempty"`
 }
 
 func ctlRebase(ctx context.Context, h endpoint, host, id string, o ctlOptions) error {
@@ -37,7 +38,12 @@ func ctlRebase(ctx context.Context, h endpoint, host, id string, o ctlOptions) e
 	if o.host != "" && errors.Is(err, ctlExit(9)) && ctx.Err() == nil {
 		cached, target, err = offlineRebaseResult(host, id, target.Number, o.turn != "", err)
 	}
-	pending := errors.Is(err, ctlExit(44)) && resultInProgress(s) && target.Number == s.Finished+1
+	if activeClaimState(s.State) {
+		reportActiveSource(claimAddress{Host: host, Job: id})
+	}
+	pendingTurn := s.Finished + 1
+
+	pending := errors.Is(err, ctlExit(44)) && resultInProgress(s) && target.Number == pendingTurn
 	if err != nil && !pending {
 		return err
 	}
@@ -83,8 +89,14 @@ func ctlRebase(ctx context.Context, h endpoint, host, id string, o ctlOptions) e
 			fmt.Println(req.Child)
 			return nil
 		}
+		if o.moduleOverride != "" && req.ModuleOverride != o.moduleOverride {
+			req.ModuleOverride = o.moduleOverride
+			if err = writeJSON(slot, req); err != nil {
+				return err
+			}
+		}
 	} else {
-		req = rebaseRequest{Refresh: req.Refresh, Text: o.dir, Session: o.session, Host: o.host, Profile: o.profile}
+		req = rebaseRequest{Refresh: req.Refresh, Text: o.dir, Session: o.session, Host: o.host, Profile: o.profile, ModuleOverride: o.moduleOverride}
 		if err = writeJSON(slot, req); err != nil {
 			return err
 		}
@@ -280,10 +292,11 @@ func dispatchRebase(ctx context.Context, h endpoint, host, id, dest, result stri
 		return err
 	}
 	if !req.Submitted {
+		sourceHost := host
 		if req.Host != "" {
 			host = req.Host
 		}
-		if err = submitRebase(ctx, host, dest, result, id, req); err != nil {
+		if err = submitRebase(ctx, host, sourceHost, dest, result, id, req); err != nil {
 			return err
 		}
 		done, receiptErr := rebaseSubmitted(host, req.Child)

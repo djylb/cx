@@ -6,11 +6,11 @@ import (
 )
 
 func routePath(id string) (string, error) {
-	home, e := os.UserHomeDir()
+	home, e := controllerCacheRoot()
 	if e != nil {
 		return "", e
 	}
-	return jobDir(filepath.Join(home, ".cache", "cx", "routes"), id)
+	return jobDir(filepath.Join(home, "routes"), id)
 }
 func rememberRoute(id, host string) error {
 	path, e := routePath(id)
@@ -36,4 +36,14 @@ func lookupRoute(id string) (string, error) {
 		return "", e
 	}
 	return "local", nil
+}
+
+// A single controller cache root determines submission, routing, result,
+// progress and observation paths. The node state layout is independent.
+func controllerCacheRoot() (string, error) {
+	if root := os.Getenv("CX_HOME"); root != "" {
+		return filepath.Abs(root)
+	}
+	cache, err := os.UserCacheDir()
+	return filepath.Join(cache, "cx"), err
 }

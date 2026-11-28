@@ -44,7 +44,9 @@ func submitScript(ctx context.Context, h endpoint, args []string, path, shell st
 	}
 	ctx, cancel := context.WithTimeout(ctx, transferLimit)
 	defer cancel()
-	cmd, e := h.command(ctx, append([]string{"submit-script", shell}, args[1:]...))
+	attempt, stop := context.WithCancel(ctx)
+	defer stop()
+	cmd, e := h.transportCommand(attempt, append([]string{"submit-script", shell}, args[1:]...), idle)
 	if e != nil {
 		return reply{}, e
 	}
@@ -59,7 +61,7 @@ func submitScript(ctx context.Context, h endpoint, args []string, path, shell st
 	}()
 	cmd.Stdin = rd
 	var out, diag bytes.Buffer
-	e = runActive(cmd, cancel, h.connectionBudget(idle), idle, &out, &diag)
+	e = cmd.run(ctx, stop, &out, &diag)
 	if e != nil {
 		var ex *exec.ExitError
 		if errors.As(e, &ex) && ex.ExitCode() >= 0 && ex.ExitCode() != 255 {

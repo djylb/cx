@@ -21,19 +21,22 @@ type pendingAgentAsk struct {
 }
 
 type agentMail struct {
-	Deadline   *time.Time    `json:"deadline,omitempty"`
-	Time       time.Time     `json:"time"`
-	Type       string        `json:"type"`
-	To         string        `json:"to"`
-	Text       string        `json:"text,omitempty"`
-	Question   string        `json:"question,omitempty"`
-	Request    string        `json:"request_id,omitempty"`
-	RunID      string        `json:"run_id"`
-	Options    []string      `json:"options,omitempty"`
-	Timeout    time.Duration `json:"timeout_ns,omitempty"`
-	Seq        uint64        `json:"seq"`
-	Generation uint64        `json:"generation"`
-	Blocking   bool          `json:"blocking,omitempty"`
+	Acceptance     string          `json:"acceptance,omitempty"`
+	Turn           int64           `json:"turn,omitempty"`
+	ContextWarning *contextWarning `json:"context_warning,omitempty"`
+	Deadline       *time.Time      `json:"deadline,omitempty"`
+	Time           time.Time       `json:"time"`
+	Type           string          `json:"type"`
+	To             string          `json:"to"`
+	Text           string          `json:"text,omitempty"`
+	Question       string          `json:"question,omitempty"`
+	Request        string          `json:"request_id,omitempty"`
+	RunID          string          `json:"run_id"`
+	Options        []string        `json:"options,omitempty"`
+	Timeout        time.Duration   `json:"timeout_ns,omitempty"`
+	Seq            uint64          `json:"seq"`
+	Generation     uint64          `json:"generation"`
+	Blocking       bool            `json:"blocking,omitempty"`
 }
 
 func appendMail(ctx context.Context, dir string, identity jobIdentity, operation string, m *agentMail) error {

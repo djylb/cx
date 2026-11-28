@@ -130,10 +130,23 @@ func ctlForward(ctx context.Context, op string, args []string) error {
 	}
 	action := []string{"control-action", op, id}
 	if op == "say" {
+		var override string
+		argv, override, e = sayClaimOperands(argv)
+		if e != nil {
+			return ctlUsage(op, e)
+		}
 		if e = forgetResult(name, id); e != nil {
 			return e
 		}
 		action = append(action, name)
+		address := claimAddress{Host: name, Job: id}
+		r, err := withRestartClaim(ctx, hs, h, address, address, override, func(info jobClaimInfo) (reply, error) {
+			return h.invoke(ctx, controlCallIdle, false, append(append(action, info.wire()), argv...)...)
+		})
+		if err != nil {
+			return err
+		}
+		return r.output()
 	}
 	r, e := h.invoke(ctx, controlCallIdle, false, append(action, argv...)...)
 	if e != nil {
@@ -146,6 +159,9 @@ func controlFlags(op string) *flag.FlagSet {
 	f := cliFlags(op)
 	var o options
 	o.flags(f, op)
+	if op == "say" {
+		f.String("module-override", "", "reason for overriding an overlapping module claim")
+	}
 	if isMarker(op) {
 		f.String("cmd-id", "", "idempotency key (defaults to CXRUN_CMD_ID)")
 		f.String("turn-id", "", "target turn (defaults to the active turn)")
@@ -233,7 +249,32 @@ func controlOperands(op string, args []string) ([]string, error) {
 	return flags, nil
 }
 
-func nodeAction(ctx context.Context, a []string) error {
+func sayClaimOperands(args []string) ([]string, string, error) {
+	var out []string
+	var override string
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if value, ok := strings.CutPrefix(arg, "--module-override="); ok {
+			if strings.TrimSpace(value) == "" {
+				return nil, "", errors.New("--module-override requires a reason")
+			}
+			override = value
+			continue
+		}
+		n := 1
+		switch arg {
+		case "--cx-text":
+			n = 2
+		case "--cx-image":
+			n = 3
+		}
+		out = append(out, args[i:i+n]...)
+		i += n - 1
+	}
+	return out, override, nil
+}
+
+func nodeAction(ctx context.Context, a []string, binding ...jobClaimInfo) error {
 	if len(a) < 2 || !isThinControl(a[0]) {
 		return errors.New("invalid control action")
 	}
@@ -266,6 +307,17 @@ func nodeAction(ctx context.Context, a []string) error {
 		}
 		if s.Engine == "cmd" {
 			op = "close"
+		}
+	}
+	var staging *os.File
+	if op == "say" && len(binding) != 0 {
+		staging, e = jobOperationLock(ctx, root, id)
+		if e != nil {
+			return e
+		}
+		defer func() { closeBestEffort(staging) }()
+		if e = (jobIdentity{run: binding[0].RunID, key: binding[0].Directory}).checkDir(dir); e != nil {
+			return e
 		}
 	}
 	var argv []string
@@ -325,15 +377,20 @@ func nodeAction(ctx context.Context, a []string) error {
 		if textPath != "" {
 			text = []string{"@" + textPath}
 		}
-		return say(ctx, dir, host, id, opts, text)
+		closeBestEffort(staging)
+		staging = nil
+		return say(ctx, dir, host, id, opts, text, binding...)
 	}
 	return run(ctx, append([]string{op, "--job", id}, argv...))
 }
 
-func say(ctx context.Context, dir, host, id string, opts options, args []string) error {
+func say(ctx context.Context, dir, host, id string, opts options, args []string, binding ...jobClaimInfo) error {
 	identity, s, _, err := captureJobIdentity(dir)
 	if err != nil {
 		return err
+	}
+	if len(binding) != 0 && (binding[0].RunID != identity.run || binding[0].Directory != identity.key) {
+		return errJobReplaced
 	}
 	if host != "" {
 		if _, err = projectJobStatus(ctx, dir, &s, identity); err != nil {
@@ -358,7 +415,7 @@ func say(ctx context.Context, dir, host, id string, opts options, args []string)
 					return engineErr
 				}
 			}
-			if err = restartNode(ctx, []string{"resume", host, id, "", "", "", ""}, &identity, io.Discard); err != nil {
+			if err = restartNode(ctx, []string{"resume", host, id, "", "", "", ""}, &identity, io.Discard, binding...); err != nil {
 				return err
 			}
 		} else if readyResult(s) {
@@ -474,6 +531,13 @@ func nodeOutboxAll(ctx context.Context, a []string) error {
 		dir, e := jobDir(root, id)
 		if e != nil {
 			return false, e
+		}
+		identity, _, _, err := captureJobIdentity(dir)
+		if err != nil {
+			return false, err
+		}
+		if replayErr := replayTurnEvents(ctx, dir, s, identity, false); replayErr != nil {
+			diagnosticf("cx: supplement outbox for %s: %v\n", id, replayErr)
 		}
 		return false, readMail(dir, since, func(m agentMail) error {
 			return json.NewEncoder(os.Stdout).Encode(struct {

@@ -11,7 +11,6 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -220,7 +219,7 @@ func follow(ctx context.Context, h endpoint, name, id string, o ctlOptions) erro
 	for i := 0; i < 4; i++ {
 		attempt, stop := context.WithCancel(ctx)
 		b, _ := json.Marshal(pos)
-		cmd, e := h.command(attempt, []string{"follow", id, string(b), limit.String()})
+		cmd, e := h.transportCommand(attempt, []string{"follow", id, string(b), limit.String()}, 10*time.Second)
 		if e != nil {
 			stop()
 			return e
@@ -229,7 +228,7 @@ func follow(ctx context.Context, h endpoint, name, id string, o ctlOptions) erro
 		var diag bytes.Buffer
 		done := make(chan error, 1)
 		go func() {
-			err := runActive(cmd, stop, h.connectionBudget(10*time.Second), 10*time.Second, wr, &diag)
+			err := cmd.run(ctx, stop, wr, &diag)
 			_ = wr.CloseWithError(err)
 			done <- err
 		}()
@@ -268,6 +267,9 @@ func follow(ctx context.Context, h endpoint, name, id string, o ctlOptions) erro
 		processErr := <-done
 		if terminal != nil && errors.Is(e, io.EOF) {
 			if o.wait {
+				if terminal.OutputDrain == "truncated" || terminal.OutputDrain == "reap_failed" {
+					diagnosticf("cx: command output %s\n", terminal.OutputDrain)
+				}
 				return resultCode(*terminal, 0)
 			}
 			return nil
@@ -278,8 +280,7 @@ func follow(ctx context.Context, h endpoint, name, id string, o ctlOptions) erro
 		if processErr == nil {
 			return fmt.Errorf("incomplete tail: %w", e)
 		}
-		if !unsupportedMaster.Load() && unsupportedDiagnostic(runtime.GOOS, diag.String()) {
-			unsupportedMaster.Store(true)
+		if errors.Is(processErr, errSSHMasterUnsupported) {
 			i--
 			continue
 		}

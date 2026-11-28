@@ -580,7 +580,7 @@ func projectSnapshotSourceError(src string, repos []projectRepository, nested ne
 	members := make([]string, 0, len(repos))
 	for _, repo := range repos {
 		members = append(members, fmt.Sprintf("%q", repo.Path))
-		if path, resolveErr := filepath.EvalSymlinks(repo.Path); resolveErr == nil && snapWithin(src, path) {
+		if resolved, resolveErr := filepath.EvalSymlinks(repo.Path); resolveErr == nil && snapWithin(src, resolved) {
 			containsMember = true
 		}
 	}

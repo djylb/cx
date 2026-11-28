@@ -35,7 +35,12 @@ type claudeEvent struct {
 // types (for example system notices) carry message as a plain string; those have no
 // content blocks, so any non-object value decodes to an empty message.
 type claudeMessage struct {
-	Content []struct{ Type, Text, Name string }
+	Content []struct {
+		Type, Text, Name, ID string
+		Input                json.RawMessage
+		ToolUseID            string `json:"tool_use_id"`
+		IsError              bool   `json:"is_error"`
+	}
 }
 
 func (m *claudeMessage) UnmarshalJSON(b []byte) error {
@@ -201,6 +206,7 @@ func decodeClaudeOutput(reader io.Reader, send func(claudeFrame) bool) error {
 }
 
 type claudeSession struct {
+	readTools   map[string]toolRead
 	cmd         *exec.Cmd
 	stdout      *os.File
 	exited      <-chan struct{}
@@ -528,6 +534,7 @@ func (r *runner) startClaude(input any, id string) error {
 	if err = r.localEvent("turn/start", id+" → "+turnID); err != nil {
 		return err
 	}
+	r.liveTurn = turnID
 	return r.begin(turnID)
 }
 func (r *runner) claudeEvent(method string, params fields) error {
@@ -548,6 +555,7 @@ func (r *runner) consumeClaude(f claudeFrame) error {
 		}
 		s.cmd = nil
 		s.frames = nil
+		s.readTools = nil
 		r.s.EnginePID = 0
 		status := "completed"
 		result := ""
@@ -577,6 +585,7 @@ func (r *runner) consumeClaude(f claudeFrame) error {
 				return err
 			}
 			r.s.Usage = usage
+			r.usageTurn, r.usageGeneration = r.s.Turn, r.s.Generation
 		}
 		return r.claudeEvent("turn/completed", fields{"turn": t})
 	}
@@ -602,9 +611,26 @@ func (r *runner) consumeClaude(f claudeFrame) error {
 					return err
 				}
 			case "tool_use":
+				read := claudeReadPaths(block.Name, block.Input)
+				if block.ID != "" && len(read.paths) != 0 {
+					if s.readTools == nil {
+						s.readTools = make(map[string]toolRead)
+					}
+					s.readTools[block.ID] = read
+				}
 				if err := r.localEvent("claude/tool", r.c.secret.text(block.Name)); err != nil {
 					return err
 				}
+			}
+		}
+	case "user":
+		for _, block := range e.Message.Content {
+			if block.Type == "tool_result" {
+				if !block.IsError {
+					read := s.readTools[block.ToolUseID]
+					r.recordReadPaths(r.s.Turn, r.c.Dir, read.paths, read.source)
+				}
+				delete(s.readTools, block.ToolUseID)
 			}
 		}
 	case "result":

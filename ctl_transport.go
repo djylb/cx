@@ -28,6 +28,7 @@ type ctlExit int
 func (e ctlExit) Error() string { return fmt.Sprintf("exit %d", e) }
 
 type endpoint struct {
+	name     string
 	relay    *endpoint
 	Via      string `toml:"via"`
 	SSH      string `toml:"ssh"`
@@ -64,6 +65,7 @@ func loadEndpoints() (endpoints, error) {
 		if name == "local" && h.SSH != "" {
 			return nil, errors.New("local uses direct execution")
 		}
+		h.name = name
 		if h.CX == "" {
 			h.defaultCX = true
 			h.CX = defaultBinary(h)
@@ -277,11 +279,12 @@ func nodeCLI(ctx context.Context, args []string) error {
 			}
 			return errors.New("invalid submission worker arguments")
 		case "continue-job":
-			if len(args) == 4 {
-				return continueNode(ctx, args[1], args[2], args[3], "")
-			}
-			if len(args) == 5 {
-				return continueNode(ctx, args[1], args[2], args[3], args[4])
+			if len(args) == 6 {
+				var info jobClaimInfo
+				if err := json.Unmarshal([]byte(args[5]), &info); err != nil {
+					return err
+				}
+				return continueNode(ctx, args[1], args[2], args[3], args[4], info)
 			}
 			return errors.New("invalid continue arguments")
 		case "context-put":
@@ -304,10 +307,22 @@ func nodeCLI(ctx context.Context, args []string) error {
 				return cleanNodeJob(ctx, args[1])
 			}
 			return errors.New("invalid clean arguments")
+		case "claim-info":
+			if len(args) == 2 {
+				return nodeClaimInfo(ctx, args[1])
+			}
+			return errors.New("invalid claim info request")
 		case "refresh-job":
 			return nodeRefresh(ctx, args[1:])
 		case "rebase-worker":
 			return rebaseWorker(ctx, args[1:])
+		case "reads-history":
+			if len(args) == 3 {
+				return nodeReadsHistory(ctx, args[1], args[2])
+			}
+			return errors.New("invalid reads history request")
+		case "result-acceptance":
+			return nodeResultAcceptance(ctx, args[1:])
 		case "result-download":
 			return nodeResult(ctx, args[1:])
 		case "observe-result":
@@ -318,10 +333,24 @@ func nodeCLI(ctx context.Context, args []string) error {
 			}
 			return errors.New("invalid job request")
 		case "restart-job":
-			return restartNode(ctx, args[1:], nil, os.Stdout)
+			if len(args) != 9 {
+				return errors.New("invalid restart request")
+			}
+			var info jobClaimInfo
+			if err := json.Unmarshal([]byte(args[8]), &info); err != nil {
+				return err
+			}
+			return restartNode(ctx, args[1:8], nil, os.Stdout, info)
 		case "submit-script":
 			return receiveScript(ctx, args)
 		case "control-action":
+			if len(args) >= 5 && args[1] == "say" {
+				var info jobClaimInfo
+				if err := json.Unmarshal([]byte(args[4]), &info); err != nil {
+					return err
+				}
+				return nodeAction(ctx, append(args[1:4:4], args[5:]...), info)
+			}
 			return nodeAction(ctx, args[1:])
 		case "outbox-all":
 			return nodeOutboxAll(ctx, args[1:])
@@ -402,7 +431,11 @@ func (h endpoint) transportCommand(ctx context.Context, args []string, idle time
 		if e != nil {
 			return nil, e
 		}
-		return h.relay.transportCommand(ctx, append([]string{op, string(dest)}, args...), idle)
+		process, err := h.relay.transportCommand(ctx, append([]string{op, string(dest)}, args...), idle)
+		if err == nil {
+			process.host, process.remote = h.name, true
+		}
+		return process, err
 	}
 	var budget time.Duration
 	if end, ok := ctx.Deadline(); ok {
@@ -428,7 +461,7 @@ func (h endpoint) transportCommand(ctx context.Context, args []string, idle time
 	if stream {
 		argv = append(argv, base64.RawURLEncoding.EncodeToString(b))
 	}
-	cmd := &transportProcess{ctx: ctx, connect: idle, idle: idle}
+	cmd := &transportProcess{ctx: ctx, host: h.name, remote: h.SSH != "", connect: idle, idle: idle}
 	if h.SSH == "" {
 		exe, err := os.Executable()
 		if err != nil {
@@ -510,7 +543,7 @@ func (h endpoint) callIdle(ctx context.Context, step string, args ...string) (re
 
 func (h endpoint) nodeExit(err error) (int, bool) {
 	var exit *exec.ExitError
-	if errors.As(err, &exit) && (exit.ExitCode() != 255 || h.SSH == "") && exit.ExitCode() >= 0 {
+	if errors.As(err, &exit) && (exit.ExitCode() != 255 || h.SSH == "" && h.relay == nil) && exit.ExitCode() >= 0 {
 		return exit.ExitCode(), true
 	}
 	return 0, false
@@ -624,7 +657,7 @@ func relayNode(ctx context.Context, args []string) error {
 	relayCtx, finish := context.WithCancel(ctx)
 	defer finish()
 	if dest.Idle > 0 {
-		if _, e := io.WriteString(os.Stderr, wireReady); e != nil {
+		if _, e := io.WriteString(os.Stderr, wireHopReady); e != nil {
 			return e
 		}
 		go func() {
@@ -655,6 +688,7 @@ func relayNode(ctx context.Context, args []string) error {
 		}
 		var diag bytes.Buffer
 		if dest.Idle > 0 {
+			cmd.onReady = func() { _, _ = io.WriteString(os.Stderr, wireReady) }
 			e = cmd.run(relayCtx, stop, os.Stdout, &diag)
 		} else {
 			cmd.Stdout = os.Stdout

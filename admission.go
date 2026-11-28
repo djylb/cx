@@ -45,8 +45,12 @@ func registryLock(ctx context.Context, root string) (*os.File, error) {
 	return lockUntil(ctx, filepath.Join(dir, "registry.lock"))
 }
 func lockUntil(ctx context.Context, path string) (*os.File, error) {
+	return lockUntilFor(ctx, path, 5*time.Second)
+}
+
+func lockUntilFor(ctx context.Context, path string, limit time.Duration) (*os.File, error) {
 	clock := timeshim.Or(contextClock(ctx))
-	ctx, cancel := timeshim.WithTimeout(ctx, clock, 5*time.Second)
+	ctx, cancel := timeshim.WithTimeout(ctx, clock, limit)
 	defer cancel()
 	for {
 		f, err := lockPath(path, os.O_CREATE)

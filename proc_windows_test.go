@@ -3,10 +3,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 
@@ -129,4 +131,50 @@ func fixtureProcessHandle(t *testing.T, p process, access uint32) windows.Handle
 		t.Fatalf("process identity changed: PID %d", p.PID)
 	}
 	return h
+}
+
+func TestWindowsManagedAuxiliaryReapsGrandchild(t *testing.T) {
+	ctx, cancel := fixtureContext(t)
+	defer cancel()
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	cmd := exec.Command(exe, "fixture-command", "detached-parent", "gated", "unmarked")
+	cmd.Dir = dir
+	var out bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &out
+	child, err := startManagedCommand(cmd, nil, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	finished := false
+	defer func() {
+		if !finished {
+			_ = child.finish()
+		}
+	}()
+	if err = awaitFixtureFile(ctx, filepath.Join(dir, "sleep.json")); err != nil {
+		t.Fatal(err)
+	}
+	var p process
+	if err = readJSON(filepath.Join(dir, "sleep.json"), &p); err != nil {
+		t.Fatal(err)
+	}
+	handle := fixtureProcessHandle(t, p, windows.PROCESS_QUERY_INFORMATION|windows.SYNCHRONIZE)
+	if !inJob(handle, child.tree.job) {
+		t.Fatal("auxiliary descendant outside its Job Object")
+	}
+	stopping, stop := context.WithCancel(ctx)
+	stop()
+	_, stopped := child.wait(stopping, nil, nil)
+	err = child.finish()
+	finished = true
+	if !errors.Is(stopped, context.Canceled) || err != nil {
+		t.Fatalf("managed cancellation: %v, teardown: %v", stopped, err)
+	}
+	if state, waitErr := windows.WaitForSingleObject(handle, 0); state != windows.WAIT_OBJECT_0 || waitErr != nil {
+		t.Fatalf("auxiliary descendant still active: %d (%v)", state, waitErr)
+	}
 }

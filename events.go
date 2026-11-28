@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -20,6 +21,8 @@ import (
 type item struct {
 	Type, ID, Text, ClientID, Command, Status string
 	ExitCode                                  *int
+	Path, Cwd                                 string
+	CommandActions                            []commandReadAction
 	Changes                                   []struct {
 		Path string
 		Kind struct{ Type string }
@@ -33,6 +36,7 @@ type turn struct {
 type event struct {
 	Error                               *turnError
 	WillRetry, Retry                    *bool
+	Path, Cwd                           string
 	ThreadID, TurnID, Diff, Explanation string
 	Item                                item
 	RateLimits                          rateLimitSnapshot
@@ -55,10 +59,11 @@ const failedReportHeading = "STATUS: FAILED"
 const turnReportKind = "turn_report"
 
 type turnReportRef struct {
-	Turn   string `json:"turn"`
-	Path   string `json:"path"`
-	SHA256 string `json:"sha256"`
-	Size   int64  `json:"size"`
+	Metadata string `json:"metadata,omitempty"`
+	Turn     string `json:"turn"`
+	Path     string `json:"path"`
+	SHA256   string `json:"sha256"`
+	Size     int64  `json:"size"`
 }
 
 func turnReportPath(id string) (string, error) {
@@ -176,6 +181,10 @@ func readTurnReport(ctx context.Context, dir, id string) ([]byte, error) {
 }
 
 func (r *runner) publishTurnReport(id string, report []byte) error {
+	return r.publishTurnReportMetadata(id, report, "")
+}
+
+func (r *runner) publishTurnReportMetadata(id string, report []byte, metadata string) error {
 	path, err := turnReportPath(id)
 	if err != nil {
 		return err
@@ -184,7 +193,7 @@ func (r *runner) publishTurnReport(id string, report []byte) error {
 	if mkdirErr := os.MkdirAll(filepath.Dir(full), 0700); mkdirErr != nil {
 		return mkdirErr
 	}
-	ref := turnReportRef{Turn: id, Path: path, Size: int64(len(report)), SHA256: snapSum(report)}
+	ref := turnReportRef{Turn: id, Path: path, Size: int64(len(report)), SHA256: snapSum(report), Metadata: metadata}
 	previous, err := findTurnReport(r.dir, id)
 	if err != nil || previous.Turn != "" {
 		return err
@@ -385,7 +394,9 @@ func (r *runner) begin(id string) error {
 	r.deriveState()
 	return r.save()
 }
-func (r *runner) finish(t turn) error {
+func (r *runner) finish(t turn) error { return r.finishTurn(t, false) }
+
+func (r *runner) finishTurn(t turn, live bool) error {
 	if t.ID == "" {
 		return fmt.Errorf("missing completed turn id")
 	}
@@ -407,9 +418,6 @@ func (r *runner) finish(t turn) error {
 	if alreadyCompleted && (r.s.CompletedStatus == "failed" || t.Status == r.s.CompletedStatus) {
 		return nil
 	}
-	if t.Status != "interrupted" || r.pending == "" {
-		r.releaseSlot()
-	}
 	r.cmdOpen = nil
 	if t.Status == "interrupted" && r.pending != "" {
 		r.s.TurnStatus = t.Status
@@ -424,6 +432,8 @@ func (r *runner) finish(t turn) error {
 		r.lastText = ""
 	}
 	for _, i := range t.Items {
+		paths, source := codexReadPaths(i)
+		r.recordReadPaths(t.ID, i.Cwd, paths, source)
 		if i.Type == "agentMessage" {
 			r.lastText = i.Text
 		}
@@ -436,9 +446,19 @@ func (r *runner) finish(t turn) error {
 		}
 		report = r.describeFailure(t.Error) + report
 	}
-	if err := r.publishTurnReport(t.ID, []byte(report)); err != nil {
+	var usage *usageSummary
+	if live && r.usageTurn == t.ID && r.usageGeneration == r.s.Generation {
+		usage = readUsage(r.s.Usage)
+		if usage != nil {
+			usage.Total = nil
+		}
+	}
+	warning := r.usageWarning(usage)
+	if err := r.publishAgentTurn(t, []byte(report), usage, warning, !alreadyCompleted && live); err != nil {
 		return err
 	}
+	check := !alreadyCompleted && live && (t.Status == "completed" || t.Status == "failed") && r.c.Work.hasAcceptance()
+	r.releaseSlot()
 	r.s.Turn = t.ID
 	r.s.TurnStatus = t.Status
 	if t.ID != r.s.LastCompleted {
@@ -471,6 +491,16 @@ func (r *runner) finish(t turn) error {
 	if err := r.save(); err != nil {
 		return err
 	}
+	if !alreadyCompleted {
+		r.notifyContextWarning(warning)
+	}
+	if check {
+		folder, err := sealTurn(r.ctx, r.dir, r.s, r.s.Finished)
+		if err != nil {
+			return r.writeProgress("result/seal-failed", r.c.secret.text(err.Error()))
+		}
+		return r.acceptSealedTurn(folder)
+	}
 	if t.Status == "completed" {
 		if err := r.sealSnapshotTurn(); err != nil {
 			return r.writeProgress("result/seal-failed", r.c.secret.text(err.Error()))
@@ -484,7 +514,7 @@ func (r *runner) notify(m message) error {
 	}
 	// Deltas remain in events.jsonl. Completed items carry full text.
 	switch m.Method {
-	case "turn/started", "turn/completed", "turn/plan/updated", "turn/diff/updated", "item/started", "item/completed", "thread/tokenUsage/updated", "account/rateLimits/updated", "error", "serverRequest/resolved":
+	case "turn/started", "turn/completed", "turn/plan/updated", "turn/diff/updated", "item/started", "item/completed", "file/read", "item/fileRead", "thread/tokenUsage/updated", "account/rateLimits/updated", "error", "serverRequest/resolved":
 	default:
 		return nil
 	}
@@ -513,9 +543,16 @@ func (r *runner) notify(m message) error {
 		}
 		return r.begin(e.Turn.ID)
 	case "turn/completed":
-		return r.finish(e.Turn)
+		return r.finishTurn(e.Turn, r.startingTurn || r.liveTurn == e.Turn.ID)
 	case "thread/tokenUsage/updated":
-		r.s.Usage = e.TokenUsage
+		if e.TurnID != "" {
+			sameTurn := r.usageTurn == e.TurnID && r.usageGeneration == r.s.Generation
+			next, sample := retainEngineUsage(e.TokenUsage, r.s.Usage, sameTurn)
+			r.s.Usage = next
+			if sample {
+				r.usageTurn, r.usageGeneration = e.TurnID, r.s.Generation
+			}
+		}
 	case "account/rateLimits/updated":
 		r.s.update(e.RateLimits)
 	case "error":
@@ -578,8 +615,18 @@ func (r *runner) notify(m message) error {
 			r.s.ChangedFiles = len(files)
 		}
 		return r.note(m.Method, fmt.Sprintf("+%d -%d %s", added, removed, strings.Join(files, ", ")))
+	case "file/read", "item/fileRead":
+		r.recordReadPaths(e.TurnID, e.Cwd, []string{e.Path}, "structured")
 	case "item/started", "item/completed":
 		i := e.Item
+		turnID := e.TurnID
+		if turnID == "" && r.active() {
+			turnID = r.s.Turn
+		}
+		if m.Method == "item/completed" {
+			paths, source := codexReadPaths(i)
+			r.recordReadPaths(turnID, i.Cwd, paths, source)
+		}
 		switch i.Type {
 		case "commandExecution":
 			command := r.c.secret.text(i.Command)
@@ -804,6 +851,9 @@ func (r *runner) connectThread() error {
 			latest.Status = "failed"
 		}
 		if latest.Status == "inProgress" && th.Status.Type == "active" {
+			if previous != "" && r.s.Turn == latest.ID {
+				r.liveTurn = latest.ID
+			}
 			if err := r.acquireSlot(); err != nil {
 				return err
 			}
@@ -854,11 +904,28 @@ func (r *runner) connectThread() error {
 }
 
 func (r *runner) input(text, id string, steer bool) error {
-	var input any = []fields{{"type": "text", "text": text}}
-	if id == "initial" && len(r.c.Input) > 0 {
-		input = r.c.Input
+	if id == "initial" {
+		parts := slices.DeleteFunc([]string{r.c.Preamble, r.moduleNote, text}, func(s string) bool { return s == "" })
+		text = strings.Join(parts, "\n\n")
+		if r.c.Input != nil {
+			items := r.c.Input
+			if r.c.Prompt != "" {
+				items = items[1:] // Replace the original text item built by options.inputs.
+			}
+			if text != "" {
+				initial, err := json.Marshal(fields{"type": "text", "text": text})
+				if err != nil {
+					return err
+				}
+				items = append([]json.RawMessage{initial}, items...)
+			}
+			if len(items) == 0 {
+				return errors.New("empty input")
+			}
+			return r.sendInput(items, id, steer)
+		}
 	}
-	return r.sendInput(input, id, steer)
+	return r.sendInput([]fields{{"type": "text", "text": text}}, id, steer)
 }
 func (r *runner) sendInput(input any, id string, steer bool) error {
 	if !steer && r.s.Finished > 0 && r.s.LastCompleted != "" && canSealResult(r.s) {
@@ -873,6 +940,23 @@ func (r *runner) sendInput(input any, id string, steer bool) error {
 		if question, err := r.refreshBeforeTurn(); question || err != nil {
 			return err
 		}
+	}
+	if !steer && r.closeRequest != 0 {
+		return errQueuedClose
+	}
+	if !steer && r.refreshModuleNote != "" {
+		part := fields{"type": "text", "text": r.refreshModuleNote}
+		switch items := input.(type) {
+		case []fields:
+			input = append([]fields{part}, items...)
+		case []json.RawMessage:
+			raw, err := json.Marshal(part)
+			if err != nil {
+				return err
+			}
+			input = append([]json.RawMessage{raw}, items...)
+		}
+		r.refreshModuleNote = ""
 	}
 	if r.claude != nil {
 		return r.startClaude(input, id)
@@ -906,12 +990,16 @@ func (r *runner) sendInput(input any, id string, steer bool) error {
 
 	p["approvalPolicy"] = appServerApprovalPolicy
 	var result struct{ Turn turn }
-	if err := r.call("turn/start", p, &result); err != nil {
+	r.startingTurn = true
+	err := r.call("turn/start", p, &result)
+	r.startingTurn = false
+	if err != nil {
 		if _, ok := errors.AsType[*rpcError](err); ok {
 			r.releaseSlot()
 		}
 		return err
 	}
+	r.liveTurn = result.Turn.ID
 	if err := r.writeProgress("turn/start", id+" → "+result.Turn.ID); err != nil {
 		return err
 	}

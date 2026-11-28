@@ -446,7 +446,15 @@ type cacheUse struct {
 }
 
 func (c *config) startCachedCommand(cmd *exec.Cmd) (commandTree, error) {
-	tree, err := startCommand(cmd, c.RunID)
+	return c.startScopedCommand(cmd, true)
+}
+
+func (c *config) startScopedCommand(cmd *exec.Cmd, named bool) (commandTree, error) {
+	id := ""
+	if named {
+		id = c.RunID
+	}
+	tree, err := startCommand(cmd, id)
 	if err != nil {
 		return tree, err
 	}

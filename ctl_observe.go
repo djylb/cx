@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -76,7 +77,7 @@ func mergeSubmissionRows(ctx context.Context, host, filter string, o ctlOptions,
 			}
 			if s.Host != host || s.Project != p || s.Job != job.Name() ||
 				o.session != "" && s.Session != o.session ||
-				s.State != "submitting" && s.State != "submit_failed" {
+				s.State != "submitting" && s.State != "submit_pending" && s.State != "submit_unverified" && s.State != "submit_failed" {
 				continue
 			}
 			data, marshalErr := json.Marshal(s)
@@ -99,11 +100,11 @@ type lsSnapshot struct {
 }
 
 func lsCachePath(host string) (string, error) {
-	home, err := os.UserHomeDir()
+	home, err := controllerCacheRoot()
 	if err != nil {
 		return "", err
 	}
-	path, err := jobPath(filepath.Join(home, ".cache", "cx", "ls"), host)
+	path, err := jobPath(filepath.Join(home, "ls"), host)
 	if err != nil {
 		return "", err
 	}
@@ -148,8 +149,34 @@ func saveLSSnapshot(ctx context.Context, path string, snapshot lsSnapshot) error
 	return writeJSON(path, snapshot)
 }
 
+func activeListState(state any) bool {
+	switch state {
+	case "running", "queued", "submitting", "waiting":
+		return true
+	default:
+		return false
+	}
+}
+
 func displayHosts(ctx context.Context, hs endpoints, op string, o ctlOptions) error {
+	if err := validateUsageOptions(o); err != nil {
+		return err
+	}
+	var listingSettings usageSettings
+	if o.usage {
+		var err error
+		listingSettings, err = usageListSettings(o)
+		if err != nil {
+			return err
+		}
+	}
+	if op == "ls" && o.changeset != "" {
+		return displayChangeset(ctx, hs, o)
+	}
 	names := hs.names()
+	if o.active {
+		names = slices.Sorted(maps.Keys(hs))
+	}
 	filter := ""
 	if op == "doctor" && len(o.pos) > 0 {
 		names = o.pos
@@ -226,8 +253,12 @@ func displayHosts(ctx context.Context, hs endpoints, op string, o ctlOptions) er
 		var output bytes.Buffer // In-memory formatting cannot return a write error.
 		enc := json.NewEncoder(&output)
 		failed := false
+		var board *usageBoard
+		if o.usage {
+			board = newUsageBoard(listingSettings)
+		}
 		current := map[string]string{}
-		appliedByProject := map[string]map[appliedJob]map[string]int64{}
+		appliedByProject := map[string]map[appliedJob]map[string]appliedRepo{}
 		for _, name := range names {
 			v := results[name]
 			nodeFailed := v.e != nil || v.r.code != 0
@@ -235,6 +266,9 @@ func displayHosts(ctx context.Context, hs endpoints, op string, o ctlOptions) er
 				failed = true
 				reports[name] = fields{"error": fmt.Sprintf("node error %v (code %d)", v.e, v.r.code), "jobs": []fields{}}
 				if op != "ls" {
+					if op == "doctor" {
+						addRecentTransport(name, reports[name])
+					}
 					continue
 				}
 			}
@@ -258,6 +292,9 @@ func displayHosts(ctx context.Context, hs endpoints, op string, o ctlOptions) er
 					}
 					obj["unread"] = unread
 					delete(obj, "channel_tips")
+				}
+				if op == "doctor" {
+					addRecentTransport(name, obj)
 				}
 				if op == "doctor" && unsupportedMaster.Load() {
 					obj["controller_ssh_multiplexing"] = "unsupported; using ordinary connections"
@@ -313,7 +350,7 @@ func displayHosts(ctx context.Context, hs endpoints, op string, o ctlOptions) er
 			}
 			for _, row := range rows {
 				id := listingJobID(row)
-				if filter != "" && id != filter {
+				if (o.active && !activeListState(row["status"])) || filter != "" && id != filter || !matchesModuleListing(row, o) {
 					continue
 				}
 				key := name + ":" + id
@@ -322,12 +359,19 @@ func displayHosts(ctx context.Context, hs endpoints, op string, o ctlOptions) er
 					continue
 				}
 				project, _ := row["project"].(string)
+				if board != nil {
+					nameRole, _ := role.(string)
+					board.add(name, project, id, nameRole, row)
+					continue
+				}
 				runID, _ := row["run_id"].(string)
 				delete(row, "run_id")
+				delete(row, "module_claims")
+				delete(row, "module_repo")
 				if project != "" {
 					applied, loaded := appliedByProject[project]
 					if !loaded {
-						applied, e = readAppliedTurns(project)
+						applied, e = readAppliedResults(project)
 						if e != nil {
 							diagnosticf("%s: apply log: %v\n", project, e)
 						}
@@ -336,15 +380,7 @@ func displayHosts(ctx context.Context, hs endpoints, op string, o ctlOptions) er
 					if turns := applied[appliedJob{Host: name, Job: id, RunID: runID}]; runID != "" && len(turns) != 0 {
 						number, _ := row["baseline_from_turn"].(json.Number)
 						floor, _ := number.Int64()
-						currentTurns := make(map[string]int64)
-						for repo, turn := range turns {
-							if turn >= floor {
-								currentTurns[repo] = turn
-							}
-						}
-						if len(currentTurns) > 0 {
-							row["applied_turn"] = currentTurns
-						}
+						addAppliedListing(row, turns, floor)
 					}
 				}
 				delete(row, "role")
@@ -377,7 +413,12 @@ func displayHosts(ctx context.Context, hs endpoints, op string, o ctlOptions) er
 				}
 			}
 		}
-		if o.watch {
+		if board != nil {
+			if err := board.write(&output, o.json); err != nil {
+				return err
+			}
+		}
+		if o.watch && board == nil {
 			for k, old := range prev {
 				if _, ok := current[k]; ok {
 					continue
@@ -474,6 +515,7 @@ func renderLSRow(output *bytes.Buffer, header *bool, brief bool, id, name string
 		{role, "ROLE", false},
 		{state, "STATUS", true},
 		{row["phase"], "PHASE", true},
+		{strings.Join(listingModules(row), ","), "MODULE", true},
 		{row["completed_turns"], "TURNS", true},
 		{appliedTurnColumn(row), appliedTurnHeading, true},
 		{baselineColumn(row), "BASELINE", true},
@@ -481,6 +523,9 @@ func renderLSRow(output *bytes.Buffer, header *bool, brief bool, id, name string
 		{row["changed_files"], "FILES", false},
 		{failure, "FAILED COMMAND", false},
 		{rate, "RATE LIMIT", true},
+		{row["cached_tokens"], "CACHED", false},
+		{row["fresh_input_tokens"], "FRESH INPUT", false},
+		{row["output_tokens"], "OUTPUT", false},
 		{row["tokens"], "TOKENS", false},
 		{row["context_percent"], "CONTEXT %", false},
 		{row["profile"], "PROFILE", false},
