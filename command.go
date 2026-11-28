@@ -116,9 +116,9 @@ func (r *runner) serveCommand() (err error) {
 		r.s.State, r.s.CompletedStatus = "failed", "interrupted"
 		return r.note("command/stop", "interrupted before start")
 	}
-	if _, close, closeErr := r.takeMarker("close"); closeErr != nil {
+	if _, closing, closeErr := r.takeMarker("close"); closeErr != nil {
 		return closeErr
-	} else if close {
+	} else if closing {
 		r.closeCompleted = true
 		r.s.State, r.s.CompletedStatus = "failed", "interrupted"
 		return r.note("command/stop", "interrupted before start")

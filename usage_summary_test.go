@@ -170,6 +170,9 @@ func TestEngineUsageKeepsCumulativeAndDoesNotCarryTurnSample(t *testing.T) {
 	before := json.RawMessage(`{"last":{"inputTokens":9},"total":{"inputTokens":110,"cachedInputTokens":80,"outputTokens":6}}`)
 	after, measured := retainEngineUsage(json.RawMessage(`{"total":{"outputTokens":9}}`), before, false)
 	usage := readUsage(after)
+	if usage == nil {
+		t.Fatalf("no usage in %s", after)
+	}
 	if measured || usage.Turn != nil || usage.Total == nil || *usage.Total.Fresh != 30 || *usage.Total.Output != 9 {
 		t.Fatalf("latest cumulative with no turn sample: %s, %t", after, measured)
 	}

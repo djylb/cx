@@ -21,11 +21,9 @@ import (
 )
 
 type ctlOptions struct {
-	usage, active                                                                   bool
 	contextWarn, usageTop, usageTurns, usageContext                                 string
 	modules, accept                                                                 []string
 	moduleOverride, changeset, acceptTimeout                                        string
-	noAccept, reads                                                                 bool
 	waitJobsByHost                                                                  map[string][]string
 	env                                                                             map[string]string
 	project, session, tag, cwd, dir, host                                           string
@@ -41,7 +39,7 @@ type ctlOptions struct {
 	full, json, log, path, watch, any, wait, raw, refresh, fromStart                bool
 	inplace, interactive, web, hard, network, noNetwork                             bool
 	command, reuse, sync, force, noTools, messages, latest                          bool
-	incremental, allowConflicts, brief                                              bool
+	incremental, allowConflicts, brief, usage, active, noAccept, reads              bool
 }
 
 func ctlFlags(op string, o *ctlOptions) *flag.FlagSet {

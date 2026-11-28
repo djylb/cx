@@ -55,9 +55,9 @@ func runModuleCommand(ctx context.Context, clock timeshim.Clock, c *config, job 
 var errAcceptanceInterrupted = errors.New("acceptance interrupted")
 
 func (r *runner) pollModuleCommand() error {
-	if _, close, err := r.takeMarker("close"); err != nil {
+	if _, closing, err := r.takeMarker("close"); err != nil {
 		return err
-	} else if close {
+	} else if closing {
 		return errQueuedClose
 	}
 	if _, stop, err := r.takeMarker("interrupt"); err != nil {
@@ -73,12 +73,12 @@ func (r *runner) modulePreamble() string {
 	if work == nil {
 		return ""
 	}
-	var note strings.Builder
+	var note []string
 	if len(work.Modules) > 0 {
-		fmt.Fprintf(&note, "Declared modules: %s. Explain in your report why you read any files outside the declared module scope.\n", strings.Join(work.Modules, ", "))
+		note = append(note, fmt.Sprintf("Declared modules: %s. Explain in your report why you read any files outside the declared module scope.", strings.Join(work.Modules, ", ")))
 	}
 	if work.Changeset != "" {
-		fmt.Fprintf(&note, "Include the Git commit trailer Changeset: %s in every commit for this job.\n", work.Changeset)
+		note = append(note, fmt.Sprintf("Include the Git commit trailer Changeset: %s in every commit for this job.", work.Changeset))
 	}
 	var generated map[string]bool
 	if work.hasModuleContext() && r.closeRequest == 0 {
@@ -90,18 +90,18 @@ func (r *runner) modulePreamble() string {
 	}
 	for _, module := range work.Definitions {
 		if len(module.Deps) > 0 {
-			fmt.Fprintf(&note, "Direct dependencies of %s: %s.\n", module.Name, strings.Join(module.Deps, ", "))
+			note = append(note, fmt.Sprintf("Direct dependencies of %s: %s.", module.Name, strings.Join(module.Deps, ", ")))
 		}
 		if len(module.Context) == 0 || r.closeRequest != 0 {
 			continue
 		}
 		if !generated[module.Name] {
-			fmt.Fprintf(&note, "Context package for %s failed to generate. See the job progress log.\n", module.Name)
+			note = append(note, fmt.Sprintf("Context package for %s failed to generate. See the job progress log.", module.Name))
 		} else {
-			fmt.Fprintf(&note, "Context package for %s: $CX_CONTEXT/modules/%s/%s.md.\n", module.Name, r.moduleContextVersion, module.Name)
+			note = append(note, fmt.Sprintf("Context package for %s: $CX_CONTEXT/modules/%s/%s.md.", module.Name, r.moduleContextVersion, module.Name))
 		}
 	}
-	return strings.TrimSuffix(note.String(), "\n")
+	return strings.Join(note, "\n")
 }
 
 func (r *runner) prepareModuleContexts() (map[string]bool, error) {

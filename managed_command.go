@@ -43,13 +43,13 @@ type managedCommand struct {
 	tree      commandTree
 	done      <-chan processWait
 	pipes     []*commandPipe
-	scoped    bool
 	run       string
 	drain     context.Context
 	clock     timeshim.Clock
 	poll      func() error
-	reaped    bool
 	processMu sync.Mutex
+	scoped    bool
+	reaped    bool
 	waited    bool
 }
 

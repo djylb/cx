@@ -36,19 +36,19 @@ type moduleTable struct {
 
 // The job carries the selected definitions from its dispatch snapshot.
 type moduleWork struct {
-	ModuleRepositoryID string             `json:"module_repository_id,omitempty"`
-	Modules            []string           `json:"modules,omitempty"`
-	ModuleOverride     string             `json:"module_override,omitempty"`
-	Changeset          string             `json:"changeset,omitempty"`
-	Definitions        []moduleDefinition `json:"module_definitions,omitempty"`
-	Hotspots           []string           `json:"hotspots,omitempty"`
 	ModuleRepository   string             `json:"module_repository,omitempty"`
 	ModuleDir          string             `json:"module_dir,omitempty"`
+	ModuleOverride     string             `json:"module_override,omitempty"`
+	Changeset          string             `json:"changeset,omitempty"`
+	ModuleRepositoryID string             `json:"module_repository_id,omitempty"`
+	Definitions        []moduleDefinition `json:"module_definitions,omitempty"`
+	Hotspots           []string           `json:"hotspots,omitempty"`
 	AcceptScripts      []string           `json:"accept_scripts,omitempty"`
+	Modules            []string           `json:"modules,omitempty"`
+	ContextOutputBytes int64              `json:"context_output_bytes,omitempty"`
 	AcceptTimeout      time.Duration      `json:"accept_timeout,omitempty"`
 	NoAccept           bool               `json:"no_accept,omitempty"`
 	FoldPaths          bool               `json:"fold_paths,omitempty"`
-	ContextOutputBytes int64              `json:"context_output_bytes,omitempty"`
 	ReadOnly           bool               `json:"module_read_only,omitempty"`
 }
 
@@ -298,14 +298,14 @@ func snapshotModuleTable(ctx context.Context, m Manifest, repo string, def proje
 			return table, pathErr
 		}
 		file := filepath.Join(physical, filepath.FromSlash(def.ModulesFile))
-		real, pathErr := filepath.EvalSymlinks(file)
+		resolved, pathErr := filepath.EvalSymlinks(file)
 		if pathErr != nil {
 			return table, pathErr
 		}
-		if real != file {
+		if resolved != file {
 			return table, errors.New("modules_file must be a regular snapshot file without symlinks")
 		}
-		in, openErr := openJobFile(real, jobFileRead)
+		in, openErr := openJobFile(resolved, jobFileRead)
 		if openErr != nil {
 			return table, openErr
 		}
@@ -431,7 +431,8 @@ func hotspotFiles(names, patterns []string, fold ...bool) []string {
 	return matches
 }
 
-func (w *moduleWork) hasAcceptance() bool {
+// hasAcceptance accepts nil: jobs without module work have no checks.
+func hasAcceptance(w *moduleWork) bool {
 	return w != nil && !w.NoAccept && (len(w.AcceptScripts) > 0 ||
 		slices.ContainsFunc(w.Definitions, func(m moduleDefinition) bool { return len(m.Accept) > 0 }))
 }

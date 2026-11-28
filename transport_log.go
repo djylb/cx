@@ -201,7 +201,7 @@ func recentTransportEvents(host string, n int) ([]transportEvent, error) {
 	if err != nil {
 		return nil, err
 	}
-	events := []transportEvent{}
+	events := make([]transportEvent, 0, n) // JSON keeps an empty list, not null
 	if _, err = os.Stat(filepath.Dir(path)); os.IsNotExist(err) {
 		return events, nil
 	}

@@ -377,7 +377,6 @@ func (r *runner) call(method string, p any, result any) error {
 
 type runner struct {
 	liveTurn                      string
-	startingTurn                  bool
 	idleSince, turnSince, closing time.Time
 	lastAction                    time.Time
 	lastStateWrite                time.Time
@@ -413,6 +412,7 @@ type runner struct {
 	closeRequest   uint64
 	closeCompleted bool
 	dirty          bool
+	startingTurn   bool
 }
 
 const (

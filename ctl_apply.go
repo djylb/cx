@@ -646,7 +646,10 @@ func applyGlobalHotspots(ctx context.Context, id string, origin submissionOrigin
 		return "", nil, err
 	}
 	table, err := snapshotModuleTable(ctx, m, repo, def)
-	return repo, table.Hotspots, err
+	if err != nil {
+		return "", nil, err
+	}
+	return repo, table.Hotspots, nil
 }
 
 func outputProject(p string) (string, error) {

@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/djylb/timeshim"
 	"io"
 	"os"
 	"path/filepath"
@@ -15,6 +14,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/djylb/timeshim"
 )
 
 func reviewWork(name, prefix string) moduleWork {

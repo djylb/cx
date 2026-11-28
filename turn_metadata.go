@@ -148,7 +148,7 @@ func nodeReadsHistory(ctx context.Context, id, run string) error {
 }
 
 func acceptanceDisposition(w *moduleWork, outcome string, live bool) string {
-	if !w.hasAcceptance() || !live || outcome != "completed" && outcome != "failed" {
+	if !hasAcceptance(w) || !live || outcome != "completed" && outcome != "failed" {
 		return "none"
 	}
 	return "pending"

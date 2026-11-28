@@ -457,7 +457,7 @@ func (r *runner) finishTurn(t turn, live bool) error {
 	if err := r.publishAgentTurn(t, []byte(report), usage, warning, !alreadyCompleted && live); err != nil {
 		return err
 	}
-	check := !alreadyCompleted && live && (t.Status == "completed" || t.Status == "failed") && r.c.Work.hasAcceptance()
+	check := !alreadyCompleted && live && (t.Status == "completed" || t.Status == "failed") && hasAcceptance(r.c.Work)
 	r.releaseSlot()
 	r.s.Turn = t.ID
 	r.s.TurnStatus = t.Status

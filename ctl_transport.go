@@ -432,10 +432,11 @@ func (h endpoint) transportCommand(ctx context.Context, args []string, idle time
 			return nil, e
 		}
 		process, err := h.relay.transportCommand(ctx, append([]string{op, string(dest)}, args...), idle)
-		if err == nil {
-			process.host, process.remote = h.name, true
+		if err != nil {
+			return nil, err
 		}
-		return process, err
+		process.host, process.remote = h.name, true
+		return process, nil
 	}
 	var budget time.Duration
 	if end, ok := ctx.Deadline(); ok {

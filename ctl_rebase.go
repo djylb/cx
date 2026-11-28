@@ -38,14 +38,13 @@ func ctlRebase(ctx context.Context, h endpoint, host, id string, o ctlOptions) e
 	if o.host != "" && errors.Is(err, ctlExit(9)) && ctx.Err() == nil {
 		cached, target, err = offlineRebaseResult(host, id, target.Number, o.turn != "", err)
 	}
-	if activeClaimState(s.State) {
-		reportActiveSource(claimAddress{Host: host, Job: id})
-	}
 	pendingTurn := s.Finished + 1
-
 	pending := errors.Is(err, ctlExit(44)) && resultInProgress(s) && target.Number == pendingTurn
 	if err != nil && !pending {
 		return err
+	}
+	if activeClaimState(s.State) {
+		reportActiveSource(claimAddress{Host: host, Job: id})
 	}
 	if target.RunID == "" {
 		return errors.New("rebase requires a registered job generation")
