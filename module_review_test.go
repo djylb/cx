@@ -396,3 +396,10 @@ func TestActiveResumeKeepsReceiptAndRejectsStaleIdentity(t *testing.T) {
 		t.Fatalf("stale directory resumed: %v", err)
 	}
 }
+
+func TestAuxiliaryKeepsJobToolchainEnv(t *testing.T) {
+	got := jobToolchainEnv([]string{"PATH=/scratch/bin", "HOME=/scratch", "USERPROFILE=/scratch", "TMPDIR=/scratch", "GOWORK=off"})
+	if want := []string{"TMPDIR=/scratch", "GOWORK=off"}; !slices.Equal(got, want) {
+		t.Fatalf("auxiliary env = %v, want %v", got, want)
+	}
+}

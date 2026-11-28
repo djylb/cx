@@ -136,6 +136,9 @@ func prepareAuxiliaryInput(ctx context.Context, job string, snapshot SnapshotID,
 		}
 	}()
 	out, err = prepareSnapshotInput(ctx, dir, manifest)
+	if err == nil {
+		out.env = jobToolchainEnv(out.env)
+	}
 	if err != nil {
 		return out, err
 	}
@@ -248,5 +251,16 @@ func verifyAuxiliaryLinks(tree string) error {
 			return fmt.Errorf("auxiliary input symlink escapes its checkout or cannot be resolved: %s", p)
 		}
 		return nil
+	})
+}
+
+// jobToolchainEnv keeps the job's own home and tool search path for checks and
+// context generators that run on the node: toolchain managers trust their
+// global configuration only under the real home, and the job's managed caches
+// stay in use. The private checkout still owns Git and temporary state.
+func jobToolchainEnv(env []string) []string {
+	return slices.DeleteFunc(env, func(entry string) bool {
+		key, _, _ := strings.Cut(entry, "=")
+		return strings.EqualFold(key, "HOME") || strings.EqualFold(key, "USERPROFILE") || strings.EqualFold(key, "PATH")
 	})
 }
