@@ -55,7 +55,7 @@ func submissionDir(host, id string) (string, error) {
 	}
 	return jobDir(root, id)
 }
-func deployJob(ctx context.Context, h endpoint, q queuedJob, beforeLaunch func() error, report func(string, int64), registered func(string)) error {
+func deployJob(ctx context.Context, h endpoint, q queuedJob, report func(string, int64), registered func(string)) error {
 	req := q.Request
 	if req.Snapshot != "" {
 		if e := Publish(ctx, h, req.Snapshot, func(n int64) { report("snapshot", n) }); e != nil {
@@ -85,9 +85,6 @@ func deployJob(ctx context.Context, h endpoint, q queuedJob, beforeLaunch func()
 	}
 	var r reply
 	if h.SSH != "" || q.Rebase != "" {
-		if e = beforeLaunch(); e != nil {
-			return e
-		}
 		if e = sendTask(ctx, h, req, data, func(n int64) { report("packet", n) }); e != nil {
 			return e
 		}
@@ -97,9 +94,6 @@ func deployJob(ctx context.Context, h endpoint, q queuedJob, beforeLaunch func()
 			return err
 		})
 	} else {
-		if e = beforeLaunch(); e != nil {
-			return e
-		}
 		r, e = h.call(ctx, 2*time.Minute, "start-job", string(data))
 	}
 	if e != nil {
@@ -337,16 +331,8 @@ func submissionWorker(ctx context.Context, host, id string) (err error) {
 		}
 		h = hs[host]
 	}
-	beforeLaunch := func() error {
-		work := q.Request.moduleWork
-		if s.OverrideReason != nil {
-			work.ModuleOverride = *s.OverrideReason
-		}
-		unchecked, err := checkModuleClaims(ctx, hs, claimAddress{Host: host, Job: id}, q.ClaimSource, work)
-		s.ClaimsUnchecked = unchecked
-		return err
-	}
-	return deployJob(ctx, h, q, beforeLaunch, func(phase string, n int64) { s.Phase = phase; s.Bytes = n; _ = writeJSON(path, s) }, func(run string) { runID = run })
+	// The claim check ran once in queueJob, before the worker started.
+	return deployJob(ctx, h, q, func(phase string, n int64) { s.Phase = phase; s.Bytes = n; _ = writeJSON(path, s) }, func(run string) { runID = run })
 }
 func readSubmissionProgress(dir string) (submissionProgress, error) {
 	var s submissionProgress

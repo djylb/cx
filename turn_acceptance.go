@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"os"
 	"path/filepath"
@@ -35,7 +36,10 @@ func (r *runner) acceptSealedTurn(folder string) error {
 	}
 	dir, number := r.dir, r.s.Finished
 	ctx := r.auxiliaryCtx
+	slot := &r.acceptSlot
 	r.auxiliary.Go(func() {
+		slot.Lock()
+		defer slot.Unlock()
 		result := runTurnAcceptance(ctx, dir, folder, c)
 		publishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), controlCallIdle)
 		defer cancel()
@@ -187,14 +191,23 @@ func replayTurnEvents(ctx context.Context, dir string, s status, identity jobIde
 	if err != nil {
 		return err
 	}
+	// A reselected engine turn gets a new local number but shares the original
+	// observations: reuse its receipt and announce each logical event once.
+	first := make(map[string]int64)
 	for _, record := range records {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		var completed turnCompletion
 		if err := json.Unmarshal(record.Value, &completed); err != nil {
-			return err
+			diagnosticf("cx: skip unreadable completion record: %v\n", err)
+			continue
 		}
+		if original, seen := first[completed.TurnID]; seen && completed.TurnID != "" {
+			linkReselectedAcceptance(work, original, completed.Number)
+			continue
+		}
+		first[completed.TurnID] = completed.Number
 		details, err := readTurnMetadata(dir, completed.TurnID)
 		if err != nil {
 			diagnosticf("cx: read turn %d observations: %v\n", completed.Number, err)
@@ -218,7 +231,9 @@ func replayTurnEvents(ctx context.Context, dir string, s status, identity jobIde
 			continue
 		}
 		if err != nil {
-			return err
+			// One damaged receipt must not hide later turns.
+			diagnosticf("cx: skip acceptance receipt for turn %d: %v\n", completed.Number, err)
+			continue
 		}
 		if err := publishTurnEvent(ctx, dir, identity, completed.Number, &agentMail{
 			Type: "acceptance", To: "parent", Text: fmt.Sprintf("Acceptance for turn %d: %s", completed.Number, result.Status),
@@ -305,7 +320,8 @@ func collectTurnAcceptance(ctx context.Context, h endpoint, id, dest string, tar
 	if meta.AcceptanceStatus != "pending" {
 		return nil
 	}
-	bounded, cancel := timeshim.WithTimeout(ctx, timeshim.Or(contextClock(ctx)), controlCallIdle)
+	// The receipt is optional next to an already local report: keep the wait short.
+	bounded, cancel := timeshim.WithTimeout(ctx, timeshim.Or(contextClock(ctx)), acceptanceCollectWait)
 	defer cancel()
 	response, err := h.callIdle(bounded, "collect acceptance receipt", "result-acceptance", id, target.RunID, strconv.FormatInt(target.Number, 10))
 	if err != nil {
@@ -341,3 +357,29 @@ func replayOutboxTurnEvents(ctx context.Context, dir string) error {
 	}
 	return replayTurnEvents(ctx, dir, s, identity, false)
 }
+
+const acceptanceCollectWait = 5 * time.Second
+
+// linkReselectedAcceptance gives a reselected turn the receipt of the turn it
+// repeats. Both are immutable; an absent source leaves the new turn as is.
+func linkReselectedAcceptance(work string, original, number int64) {
+	from := filepath.Join(work, "result", fmt.Sprintf("turn-%d", original), acceptanceFilename)
+	to := filepath.Join(work, "result", fmt.Sprintf("turn-%d", number), acceptanceFilename)
+	in, err := openJobFile(from, jobFileRead)
+	if err != nil {
+		return
+	}
+	data, err := io.ReadAll(io.LimitReader(in, acceptanceReceiptLimit))
+	closeBestEffort(in)
+	if err != nil {
+		return
+	}
+	if _, statErr := os.Stat(filepath.Dir(to)); statErr != nil {
+		return
+	}
+	if err = snapImmutable(to, data); err != nil {
+		diagnosticf("cx: reuse acceptance for turn %d: %v\n", number, err)
+	}
+}
+
+const acceptanceReceiptLimit = 4 << 20

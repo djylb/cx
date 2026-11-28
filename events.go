@@ -453,6 +453,12 @@ func (r *runner) finishTurn(t turn, live bool) error {
 			usage.Total = nil
 		}
 	}
+	if live {
+		r.s.TurnContext = nil
+		if usage != nil {
+			r.s.TurnContext = usage.ContextPercent
+		}
+	}
 	warning := r.usageWarning(usage)
 	if err := r.publishAgentTurn(t, []byte(report), usage, warning, !alreadyCompleted && live); err != nil {
 		return err
@@ -497,6 +503,8 @@ func (r *runner) finishTurn(t turn, live bool) error {
 	if check {
 		folder, err := sealTurn(r.ctx, r.dir, r.s, r.s.Finished)
 		if err != nil {
+			// The next successful seal of this turn delivers the acceptance.
+			r.acceptRetry = r.s.Finished
 			return r.writeProgress("result/seal-failed", r.c.secret.text(err.Error()))
 		}
 		return r.acceptSealedTurn(folder)
@@ -927,18 +935,25 @@ func (r *runner) input(text, id string, steer bool) error {
 	}
 	return r.sendInput([]fields{{"type": "text", "text": text}}, id, steer)
 }
-func (r *runner) sendInput(input any, id string, steer bool) error {
+func (r *runner) sendInput(input any, id string, steer bool) (err error) {
 	if !steer && r.s.Finished > 0 && r.s.LastCompleted != "" && canSealResult(r.s) {
-		if _, err := sealTurn(r.ctx, r.dir, r.s, r.s.Finished); err != nil {
-			return fmt.Errorf("seal previous turn before starting the next: %w", err)
+		folder, sealErr := sealTurn(r.ctx, r.dir, r.s, r.s.Finished)
+		if sealErr != nil {
+			return fmt.Errorf("seal previous turn before starting the next: %w", sealErr)
+		}
+		if r.acceptRetry == r.s.Finished {
+			r.acceptRetry = 0
+			if err = r.acceptSealedTurn(folder); err != nil {
+				return err
+			}
 		}
 	}
 	if !steer {
-		if err := r.acquireSlot(); err != nil {
+		if err = r.acquireSlot(); err != nil {
 			return err
 		}
-		if question, err := r.refreshBeforeTurn(); question || err != nil {
-			return err
+		if question, refreshErr := r.refreshBeforeTurn(); question || refreshErr != nil {
+			return refreshErr
 		}
 	}
 	if !steer && r.closeRequest != 0 {
@@ -950,13 +965,19 @@ func (r *runner) sendInput(input any, id string, steer bool) error {
 		case []fields:
 			input = append([]fields{part}, items...)
 		case []json.RawMessage:
-			raw, err := json.Marshal(part)
-			if err != nil {
-				return err
+			raw, marshalErr := json.Marshal(part)
+			if marshalErr != nil {
+				return marshalErr
 			}
 			input = append([]json.RawMessage{raw}, items...)
 		}
-		r.refreshModuleNote = ""
+		// Keep the note until the engine accepts this input, so a failed start
+		// or a restart delivers it again.
+		defer func() {
+			if err == nil {
+				r.refreshModuleNote = ""
+			}
+		}()
 	}
 	if r.claude != nil {
 		return r.startClaude(input, id)
@@ -964,7 +985,7 @@ func (r *runner) sendInput(input any, id string, steer bool) error {
 	p := fields{"threadId": r.s.Thread, "clientUserMessageId": id, "input": input}
 	if steer {
 		p["expectedTurnId"] = r.s.Turn
-		if err := r.call("turn/steer", p, nil); err != nil {
+		if err = r.call("turn/steer", p, nil); err != nil {
 			return err
 		}
 		return r.writeProgress("turn/steer", id+" → "+r.s.Turn)
@@ -991,7 +1012,7 @@ func (r *runner) sendInput(input any, id string, steer bool) error {
 	p["approvalPolicy"] = appServerApprovalPolicy
 	var result struct{ Turn turn }
 	r.startingTurn = true
-	err := r.call("turn/start", p, &result)
+	err = r.call("turn/start", p, &result)
 	r.startingTurn = false
 	if err != nil {
 		if _, ok := errors.AsType[*rpcError](err); ok {

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
 	"slices"
@@ -228,10 +229,11 @@ func prepareModuleWork(ctx context.Context, req *jobSubmission, def projectDefin
 		work.Modules = append(work.Modules, name)
 		work.Definitions = append(work.Definitions, module)
 		if len(module.Context) > 0 {
-			target := strings.ToLower("modules/" + name + ".md")
+			// modules/ in the job context belongs to generated packages only, so a
+			// published version directory is always cx's own atomic publish.
 			for key := range req.Context {
-				if modulePrefixesOverlap(strings.ToLower(key), target) {
-					return fmt.Errorf("context input %q overlaps generated %s", key, target)
+				if modulePrefixesOverlap(strings.ToLower(key), "modules") {
+					return fmt.Errorf("context input %q uses the reserved modules/ directory", key)
 				}
 			}
 		}
@@ -277,6 +279,9 @@ func moduleRepository(ctx context.Context, m Manifest, sources map[string]string
 
 func snapshotModuleTable(ctx context.Context, m Manifest, repo string, def projectDefinition) (moduleTable, error) {
 	var table moduleTable
+	if def.ModulesFile != "" {
+		return snapshotModulesFile(ctx, m, repo, def)
+	}
 	work, err := os.MkdirTemp("", "cx-modules-")
 	if err != nil {
 		return table, err
@@ -289,29 +294,6 @@ func snapshotModuleTable(ctx context.Context, m Manifest, repo string, def proje
 	tree := filepath.Join(scratch.dir, "tree")
 	limit := moduleOutputBudget(def.ModulesOutputBytes)
 	cwd := filepath.Join(tree, repo)
-	if def.ModulesFile != "" {
-		if !snapIncludePath(def.ModulesFile) {
-			return table, errors.New("modules_file must name a repository-relative file")
-		}
-		physical, pathErr := filepath.EvalSymlinks(cwd)
-		if pathErr != nil {
-			return table, pathErr
-		}
-		file := filepath.Join(physical, filepath.FromSlash(def.ModulesFile))
-		resolved, pathErr := filepath.EvalSymlinks(file)
-		if pathErr != nil {
-			return table, pathErr
-		}
-		if resolved != file {
-			return table, errors.New("modules_file must be a regular snapshot file without symlinks")
-		}
-		in, openErr := openJobFile(resolved, jobFileRead)
-		if openErr != nil {
-			return table, openErr
-		}
-		defer closeBestEffort(in)
-		return decodeModuleTable(in, limit)
-	}
 	cmd := commandArgv(def.ModulesCmd, false)
 	cmd.Dir = cwd
 	// The private snapshot already wrote go.work (or chose GOWORK=off).
@@ -442,4 +424,44 @@ func (w moduleWork) claimRepository() string {
 		return w.ModuleRepositoryID
 	}
 	return w.ModuleRepository
+}
+
+// snapshotModulesFile reads the declared table as one Git blob of the selected
+// snapshot repository: no checkout, no project code.
+func snapshotModulesFile(ctx context.Context, m Manifest, repo string, def projectDefinition) (moduleTable, error) {
+	var table moduleTable
+	if !snapIncludePath(def.ModulesFile) {
+		return table, errors.New("modules_file must name a repository-relative file")
+	}
+	store, err := snapStore()
+	if err != nil {
+		return table, err
+	}
+	for _, r := range m.Repositories {
+		if r.Path != repo {
+			continue
+		}
+		g := snapGit{ctx: ctx, dir: r.bare(store)}
+		spec := r.OID + ":" + def.ModulesFile
+		entry, err := g.get("ls-tree", r.OID, "--", def.ModulesFile)
+		if err != nil {
+			return table, err
+		}
+		if mode, _, _ := strings.Cut(entry, " "); mode != "100644" && mode != "100755" {
+			return table, errors.New("modules_file must be a regular file in the snapshot")
+		}
+		cmd := exec.CommandContext(ctx, "git", "--git-dir", r.bare(store), "cat-file", "blob", spec)
+		cmd.Env = snapProcessEnv()
+		out, err := cmd.StdoutPipe()
+		if err != nil {
+			return table, err
+		}
+		if err = cmd.Start(); err != nil {
+			return table, err
+		}
+		table, err = decodeModuleTable(out, moduleOutputBudget(def.ModulesOutputBytes))
+		_, _ = io.Copy(io.Discard, out)
+		return table, errors.Join(err, cmd.Wait())
+	}
+	return table, errors.New("module repository is absent from the snapshot")
 }

@@ -14,16 +14,18 @@ import (
 	"time"
 )
 
+// appliedGroup keeps each filter identity apart, so an adopted job's later
+// applications report their own session and role.
 type appliedGroup struct {
 	appliedJob
 	Baseline SnapshotID
+	Session  string
+	Role     string
 }
 
 type changesetApplication struct {
 	repos   []appliedRepo
 	modules []string
-	session string
-	role    string
 }
 
 func readChangesetApplications(changeset, project string) (map[appliedGroup]*changesetApplication, error) {
@@ -51,10 +53,10 @@ func readChangesetApplications(changeset, project string) (map[appliedGroup]*cha
 			if entry.Changeset != changeset {
 				return
 			}
-			key := appliedGroup{entry.appliedJob, entry.Baseline}
+			key := appliedGroup{entry.appliedJob, entry.Baseline, entry.Session, entry.Role}
 			a := applications[key]
 			if a == nil {
-				a = &changesetApplication{modules: entry.Modules, session: entry.Session, role: entry.Role}
+				a = &changesetApplication{modules: entry.Modules}
 				applications[key] = a
 			}
 			a.repos = append(a.repos, entry.appliedRepo)
@@ -121,7 +123,7 @@ func displayChangeset(ctx context.Context, hs endpoints, o ctlOptions) error {
 			}
 		}
 		groups := slices.SortedFunc(maps.Keys(applications), func(a, b appliedGroup) int {
-			return strings.Compare(a.Host+":"+a.Job+":"+a.RunID+":"+string(a.Baseline), b.Host+":"+b.Job+":"+b.RunID+":"+string(b.Baseline))
+			return strings.Compare(a.Host+":"+a.Job+":"+a.RunID+":"+string(a.Baseline)+":"+a.Session+":"+a.Role, b.Host+":"+b.Job+":"+b.RunID+":"+string(b.Baseline)+":"+b.Session+":"+b.Role)
 		})
 		var out bytes.Buffer
 		enc := json.NewEncoder(&out)
@@ -132,11 +134,11 @@ func displayChangeset(ctx context.Context, hs endpoints, o ctlOptions) error {
 			}
 			p, j, _ := strings.Cut(group.Job, "/")
 			row := fields{"host": group.Host, "project": p, "job": j, "run_id": group.RunID, "baseline": group.Baseline,
-				"changeset": o.changeset, "session": a.session, "modules": a.modules, "role": a.role, "status": "applied"}
+				"changeset": o.changeset, "session": group.Session, "modules": a.modules, "role": group.Role, "status": "applied"}
 			if node := nodes[group.appliedJob]; node != nil {
 				row["node"] = node
 			}
-			if o.session != "" && row["session"] != o.session || o.role != "" && a.role != o.role || !matchesModuleListing(row, o) {
+			if o.session != "" && row["session"] != o.session || o.role != "" && group.Role != o.role || !matchesModuleListing(row, o) {
 				continue
 			}
 			row["applications"] = a.repos

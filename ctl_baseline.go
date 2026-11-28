@@ -145,7 +145,7 @@ func submitRebase(ctx context.Context, host, sourceHost, dest, result, id string
 		if loadErr != nil {
 			return loadErr
 		}
-		queued.ClaimSource = &claimAddress{Host: sourceHost, Job: id}
+		queued.ClaimSource = &claimAddress{Host: sourceHost, Job: id, RunID: req.SourceRun}
 		queued.OverrideReason = &req.ModuleOverride
 		return queueJob(ctx, hs, queued, true, true, nil)
 	}
@@ -179,7 +179,7 @@ func submitRebase(ctx context.Context, host, sourceHost, dest, result, id string
 	if err != nil {
 		return err
 	}
-	input := rebaseInput{key: key, files: attachments, source: &claimAddress{Host: sourceHost, Job: id}}
+	input := rebaseInput{key: key, files: attachments, source: &claimAddress{Host: sourceHost, Job: id, RunID: req.SourceRun}}
 	if req.Host != "" {
 		opts.profile = req.Profile
 		input.carry = result

@@ -26,6 +26,7 @@ type usageRank struct {
 	usageCounters
 	CompletedTurns int64    `json:"completed_turns,omitempty"`
 	ContextPercent *float64 `json:"context_percent,omitempty"`
+	TurnContext    *float64 `json:"turn_context_percent,omitempty"`
 	HighContext    bool     `json:"high_context,omitempty"`
 	Stale          bool     `json:"stale,omitempty"`
 }
@@ -103,12 +104,13 @@ func (b *usageBoard) add(host, project, id, role string, row fields) {
 		Name: host + ":" + id,
 		usageCounters: usageCounters{Total: rowUsageCount(row["tokens"]), Cached: rowUsageCount(row["cached_tokens"]),
 			Fresh: rowUsageCount(row["fresh_input_tokens"]), Output: rowUsageCount(row["output_tokens"])},
-		ContextPercent: rowUsagePercent(row["context_percent"]), Stale: row["stale"] == true,
+		ContextPercent: rowUsagePercent(row["context_percent"]), TurnContext: rowUsagePercent(row["turn_context_percent"]), Stale: row["stale"] == true,
 	}
 	if turns := rowUsageCount(row["completed_turns"]); turns != nil {
 		entry.CompletedTurns = *turns
 	}
-	entry.HighContext = entry.CompletedTurns >= int64(b.settings.MinTurns) && entry.ContextPercent != nil && *entry.ContextPercent >= b.settings.MinContext
+	// Only a sample owned by the last completed turn counts toward high context.
+	entry.HighContext = entry.CompletedTurns >= int64(b.settings.MinTurns) && entry.TurnContext != nil && *entry.TurnContext >= b.settings.MinContext
 	entry.Samples = 1
 	for _, metric := range []struct {
 		known bool

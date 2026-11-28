@@ -50,7 +50,11 @@ func stageResultDetails(ctx context.Context, dir, folder, extra string, s status
 	if err != nil {
 		return err
 	}
+	sealed := m.ResultDetails
 	m.ResultDetails = &ResultDetails{Engine: s.Engine, Log: log}
+	if sealed != nil {
+		m.Status, m.ExitCode = sealed.Status, sealed.ExitCode
+	}
 	if latest {
 		var after status
 		if err = loadJobStatusInto(dir, &after); err != nil {

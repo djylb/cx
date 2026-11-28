@@ -24,6 +24,7 @@ type rebaseRequest struct {
 	Child          string `json:",omitempty"`
 	Failure        string `json:",omitempty"`
 	Submitted      bool   `json:",omitempty"`
+	SourceRun      string `json:",omitempty"`
 }
 
 func ctlRebase(ctx context.Context, h endpoint, host, id string, o ctlOptions) error {
@@ -42,9 +43,6 @@ func ctlRebase(ctx context.Context, h endpoint, host, id string, o ctlOptions) e
 	pending := errors.Is(err, ctlExit(44)) && resultInProgress(s) && target.Number == pendingTurn
 	if err != nil && !pending {
 		return err
-	}
-	if activeClaimState(s.State) {
-		reportActiveSource(claimAddress{Host: host, Job: id})
 	}
 	if target.RunID == "" {
 		return errors.New("rebase requires a registered job generation")
@@ -95,7 +93,7 @@ func ctlRebase(ctx context.Context, h endpoint, host, id string, o ctlOptions) e
 			}
 		}
 	} else {
-		req = rebaseRequest{Refresh: req.Refresh, Text: o.dir, Session: o.session, Host: o.host, Profile: o.profile, ModuleOverride: o.moduleOverride}
+		req = rebaseRequest{SourceRun: target.RunID, Refresh: req.Refresh, Text: o.dir, Session: o.session, Host: o.host, Profile: o.profile, ModuleOverride: o.moduleOverride}
 		if err = writeJSON(slot, req); err != nil {
 			return err
 		}

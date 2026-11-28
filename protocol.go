@@ -402,6 +402,8 @@ type runner struct {
 	usageGeneration      uint64
 	auxiliaryCtx         context.Context
 	auxiliary            sync.WaitGroup
+	acceptSlot           sync.Mutex // one acceptance at a time per runner
+	acceptRetry          int64      // turn whose acceptance waits for a successful seal
 	refreshModuleNote    string
 	moduleNote           string
 	reads                readTracker
@@ -678,7 +680,15 @@ func (r *runner) serveAgent(session func() error) (err error) {
 	r.auxiliaryCtx = auxiliary
 	defer func() {
 		cancelAuxiliary()
-		r.auxiliary.Wait()
+		// Cancellation stops the checks; receipts already persisted are
+		// replayed by the recovery path, so exit waits only briefly.
+		done := make(chan struct{})
+		go func() { r.auxiliary.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(auxiliaryExitWait):
+			diagnosticf("cx: acceptance still finishing for %s; leaving it to recovery\n", r.dir)
+		}
 	}()
 	if cleanupErr := r.recoverAuxiliaryWorkspace(); cleanupErr != nil {
 		diagnosticf("cx: recover auxiliary work for %s: %v\n", r.dir, cleanupErr)
@@ -686,7 +696,7 @@ func (r *runner) serveAgent(session func() error) (err error) {
 	if r.c.ForkThread == "" {
 		if r.s.Finished == 0 && r.s.Turn == "" {
 			r.moduleNote = r.modulePreamble()
-		} else if r.c.Work != nil && r.c.Work.hasModuleContext() {
+		} else if r.c.Work != nil && len(r.c.Work.Modules) > 0 {
 			previous, readErr := readTurnMetadata(r.dir, r.s.LastCompleted)
 			if readErr == nil {
 				r.moduleContextVersion = previous.ContextVersion
@@ -804,3 +814,5 @@ func (r *runner) baseContext() context.Context {
 	}
 	return r.ctx
 }
+
+const auxiliaryExitWait = 15 * time.Second

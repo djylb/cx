@@ -88,7 +88,10 @@ func (c *config) privileged() bool {
 }
 
 type status struct {
-	OutputDrain string    `json:"output_drain,omitempty"`
+	OutputDrain string `json:"output_drain,omitempty"`
+	// TurnContext is the context share sampled for the last completed turn;
+	// nil when that turn had no sample of its own.
+	TurnContext *float64  `json:"turn_context_percent,omitempty"`
 	LastEvent   time.Time `json:"last_event_time"`
 	ExitCode    *int64    `json:"exit_code,omitempty"`
 

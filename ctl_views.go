@@ -132,6 +132,7 @@ func nodeRows(ctx context.Context, root, p, session, chatProject string) error {
 			return false, e
 		}
 		usage(r, s.Usage)
+		r["turn_context_percent"] = s.TurnContext
 		if len(s.Usage) > 0 && string(s.Usage) != "null" {
 			r["token_usage"] = s.Usage
 		}

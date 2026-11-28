@@ -459,14 +459,6 @@ func applyTurn(ctx context.Context, dir, project, id, host, runID string, o ctlO
 	if changed == 0 {
 		return nil
 	}
-	if len(result.Modules) == 0 {
-		repo, hotspots, err := applyGlobalHotspots(ctx, id, origin, result, manifest)
-		if err != nil {
-			diagnosticf("cx: load global hotspots: %v\n", err)
-		} else {
-			result.ModuleRepository, result.Hotspots = repo, hotspots
-		}
-	}
 	root, e := manifest.sourceRoot(ctx, origin.Source)
 	if e != nil {
 		return e
@@ -694,4 +686,21 @@ func applyOrigin(dir string) (submissionOrigin, string, Manifest, error) {
 	}
 	m, _, e = snapManifest(store, string(origin.Snapshot))
 	return origin, store, m, e
+}
+
+// preloadApplyHotspots fills global hotspots for jobs without declared modules.
+func preloadApplyHotspots(ctx context.Context, id, dir string, result *turnResult) {
+	if len(result.Modules) != 0 {
+		return
+	}
+	origin, _, manifest, err := applyOrigin(dir)
+	if err == nil {
+		var repo string
+		var hotspots []string
+		if repo, hotspots, err = applyGlobalHotspots(ctx, id, origin, *result, manifest); err == nil {
+			result.ModuleRepository, result.Hotspots = repo, hotspots
+			return
+		}
+	}
+	diagnosticf("cx: load global hotspots: %v\n", err)
 }

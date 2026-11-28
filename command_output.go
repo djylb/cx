@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -79,37 +78,21 @@ func (w *commandOutput) sealLength() int64 {
 	}
 }
 
-func (w *commandOutput) seal(ctx context.Context, dir string, abandoned bool) (int64, error) {
+func (w *commandOutput) seal(dir string, abandoned bool) (int64, error) {
 	length := w.sealLength()
 	source := w.stream.Name()
 	if abandoned {
-		// Closing an os.File can wait for an in-flight write. Those writes
-		// may extend the spool, but they can no longer advance its prefix.
+		// Closing an os.File can wait for an in-flight write, and that write may
+		// still extend the spool. Leave the spool unpublished: readers bound it
+		// by the cursor's committed length, so exit never copies the log.
 		go func() {
 			closeBestEffort(w.stream)
 			closeBestEffort(w.cursor)
 		}()
-	} else if err := errors.Join(w.stream.Close(), w.cursor.Close()); err != nil {
-		return length, err
+		return length, nil
 	}
-	in, err := openJobFile(source, jobFileRead)
-	if err != nil {
+	if err := errors.Join(w.stream.Close(), w.cursor.Close()); err != nil {
 		return length, err
-	}
-	defer closeBestEffort(in)
-	// In the usual case one inode serves both names. If the copier was
-	// abandoned, publish an independent inode even when the sizes match.
-	if abandoned {
-		f, err := createJobTemp(dir, ".output-")
-		if err != nil {
-			return length, err
-		}
-		source = f.Name()
-		defer removeBestEffort(source)
-		_, err = io.CopyN(f, resultReader{ctx, in}, length)
-		if err = errors.Join(err, f.Close()); err != nil {
-			return length, err
-		}
 	}
 	if err := syncExistingJobFile(source, syncJobFile); err != nil {
 		return length, err

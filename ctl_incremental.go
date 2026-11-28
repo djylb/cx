@@ -47,6 +47,8 @@ func ctlSealedPatches(ctx context.Context, h endpoint, host, id, runID, dir, op 
 	}
 	var project string
 	if op == "apply" {
+		// Hotspot lookup may run project code; keep it outside the apply lock.
+		preloadApplyHotspots(ctx, id, dir, &m)
 		var err error
 		project, err = outputProject(applyLogProject(id))
 		if err != nil {

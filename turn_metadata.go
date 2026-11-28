@@ -83,12 +83,15 @@ func stageTurnMetadata(dir, stage string, meta *turnResult) error {
 	if details.Reads == nil {
 		return nil
 	}
+	// The read log is an optional attachment: failing to write it leaves the
+	// turn deliverable and the reads unavailable.
 	reads, err := json.Marshal(turnReads{Turn: meta.Turn, Status: "available", Paths: details.Reads})
-	if err != nil {
-		return err
+	if err == nil {
+		err = writeJobBytes(filepath.Join(stage, readsFilename), append(reads, '\n'))
 	}
-	if err = writeJobBytes(filepath.Join(stage, readsFilename), append(reads, '\n')); err != nil {
-		return err
+	if err != nil {
+		diagnosticf("cx: read log for turn %d unavailable: %v\n", meta.Turn, err)
+		return nil
 	}
 	meta.ReadsPath = readsFilename
 	return nil

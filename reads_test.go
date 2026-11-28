@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -40,6 +41,10 @@ func TestClaudeAndCodexReadPaths(t *testing.T) {
 	}
 	want := []readObservation{{"docs/start.md", "structured"}, {"docs", "structured"}, {"src", "structured"}, {"lab.ipynb", "structured"}, {"notes.md", "parsed"},
 		{"notes with spaces.md", "parsed"}, {"src/a.go", "structured"}, {"other", "parsed"}, {"input", "parsed"}, {"notes/subsection", "parsed"}}
+	if runtime.GOOS == "windows" {
+		// Codex commands on Windows are not reparsed with a POSIX shell dialect.
+		want = []readObservation{{"docs/start.md", "structured"}, {"docs", "structured"}, {"src", "structured"}, {"lab.ipynb", "structured"}, {"notes.md", "parsed"}, {"src/a.go", "structured"}}
+	}
 	if !slices.Equal(r.reads.paths, want) {
 		t.Fatalf("reads %v, want %v", r.reads.paths, want)
 	}

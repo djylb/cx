@@ -102,7 +102,11 @@ func checkModuleClaims(ctx context.Context, hs endpoints, target claimAddress, s
 		if !activeClaimState(row.State) {
 			continue
 		}
-		if source != nil && key == source.key() && (source.RunID == "" || row.RunID == source.RunID) {
+		if source != nil && key == source.key() && source.RunID != "" && row.RunID == source.RunID {
+			// Only the verified source run is exempt; report it from this scan.
+			if source.key() != target.key() {
+				reportActiveSource(*source)
+			}
 			continue
 		}
 		if key == target.key() && (source == nil || source.key() != target.key()) {
@@ -119,7 +123,7 @@ func checkModuleClaims(ctx context.Context, hs endpoints, target claimAddress, s
 		}
 	}
 	for _, dependency := range dependencies {
-		diagnosticf("cx: direct dependencies have an active writer at %s\n", dependency)
+		diagnosticf("cx: notice: active writer at %s\n", dependency)
 	}
 	reportUncheckedClaims(unchecked)
 	return unchecked, reportModuleConflicts(w.ModuleOverride, conflicts)
@@ -223,17 +227,12 @@ func withRestartClaim(ctx context.Context, hs endpoints, h endpoint, source, tar
 	if err != nil {
 		return reply{}, err
 	}
-	if source.key() != target.key() && activeClaimState(info.State) {
-		reportActiveSource(source)
-	}
-	info.ActiveOnly = source == target && activeClaimState(info.State)
+	source.RunID = info.RunID
+	info.ActiveOnly = source.key() == target.key() && activeClaimState(info.State)
 	info.Override = override
 	if info.Work != nil && !info.ActiveOnly {
 		work := *info.Work
 		work.ModuleOverride = override
-		if source == target {
-			source.RunID = info.RunID
-		}
 		if _, err := checkModuleClaims(ctx, hs, target, &source, work); err != nil {
 			return reply{}, err
 		}

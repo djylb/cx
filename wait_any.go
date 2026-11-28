@@ -500,6 +500,11 @@ func selectWaitAny(ctx context.Context, root string, projects []string, session 
 					}
 				}
 				if s.Engine != "cmd" {
+					// Receipts can be on disk before their outbox event: replay
+					// by stable ID before tailing, as cx outbox does.
+					if replayErr := replayOutboxTurnEvents(ctx, dir); replayErr != nil {
+						diagnosticf("cx: supplement outbox: %v\n", replayErr)
+					}
 					closeBestEffort(job.mail)
 					var tailErr error
 					job.mail, tailErr = openOutboxTail(dir, from)

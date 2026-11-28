@@ -107,7 +107,7 @@ func TestResultDetailsKeepsCompletedLogWhenJobAdvances(t *testing.T) {
 		t.Fatal(err)
 	}
 	var m turnResult
-	if err = readJSON(filepath.Join(stage, "result.json"), &m); err != nil || m.ResultDetails == nil || m.Status != nil || m.Log != "progress.log" {
+	if err = readJSON(filepath.Join(stage, "result.json"), &m); err != nil || m.ResultDetails == nil || m.Status == nil || *m.Status != s.State || m.Log != "progress.log" {
 		t.Fatalf("result details: %+v, %v", m.ResultDetails, err)
 	}
 	if b, err := os.ReadFile(filepath.Join(stage, m.Log)); err != nil || string(b) != first {

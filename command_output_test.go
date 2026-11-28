@@ -54,7 +54,7 @@ func TestCommandLogPrefixExcludesAbandonedWrite(t *testing.T) {
 		}
 	}
 	checkPrefix(status{Engine: "cmd"})
-	size, err := out.seal(ctx, dir, true)
+	size, err := out.seal(dir, true)
 	if err != nil || size != int64(len("committed")) {
 		t.Fatalf("sealed length = %d, %v", size, err)
 	}

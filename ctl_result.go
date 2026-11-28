@@ -203,6 +203,12 @@ func sealTurn(ctx context.Context, dir string, s status, n int64) (string, error
 	if s.Engine != "cmd" {
 		meta.Outcome = s.CompletedStatus
 	}
+	if readyResult(s) && s.Finished == n {
+		// Fix the turn's state at seal time so later details do not depend on
+		// when the result is first collected.
+		state := s.State
+		meta.ResultDetails = &ResultDetails{Status: &state, ExitCode: s.ExitCode, Engine: s.Engine}
+	}
 	var req jobSubmission
 	if err := readJSON(filepath.Join(work, "request.json"), &req); err == nil {
 		scope = req.moduleWork
@@ -336,6 +342,15 @@ func resultArchive(ctx context.Context, folder, dir string, s status, details bo
 	e = filepath.WalkDir(folder, func(p string, d fs.DirEntry, walkErr error) error {
 		if p == filepath.Join(folder, acceptanceFilename) || details && p == manifestPath {
 			return walkErr
+		}
+		if p == filepath.Join(folder, readsFilename) && walkErr == nil {
+			// An unreadable read log must not block the report and patch.
+			in, openErr := openJobFile(p, jobFileRead)
+			if openErr != nil {
+				diagnosticf("cx: skip unreadable read log: %v\n", openErr)
+				return nil
+			}
+			closeBestEffort(in)
 		}
 		return add(folder, p, d, walkErr)
 	})

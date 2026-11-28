@@ -85,27 +85,46 @@ func moduleClaimRelation(w moduleWork, repo string, old []moduleClaim, fold ...b
 			if slices.Contains(current.Deps, other.Name) {
 				dependency = append(dependency, current.Name+" -> "+other.Name)
 			}
-			if current.Name != other.Name && equalRepo && modulePathsOverlap(current.Paths, other.Paths, ignoreCase) {
+			if current.Name == other.Name || !equalRepo {
+				continue
+			}
+			if confirmed, possible := modulePathsOverlap(current.Paths, other.Paths, ignoreCase); confirmed {
 				overlap = append(overlap, current.Name+" / "+other.Name)
+			} else if possible {
+				dependency = append(dependency, current.Name+" ~ "+other.Name+" (patterns may overlap)")
 			}
 		}
 	}
 	return overlap, dependency
 }
 
-func modulePathsOverlap(a, b []string, fold bool) bool {
+// modulePathsOverlap reports overlaps it can confirm, and glob pairs that only
+// may overlap (for example src/*.go and src/*.md): the latter are notices.
+func modulePathsOverlap(a, b []string, fold bool) (confirmed, possible bool) {
 	for _, left := range a {
 		for _, right := range b {
-			l, r := modulePatternPrefix(left), modulePatternPrefix(right)
 			if fold {
-				l, r = strings.ToLower(l), strings.ToLower(r)
+				left, right = strings.ToLower(left), strings.ToLower(right)
 			}
-			if modulePrefixesOverlap(l, r) {
-				return true
+			l, r := modulePatternPrefix(left), modulePatternPrefix(right)
+			if !modulePrefixesOverlap(l, r) {
+				continue
+			}
+			lGlob, rGlob := strings.ContainsAny(left, "*?["), strings.ContainsAny(right, "*?[")
+			switch {
+			case left == right,
+				!lGlob && modulePrefixesOverlap(left, r) && (left == "." || r == left || strings.HasPrefix(r, left+"/")),
+				!rGlob && modulePrefixesOverlap(right, l) && (right == "." || l == right || strings.HasPrefix(l, right+"/")),
+				!lGlob && rGlob && matchesModulePattern(right, left),
+				!rGlob && lGlob && matchesModulePattern(left, right),
+				!lGlob && !rGlob:
+				return true, false
+			default:
+				possible = true
 			}
 		}
 	}
-	return false
+	return false, possible
 }
 
 func reportModuleConflicts(override string, conflicts []string) error {

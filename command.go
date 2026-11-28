@@ -102,7 +102,7 @@ func (r *runner) serveCommand() (err error) {
 		return err
 	}
 	defer func() {
-		_, sealErr := out.seal(context.WithoutCancel(r.baseContext()), r.dir, abandoned)
+		_, sealErr := out.seal(r.dir, abandoned)
 		if sealErr != nil {
 			r.s.OutputDrain = "truncated"
 		}

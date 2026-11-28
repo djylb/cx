@@ -155,6 +155,21 @@ func (r *runner) installRefresh(record stateRecord) (string, error) {
 	if err := json.Unmarshal(record.Value, &req); err != nil {
 		return "", err
 	}
+	// fork verifies the source baseline under this lock; install under it too
+	// so a fork never inherits a half-installed checkout.
+	root, err := stateRoot()
+	if err != nil {
+		return "", err
+	}
+	id := r.s.Job
+	if r.s.Project != "" {
+		id = r.s.Project + "/" + r.s.Job
+	}
+	lock, err := jobOperationLock(r.baseContext(), root, id)
+	if err != nil {
+		return "", err
+	}
+	defer closeBestEffort(lock)
 	work, err := workDir(r.dir, r.s)
 	if err != nil {
 		return "", err
@@ -196,6 +211,11 @@ func (r *runner) activateModuleWork(base jobBaseline) {
 		r.reads.roots = nil
 		r.moduleContextVersion = ""
 		r.refreshModuleNote = r.modulePreamble()
+		if r.moduleContextVersion == "" {
+			// Modules without generators still record which baseline's note
+			// the next turn received, so recovery does not resend it.
+			r.moduleContextVersion = base.Request
+		}
 	}
 }
 

@@ -153,16 +153,13 @@ func prepareAuxiliaryInput(ctx context.Context, job string, snapshot SnapshotID,
 			}
 		}
 	}
-	if err := verifyAuxiliaryLinks(tree); err != nil {
-		return out, err
-	}
 	if meta != nil {
 		for _, attachment := range meta.Artifacts {
 			if !snapPath(attachment.Path) || !strings.HasPrefix(attachment.Path, "artifacts/") {
 				return out, errors.New("invalid acceptance attachment path")
 			}
 			target := filepath.Join(out.cwd, attachment.Path)
-			if err := os.MkdirAll(filepath.Dir(target), 0700); err != nil {
+			if err := prepareArtifactTarget(out.cwd, target); err != nil {
 				return out, err
 			}
 			if err := copyAcceptanceArtifact(ctx, filepath.Join(result, attachment.Path), target, attachment.Bytes); err != nil {
@@ -170,7 +167,51 @@ func prepareAuxiliaryInput(ctx context.Context, job string, snapshot SnapshotID,
 			}
 		}
 	}
+	// Links are checked on the combined layout, after attachments are in place.
+	if err := verifyAuxiliaryLinks(tree); err != nil {
+		return out, err
+	}
 	return out, nil
+}
+
+// prepareArtifactTarget lets a sealed attachment replace a tracked regular
+// file of the same name, after checking that no ancestor leaves the checkout.
+func prepareArtifactTarget(root, target string) error {
+	rel, err := filepath.Rel(root, filepath.Dir(target))
+	if err != nil {
+		return err
+	}
+	dir := root
+	for _, part := range strings.Split(rel, string(filepath.Separator)) {
+		if part == "." {
+			continue
+		}
+		dir = filepath.Join(dir, part)
+		info, statErr := os.Lstat(dir)
+		if os.IsNotExist(statErr) {
+			if err = os.Mkdir(dir, 0700); err != nil {
+				return err
+			}
+			continue
+		}
+		if statErr != nil {
+			return statErr
+		}
+		if !info.IsDir() {
+			return errors.New("acceptance attachment ancestor is not a directory")
+		}
+	}
+	info, err := os.Lstat(target)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return errors.New("acceptance attachment target is not a regular file")
+	}
+	return os.Remove(target)
 }
 
 func copyAcceptanceArtifact(ctx context.Context, source, target string, expected int64) error {
