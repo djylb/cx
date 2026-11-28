@@ -196,7 +196,7 @@ func snapStage(source, stage snapGit, head, tmp string, isGit bool, include []st
 				tracked[n] = true
 			}
 		}
-		for i, args := range [][]string{{"ls-files", "-o", "--exclude-standard", "-z"}, {"ls-files", "-o", "-z", "--", "internal/web/dist"}, {"ls-files", "-oi", "--exclude-standard", "--directory", "-z"}} {
+		for i, args := range [][]string{{"ls-files", "-o", "--exclude-standard", "-z"}, {"ls-files", "-oi", "--exclude-standard", "--directory", "-z"}} {
 			b, listErr := source.input(nil, args...)
 			if listErr != nil {
 				return "", listErr
@@ -205,7 +205,7 @@ func snapStage(source, stage snapGit, head, tmp string, isGit bool, include []st
 				if listErr = snapName(n); listErr != nil {
 					return "", listErr
 				}
-				if i < 2 {
+				if i == 0 {
 					if _, ok := modes[n]; !ok {
 						modes[n] = ""
 					}

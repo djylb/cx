@@ -374,6 +374,9 @@ func ctlSubmitWithRebase(ctx context.Context, hs endpoints, op string, o ctlOpti
 			return e
 		}
 	}
+	if len(def.Repositories) > 0 {
+		reportMissingMembers(ctx, src, req.Prompt, def)
+	}
 	if len(o.own) > 0 {
 		if e = validateSnapshotOwnership(ctx, req.Snapshot, o.own); e != nil {
 			return e
@@ -803,7 +806,28 @@ func verifySourceBase(ctx context.Context, src string, req *jobSubmission, o ctl
 				return fmt.Errorf("dirty source: %s", r.Path)
 			}
 			diagnosticf("cx: uncommitted changes in %s; using frozen worktree\n", r.Path)
+			reportUntrackedIncluded(r.Path, dirty)
 		}
 	}
 	return nil
+}
+
+// reportUntrackedIncluded names untracked files the frozen worktree carries, so
+// a draft that was not meant for the job is noticed at submit time.
+func reportUntrackedIncluded(repo, porcelain string) {
+	var untracked []string
+	for entry := range strings.SplitSeq(porcelain, "\x00") {
+		if name, ok := strings.CutPrefix(entry, "?? "); ok {
+			untracked = append(untracked, name)
+		}
+	}
+	if len(untracked) == 0 {
+		return
+	}
+	shown := untracked[:min(len(untracked), 5)]
+	more := ""
+	if len(untracked) > len(shown) {
+		more = fmt.Sprintf(" and %d more", len(untracked)-len(shown))
+	}
+	diagnosticf("cx: %s: %d untracked file(s) included: %s%s (ignore or move files the job should not see)\n", repo, len(untracked), strings.Join(shown, ", "), more)
 }

@@ -99,7 +99,6 @@ func TestSnapWorkspace(t *testing.T) {
 		{"app/state", "working version\n"},
 		{"app/staged", "staged only\n"},
 		{"app/new file-中", "untracked\n"},
-		{"app/internal/web/dist/generated", "generated\n"},
 		{"library/lib.go", "package lib\nconst Value = \"dirty-lib\"\n"},
 	} {
 		b, err := os.ReadFile(filepath.Join(unpublished, file.path))

@@ -13,7 +13,9 @@ Before dispatching, set `CX_SESSION` or use a supported session environment. cx 
 - Snapshots can include uncommitted work. Use `--clean-base` to require a clean Git source, `--with-history` to include commit history, or `--snapshot ID` to reuse the ID from `cx snapshot DIR`. Non-Git directories work too.
 - For a new snapshot-backed agent, repeat `--own PATH` with `cx run` or `cx agent` to limit workspace writes to existing files or directories. Paths are relative to the main repository root. Use `../MEMBER/PATH` for a sibling snapshot repository. Managed caches and job temporary space remain writable.
 - Include needed files in the snapshot, attach them, or inline their contents in the prompt. Review inputs before sending work to an execution host or model service. Write deliverable files to `artifacts/` in the job checkout. `--inplace` uses the original directory on `local`; use snapshots for the patch workflow.
-- For another controller, or to disambiguate a job, use `HOST:project/tag`.
+- For another controller, or to disambiguate a job, use `HOST:project/tag`. A job ID without a host resolves through this controller's routes, then through cached listings and a short query of every configured host. One match is used and remembered. Several matches are an error that lists the qualified IDs.
+- A snapshot of a repository with local changes uses a frozen worktree: committed content, uncommitted changes to tracked files, and untracked files that `.gitignore` does not exclude. Submission names the untracked files it includes. Ignore or move drafts the job should not see. Ignored files enter only through `--include` or the project's `include`.
+- Jobs cannot dispatch to other hosts: execution hosts have no controller host configuration, so `cx exec OTHER` inside a job reports an unknown host. The manager dispatches cross-host steps. Do not ask a job to run something on another host.
 
 For commands, use `exec` for a private working directory or pass `--cwd` for an existing directory on the execution host. Use `run HOST DIR TAG --cmd -- ARGV…` to run against a source snapshot. With `exec --wait`, stdout carries merged command output, stderr carries the job ID, and normal process exit codes pass through.
 
@@ -37,6 +39,8 @@ cx run local ./app check prompt.txt --project demo
 ```
 
 With no explicit selection, cx can infer the project from the source repository. The job starts in the selected member's repository root with the project layout preserved, so it can access `../library`. With `workspace-write`, one job can update the library and its consumers together. Go workspace discovery adds other referenced repositories to the snapshot.
+
+Submission warns when the job references a repository the project does not mount: a local `replace` target in `go.mod`, a `use` entry in `go.work`, or an absolute path in the prompt that lies in another repository. The job is still submitted; add the repository to the project if the job must change it.
 
 Repeat `--include REPO:PATH` for each input file or quoted glob. These entries are stored as the repository's `include` list in the project definition. Use them for local configuration needed by the job. Each entry must match a file, and job edits to the matched files are excluded from collected patches. Keep credentials out of these files.
 
@@ -71,6 +75,8 @@ Keep exactly one watcher per session. After dispatching, run this in the backgro
 ```sh
 cx wait --any --timeout 55m
 ```
+
+To wait for particular jobs, name each one: `cx wait --any --job linux:p/a1 --job linux:p/a2 --timeout 55m`. Run it in the background without a shell loop or output filter. It exits after the first event among them.
 
 It watches every job this session dispatched, on every host, and returns one JSON line as soon as any job finishes a turn, asks a question, is rate-limited, fails, is blocked from admission, or sends a message. A turn event carries the completed `turn`, the `next` result command, and `rate_limited` to tell a quota stop from a normal finish. For a quota stop, use `reset_at` (the blocking quota reset recorded at turn completion, in Unix seconds, or `null` if unknown) to decide when to continue. Then:
 

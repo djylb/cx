@@ -749,7 +749,7 @@ func resolveJob(ctx context.Context, address string) (name, id string, e error) 
 		return "", "", e
 	}
 	if !strings.Contains(address, ":") {
-		name, e = lookupRoute(id)
+		name, e = lookupRoute(ctx, id)
 	}
 	return name, id, e
 }
