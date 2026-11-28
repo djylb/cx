@@ -80,6 +80,7 @@ type config struct {
 	WebSearch                           bool `json:"web_search,omitempty"`
 	Interactive                         bool `json:"interactive,omitempty"`
 	Shell                               bool `json:"cmd_shell,omitempty"`
+	AdmitNow                            bool `json:"admit_now,omitempty"`
 	Network                             bool
 }
 
@@ -510,6 +511,7 @@ func runNodeWithRegistration(ctx context.Context, args []string, directSubmit bo
 		fs.Func("env", "command environment NAME=VALUE", func(v string) error { return addCommandEnv(&c.Env, v) })
 		fs.BoolVar(&c.Shell, "cmd-shell", false, "execute one explicit shell script")
 		fs.StringVar(&c.SlotClass, "slot-class", "", "admission class")
+		fs.BoolVar(&c.AdmitNow, "now", false, "start without waiting for admission slots or the queue")
 		fs.DurationVar(&c.Timeout, "timeout", defaultRuntimeLimit, "runtime limit excluding queue time")
 		fs.DurationVar(&c.QueueTimeout, "queue-timeout", defaultQueueLimit, "maximum wait per admission")
 		fs.DurationVar(&c.Quiet, "quiet-timeout", defaultQuiet, "command output inactivity limit")

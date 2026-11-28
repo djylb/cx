@@ -325,6 +325,30 @@ func (r *runner) reserve(ctx context.Context, t *queueTicket, controls bool, rep
 			diskChecked = clock.Now()
 		}
 		reason := diskReason
+		if reason == "" && controls && !r.c.AdmitNow {
+			if _, ok, e := r.takeMarker("admit"); e != nil {
+				return e
+			} else if ok {
+				r.c.AdmitNow = true
+			}
+		}
+		if reason == "" && r.c.AdmitNow {
+			// Admission was waived: take a private slot outside the pool count
+			// and the FIFO queue. The disk minimum above still applies.
+			slot, err := lockPath(filepath.Join(r.pool(), "slot-now-"+r.c.RunID+".lock"), os.O_CREATE)
+			if err != nil {
+				return err
+			}
+			if slot != nil {
+				if err = report(""); err != nil {
+					closeBestEffort(slot)
+					return err
+				}
+				r.slot = slot
+				_ = r.note("admission/now", "started without waiting for admission")
+				return nil
+			}
+		}
 		if reason == "" && host.LoadCmd != "" {
 			if clock.Now().Sub(loadChecked) >= loadInterval {
 				allowed = loadOK(ctx, host.LoadCmd, clock)

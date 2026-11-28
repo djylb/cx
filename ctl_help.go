@@ -15,7 +15,7 @@ type ctlCommand struct {
 }
 
 const submissionSessionFlags = "session no-session"
-const submitFlags = "project profile engine model effort sandbox own role parent snapshot with-history input-json image idle-exit turn-timeout approval-timeout stall queue-timeout inplace interactive web-search hard network no-network force sync no-tools clean-base context context-warn module module-override changeset accept accept-timeout no-accept " + submissionSessionFlags
+const submitFlags = "project profile engine model effort sandbox own role parent snapshot with-history input-json image idle-exit turn-timeout approval-timeout stall queue-timeout now inplace interactive web-search hard network no-network force sync no-tools clean-base context context-warn module module-override changeset accept accept-timeout no-accept " + submissionSessionFlags
 const runFlags = submitFlags + " batch cmd reuse timeout quiet-timeout json"
 const projectInitUsage = "NAME --repo DIR [DIR ...] [--include REPO:PATH ...] [--default-host HOST]"
 
@@ -36,7 +36,7 @@ var ctlCommands = map[string]ctlCommand{
 	"diff":         {"JOB", "Read recorded diff events.", ""},
 	"doctor":       {"[HOST ...]", "Check execution hosts.", "json"},
 	"events":       {"JOB", "Read recorded events.", ""},
-	"exec":         {"HOST [options] -- ARGV...\n  cx exec HOST --script FILE [--shell SHELL] [options]", "Submit a command job.", "project tag cwd timeout quiet-timeout queue-timeout wait script shell reuse env profile " + submissionSessionFlags},
+	"exec":         {"HOST [options] -- ARGV...\n  cx exec HOST --script FILE [--shell SHELL] [options]", "Submit a command job.", "project tag cwd timeout quiet-timeout queue-timeout now wait script shell reuse env profile " + submissionSessionFlags},
 	"fork":         {"JOB --job CHILD [--through TURN] [--profile NAME]", "Fork an agent thread on its current host.", "job through profile module-override " + submissionSessionFlags},
 	"gate":         {"DIR [GATE-ARGS ...]", "Run the source directory's scripts/gate.sh.", ""},
 	"history":      {"JOB [read|turns|items]", "Read agent thread history.", ""},
@@ -44,6 +44,7 @@ var ctlCommands = map[string]ctlCommand{
 	"hosts":        {"[HOST]", "Print current execution host facts.", ""},
 	"context":      {"push HOST", "Copy this controller's context layers to HOST for a manager running there.", ""},
 	"interrupt":    {"JOB", "Stop an active turn or command.", ""},
+	"admit":        {"JOB", "Let a queued job start now, ignoring slots, the queue and the load check.", ""},
 	"limits":       {"JOB", "Read the engine account's rate limits.", ""},
 	"ls":           {"[JOB]", "List jobs.", "active brief json watch interval project session role module changeset usage usage-top usage-turns usage-context all all-hosts max-bytes"},
 	"mcp":          {"JOB list|reload|login|resource|call", "Call an engine MCP operation.", ""},
@@ -321,6 +322,8 @@ func ctlFlagHelp(op, key string) string {
 		return fmt.Sprintf("agent stall `DURATION` (defaults to %s)", defaultStall)
 	case "queue-timeout":
 		return "admission deadline `DURATION` (defaults to no deadline)"
+	case "now":
+		return "start without waiting for admission slots, earlier queued jobs, or the load check (the disk minimum still applies)"
 	case "quiet-timeout":
 		return fmt.Sprintf("command output inactivity `DURATION` (defaults to %s)", defaultQuiet)
 	case "timeout":

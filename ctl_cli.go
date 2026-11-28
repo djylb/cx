@@ -38,7 +38,7 @@ type ctlOptions struct {
 	cleanBase, all, explicitSession, noSession                                      bool
 	full, json, log, path, watch, any, wait, raw, refresh, fromStart                bool
 	inplace, interactive, web, hard, network, noNetwork                             bool
-	command, reuse, sync, force, noTools, messages, latest                          bool
+	command, reuse, sync, force, noTools, messages, latest, now                     bool
 	incremental, allowConflicts, brief, usage, active, noAccept, reads              bool
 }
 
@@ -54,7 +54,7 @@ func ctlFlags(op string, o *ctlOptions) *flag.FlagSet {
 		"refresh":    &o.refresh, "cmd": &o.command, "reuse": &o.reuse,
 		"inplace": &o.inplace, "interactive": &o.interactive, "web-search": &o.web,
 		"hard": &o.hard, "network": &o.network, "no-network": &o.noNetwork,
-		"force": &o.force, "sync": &o.sync, "no-tools": &o.noTools,
+		"force": &o.force, "sync": &o.sync, "no-tools": &o.noTools, "now": &o.now,
 		"brief": &o.brief, "full": &o.full, "json": &o.json, "log": &o.log, "path": &o.path, "watch": &o.watch,
 		"messages": &o.messages, "any": &o.any, "wait": &o.wait, "raw": &o.raw, "from-start": &o.fromStart, "latest": &o.latest,
 	}
@@ -527,6 +527,9 @@ func controller(ctx context.Context, a []string) error {
 			if kv[1] != "" {
 				args = append(args, kv[0], kv[1])
 			}
+		}
+		if o.now {
+			args = append(args, "--now")
 		}
 		var r reply
 		if o.script != "" {

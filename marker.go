@@ -25,7 +25,7 @@ type controlMarker struct {
 }
 
 func isMarker(op string) bool {
-	return op == "close" || op == "interrupt" || op == "approve" || op == "deny"
+	return op == "close" || op == "interrupt" || op == "admit" || op == "approve" || op == "deny"
 }
 
 func targetTurn(s status) string {
@@ -180,8 +180,12 @@ func publishControlFor(ctx context.Context, dir string, expected *jobIdentity, o
 				m.Turn = original.Turn
 			}
 		} else {
-			if s.Engine == "cmd" && op != "close" {
-				return errors.New("command only accepts close")
+			if s.Engine == "cmd" && op != "close" && op != "admit" {
+				return errors.New("command only accepts close or admit")
+			}
+			if op == "admit" && s.State != "queued" {
+				// A waiver left in the inbox would silently apply to a later admission.
+				return errors.New("job is not queued")
 			}
 			if isTerminal(s.State) {
 				if op == "close" {

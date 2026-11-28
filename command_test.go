@@ -427,3 +427,32 @@ func TestCommandRuntimeStartsAfterAdmission(t *testing.T) {
 		t.Fatal(out)
 	}
 }
+
+func TestCommandAdmitNowSkipsTheQueue(t *testing.T) {
+	h := commands(t)
+	h.start("holder", nil, "after-parent")
+	h.running("holder")
+	h.start("eager", []string{"--now"}, "silent")
+	h.running("eager")
+	h.start("queued", nil, "silent")
+	if s := h.status("queued"); s.State != "queued" {
+		t.Fatal(s)
+	}
+	h.cli(0, "admit", "--job", "p/queued")
+	h.running("queued")
+	for _, name := range []string{"queued", "eager", "holder"} {
+		h.cli(0, "close", "--job", "p/"+name)
+		h.cli(1, "wait", "--job", "p/"+name)
+	}
+}
+
+func TestAdmitRequiresAQueuedJob(t *testing.T) {
+	h := commands(t)
+	h.start("running", nil, "after-parent")
+	h.running("running")
+	if out := h.cli(1, "admit", "--job", "p/running"); !strings.Contains(out, "not queued") {
+		t.Fatalf("admit of a running job: %s", out)
+	}
+	h.cli(0, "close", "--job", "p/running")
+	h.cli(1, "wait", "--job", "p/running")
+}

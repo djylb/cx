@@ -113,6 +113,7 @@ Use `cx doctor HOST --json` to see the controller’s recent disconnects and rec
 - Bring inputs that Git ignores into snapshots with the project `--include` list.
 - When a job stops on a usage limit, check `rate_limited` and `reset_at` in its event; `cx rebase JOB TEXT --host H` continues its work on another host or account.
 - Collect a batch of similar jobs together once all of them have finished.
+- A job waits for an admission slot, earlier queued jobs, and the host load check. Submit with `--now` to start at once, or run `cx admit JOB` for a job that is already queued. Both ignore the slot limit, the queue order and the load check; the disk minimum still applies. Use them for urgent or short work, since they add load beyond the configured slots.
 
 ## Work while the manager is away
 

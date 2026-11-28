@@ -314,6 +314,9 @@ func ctlSubmitWithRebase(ctx context.Context, hs endpoints, op string, o ctlOpti
 	if jobTools {
 		req.Options = append(req.Options, "--job-tools")
 	}
+	if o.now {
+		req.Options = append(req.Options, "--now")
+	}
 	if o.web {
 		req.Options = append(req.Options, "--web-search")
 	}

@@ -20,7 +20,7 @@ import (
 
 func isThinControl(op string) bool {
 	switch op {
-	case "requests", "reply", "approve", "deny", "review", "undo", "compact", "settings", "mcp", "events", "plan", "diff", "limits", "usage", "models", "threads", "history", "rpc", "interrupt", "close", "say":
+	case "requests", "reply", "approve", "deny", "review", "undo", "compact", "settings", "mcp", "events", "plan", "diff", "limits", "usage", "models", "threads", "history", "rpc", "interrupt", "admit", "close", "say":
 		return true
 	}
 	return false
